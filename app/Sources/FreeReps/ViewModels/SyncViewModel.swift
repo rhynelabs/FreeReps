@@ -118,7 +118,10 @@ final class SyncViewModel: ObservableObject {
 
     func refreshLatestHealthKitDates() {
         Task {
+            guard HealthSyncSelection.shared.isEnabled else { return }
             for i in syncState.categories.indices {
+                guard HealthSyncSelection.shared.isEnabled else { return }
+                guard HealthSyncSelection.shared.includes(syncState.categories[i].id) else { continue }
                 let date = await latestHKDate(for: syncState.categories[i].id)
                 syncState.categories[i].latestHealthKitDate = date
             }

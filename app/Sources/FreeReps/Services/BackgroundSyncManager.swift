@@ -19,6 +19,7 @@ final class BackgroundSyncManager {
     private var pendingTypes: Set<String> = []
     private var debounceTask: Task<Void, Never>?
     private var isSyncing = false
+    private var observationGeneration = 0
 
     private init() {}
 
@@ -26,14 +27,28 @@ final class BackgroundSyncManager {
 
     /// Call once from AppDelegate.didFinishLaunchingWithOptions to start monitoring HealthKit.
     func startObserving() {
-        setupObserverQueries()
-        enableBackgroundDelivery()
+        observationGeneration += 1
+        let generation = observationGeneration
+        debounceTask?.cancel()
+        for query in observerQueries { healthStore.stop(query) }
+        observerQueries.removeAll()
+        let revision = HealthSyncSelection.shared.revision
+        healthStore.disableAllBackgroundDelivery { [weak self] _, _ in
+            Task { @MainActor in
+                guard let self, self.observationGeneration == generation,
+                      HealthSyncSelection.shared.revision == revision,
+                      HealthSyncSelection.shared.isEnabled,
+                      UserDefaults.standard.bool(forKey: "backgroundSyncEnabled") else { return }
+                self.setupObserverQueries()
+                self.enableBackgroundDelivery()
+            }
+        }
     }
 
     // MARK: - Observer Queries
 
     private func setupObserverQueries() {
-        let readTypes = HealthDataTypes.allReadTypes
+        let readTypes = HealthKitService.selectedReadTypes
 
         for type in readTypes {
             guard let sampleType = type as? HKSampleType else { continue }
@@ -53,7 +68,7 @@ final class BackgroundSyncManager {
     }
 
     private func enableBackgroundDelivery() {
-        let readTypes = HealthDataTypes.allReadTypes
+        let readTypes = HealthKitService.selectedReadTypes
 
         for type in readTypes {
             guard let sampleType = type as? HKSampleType else { continue }
@@ -69,6 +84,7 @@ final class BackgroundSyncManager {
     // MARK: - Observer Callback Handling
 
     private func handleObserverUpdate(sampleType: HKSampleType, error: Error?) {
+        guard HealthSyncSelection.shared.isEnabled else { return }
         if let error = error {
             postFailureNotification("HealthKit observer error: \(error.localizedDescription)")
             return
@@ -98,6 +114,7 @@ final class BackgroundSyncManager {
     // MARK: - Trigger Sync
 
     private func triggerIncrementalSync() async {
+        guard HealthSyncSelection.shared.isEnabled else { return }
         guard UserDefaults.standard.bool(forKey: "backgroundSyncEnabled") else { return }
         guard !isSyncing, !SyncService.isSyncRunning else { return }
         isSyncing = true

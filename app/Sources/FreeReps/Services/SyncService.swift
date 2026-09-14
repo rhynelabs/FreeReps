@@ -45,6 +45,32 @@ final class SyncService: ObservableObject {
     private let healthKit = HealthKitService.shared
     let syncState: SyncState
     private var freereps: FreeRepsService?
+    private var selectionRevision = 0
+    private static weak var activeService: SyncService?
+
+    static func stopForSelectionChange() {
+        activeService?.taskForCancellation?.cancel()
+        if let client = activeService?.freereps { Task { await client.cancelRequests() } }
+    }
+
+    private func checkSelection() throws {
+        try Task.checkCancellation()
+        try HealthSyncSelection.shared.checkRevision(selectionRevision)
+    }
+
+    private func beginSelectedSync() -> Bool {
+        guard HealthSyncSelection.shared.isEnabled else {
+            syncState.currentOperation = "Apple Health sync is paused"
+            return false
+        }
+        guard syncState.categories.contains(where: { $0.id != "cat_strength" && HealthSyncSelection.shared.includes($0.id) }) else {
+            syncState.currentOperation = "Choose data to sync in Settings → Apple Health"
+            return false
+        }
+        selectionRevision = HealthSyncSelection.shared.revision
+        Self.activeService = self
+        return true
+    }
 
     /// Sparse categories that have very few records — skip 90-day windowing, query full range at once.
     private static let sparseCategories: Set<String> = [
@@ -213,6 +239,7 @@ final class SyncService: ObservableObject {
     /// Check HealthKit authorization and FreeReps connectivity before syncing.
     /// Returns a list of issues that need user attention.
     func validatePrerequisites(config: FreeRepsConfig) async -> [SyncPrerequisiteIssue] {
+        guard HealthSyncSelection.shared.isEnabled else { return [] }
         var issues: [SyncPrerequisiteIssue] = []
 
         // Check HealthKit availability
@@ -265,7 +292,8 @@ final class SyncService: ObservableObject {
     // MARK: - Single-category sync
 
     func runSingleCategorySync(categoryID: String, config: FreeRepsConfig) async {
-        guard !Self.isSyncRunning, !syncState.isAnySyncRunning else { return }
+        guard HealthSyncSelection.shared.includes(categoryID) else { return }
+        guard !Self.isSyncRunning, !syncState.isAnySyncRunning, beginSelectedSync() else { return }
         syncState.isFullSyncRunning = true
         SyncService.isSyncRunning = true
         defer { SyncService.isSyncRunning = false }
@@ -280,6 +308,7 @@ final class SyncService: ObservableObject {
             connectFreeReps(config: config)
             guard let freereps else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
             _ = try await freereps.ping()
+            try checkSelection()
 
             syncState.updateCategory(categoryID, status: .syncing)
             syncState.currentOperation = "Syncing\u{2026}"
@@ -320,6 +349,8 @@ final class SyncService: ObservableObject {
                 }
             }
 
+            try checkSelection()
+
             syncState.updateCategory(categoryID, status: .completed, recordCount: count, lastSyncDate: Date())
             syncState.currentOperation = ""
             // Clear cursor so a future full sync re-visits this category from the beginning
@@ -331,7 +362,7 @@ final class SyncService: ObservableObject {
         } catch is CancellationError {
             disconnectFreeReps()
             endLiveActivity(totalRecords: syncState.totalRecords)
-            syncState.currentOperation = "Sync cancelled"
+            syncState.currentOperation = HealthSyncSelection.shared.isEnabled ? "Sync stopped; progress saved" : "Apple Health sync is paused"
             if case .syncing = syncState.categories.first(where: { $0.id == categoryID })?.status {
                 syncState.updateCategory(categoryID, status: .idle)
             }
@@ -351,7 +382,7 @@ final class SyncService: ObservableObject {
     // MARK: - Historical backfill (windowed, resumable)
 
     func runHistoricalBackfill(config: FreeRepsConfig) async {
-        guard !Self.isSyncRunning, !syncState.isAnySyncRunning else { return }
+        guard !Self.isSyncRunning, !syncState.isAnySyncRunning, beginSelectedSync() else { return }
         syncState.isFullSyncRunning = true
         SyncService.isSyncRunning = true
         defer { SyncService.isSyncRunning = false }
@@ -420,13 +451,15 @@ final class SyncService: ObservableObject {
             connectFreeReps(config: config)
             guard let freereps else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
             _ = try await freereps.ping()
+            try checkSelection()
 
             var failedCategories: [String] = []
 
             // Quantity categories — 90-day windowed backfill
             for (cat, types) in HealthDataTypes.quantityTypesByCategory {
                 let catID = "qty_\(cat.rawValue)"
-                try Task.checkCancellation()
+                guard HealthSyncSelection.shared.includes(catID) else { continue }
+                try checkSelection()
                 if syncState.backfillCursors[catID] == anchor { continue }
 
                 syncState.updateCategory(catID, status: .syncing)
@@ -436,6 +469,7 @@ final class SyncService: ObservableObject {
                         catID: catID, cat: cat, types: types,
                         from: historicalStart, until: anchor, config: config
                     )
+                    try checkSelection()
                     syncState.updateCategory(catID, status: .completed, recordCount: count, lastSyncDate: Date())
                     updateLiveActivity(phase: cat.rawValue, operation: "Backfilled \(cat.rawValue) (\(count.formatted()) records)", records: count)
                 } catch is CancellationError {
@@ -456,7 +490,8 @@ final class SyncService: ObservableObject {
                 ("cat_workout_routes", "Workout Routes"),
             ]
             for (catID, displayName) in heavySpecials {
-                try Task.checkCancellation()
+                guard HealthSyncSelection.shared.includes(catID) else { continue }
+                try checkSelection()
                 if syncState.backfillCursors[catID] == anchor { continue }
 
                 syncState.updateCategory(catID, status: .syncing)
@@ -480,6 +515,7 @@ final class SyncService: ObservableObject {
                             return 0
                         }
                     }
+                    try checkSelection()
                     syncState.updateCategory(catID, status: .completed, recordCount: count, lastSyncDate: Date())
                     updateLiveActivity(phase: displayName, operation: "Backfilled \(displayName) (\(count.formatted()) records)", records: count)
                 } catch is CancellationError {
@@ -499,11 +535,12 @@ final class SyncService: ObservableObject {
                 ("cat_vision", "Vision Prescriptions"),
                 ("cat_state_of_mind", "State of Mind"),
             ]
-            try Task.checkCancellation()
+            try checkSelection()
             syncState.currentOperation = "Backfilling sparse categories\u{2026}"
             do {
                 try await withThrowingTaskGroup(of: (String, String, Int).self) { group in
                     for (catID, displayName) in sparseSpecials {
+                        guard HealthSyncSelection.shared.includes(catID) else { continue }
                         if syncState.backfillCursors[catID] == anchor { continue }
                         syncState.updateCategory(catID, status: .syncing)
 
@@ -521,6 +558,7 @@ final class SyncService: ObservableObject {
                         }
                     }
                     for try await (catID, displayName, count) in group {
+                        try checkSelection()
                         syncState.updateCategory(catID, status: .completed, recordCount: count, lastSyncDate: Date())
                         syncState.backfillCursors[catID] = anchor
                         updateLiveActivity(phase: displayName, operation: "Backfilled \(displayName) (\(count.formatted()) records)", records: count)
@@ -536,7 +574,7 @@ final class SyncService: ObservableObject {
             syncState.persist()
 
             // Mark complete even if some categories failed — successful ones keep their progress.
-            syncState.hasCompletedFullSync = failedCategories.isEmpty
+            syncState.hasCompletedFullSync = failedCategories.isEmpty && HealthSyncSelection.shared.disabledCategories.isEmpty
             if failedCategories.isEmpty { syncState.lastSyncDate = anchor }
             if failedCategories.isEmpty {
                 syncState.currentOperation = "Backfill complete"
@@ -552,7 +590,7 @@ final class SyncService: ObservableObject {
         } catch is CancellationError {
             disconnectFreeReps()
             endLiveActivity(totalRecords: syncState.totalRecords)
-            syncState.currentOperation = "Sync cancelled"
+            syncState.currentOperation = HealthSyncSelection.shared.isEnabled ? "Sync stopped; progress saved" : "Apple Health sync is paused"
             for i in syncState.categories.indices {
                 if case .syncing = syncState.categories[i].status {
                     syncState.categories[i].status = .idle
@@ -596,9 +634,10 @@ final class SyncService: ObservableObject {
             : 0
 
         while cursor < anchor {
-            try Task.checkCancellation()
+            try checkSelection()
             guard let freereps else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
             _ = try await freereps.ping()
+            try checkSelection()
 
             let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
             var windowTotal = 0
@@ -664,9 +703,10 @@ final class SyncService: ObservableObject {
             : 0
 
         while cursor < anchor {
-            try Task.checkCancellation()
+            try checkSelection()
             guard let freereps else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
             _ = try await freereps.ping()
+            try checkSelection()
 
             let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
             var retries = 0
@@ -712,7 +752,7 @@ final class SyncService: ObservableObject {
     }
 
     func runIncrementalSync(config: FreeRepsConfig) async {
-        guard !Self.isSyncRunning, !syncState.isAnySyncRunning else { return }
+        guard !Self.isSyncRunning, !syncState.isAnySyncRunning, beginSelectedSync() else { return }
         syncState.isIncrementalSyncRunning = true
         SyncService.isSyncRunning = true
         defer {
@@ -770,6 +810,7 @@ final class SyncService: ObservableObject {
             connectFreeReps(config: config)
             guard let freereps else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
             _ = try await freereps.ping()
+            try checkSelection()
 
             // Find last sync date from UserDefaults-backed syncState.
             // Daily sync has a bounded bootstrap. Older history is a separate operation.
@@ -789,14 +830,15 @@ final class SyncService: ObservableObject {
 
             for (cat, types) in HealthDataTypes.quantityTypesByCategory {
                 let catID = "qty_\(cat.rawValue)"
+                guard HealthSyncSelection.shared.includes(catID) else { continue }
                 let querySince = recentQueryStart(categoryID: catID, now: syncStartedAt)
-                try Task.checkCancellation()
+                try checkSelection()
 
                 syncState.updateCategory(catID, status: .syncing)
                 var catDelta = 0
                 var failedTypes: [String] = []
                 for typeDesc in types {
-                    try Task.checkCancellation()
+                    try checkSelection()
                     do {
                         await SyncTrace.shared.record("quantity.started", ["type": typeDesc.id])
                         catDelta += try await syncQuantityType(typeDesc: typeDesc, since: querySince)
@@ -816,6 +858,7 @@ final class SyncService: ObservableObject {
                 }
                 let existing = syncState.categories.first(where: { $0.id == catID })?.recordCount ?? 0
                 if failedTypes.isEmpty {
+                    try checkSelection()
                     syncState.updateCategory(catID, status: .completed, recordCount: existing + catDelta, lastSyncDate: Date())
                 } else {
                     failedCategories.append(cat.rawValue)
@@ -827,196 +870,237 @@ final class SyncService: ObservableObject {
                 updateLiveActivity(phase: cat.rawValue, operation: "Synced \(cat.rawValue) (\(catDelta) records)", records: total)
             }
 
-            try Task.checkCancellation()
-            syncState.updateCategory("cat_category", status: .syncing)
-            do {
-                let catCount = try await syncCategorySamples(since: recentQueryStart(categoryID: "cat_category", now: syncStartedAt))
-                let existingCat = syncState.categories.first(where: { $0.id == "cat_category" })?.recordCount ?? 0
-                syncState.updateCategory("cat_category", status: .completed, recordCount: existingCat + catCount, lastSyncDate: Date())
-                total += catCount
-                updateLiveActivity(phase: "Health Events", operation: "Synced Health Events (\(catCount) records)", records: total)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                    throw error
-                } else {
-                    failedCategories.append("Category Samples")
-                    syncState.updateCategory("cat_category", status: .failed(error.localizedDescription))
+            if HealthSyncSelection.shared.includes("cat_category") {
+                let querySince = recentQueryStart(categoryID: "cat_category", now: syncStartedAt)
+                try checkSelection()
+                syncState.updateCategory("cat_category", status: .syncing)
+                do {
+                    let catCount = try await syncCategorySamples(since: querySince)
+                    let existingCat = syncState.categories.first(where: { $0.id == "cat_category" })?.recordCount ?? 0
+                    try checkSelection()
+                    syncState.updateCategory("cat_category", status: .completed, recordCount: existingCat + catCount, lastSyncDate: Date())
+                    total += catCount
+                    updateLiveActivity(phase: "Health Events", operation: "Synced Health Events (\(catCount) records)", records: total)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                        throw error
+                    } else {
+                        failedCategories.append("Category Samples")
+                        syncState.updateCategory("cat_category", status: .failed(error.localizedDescription))
+                    }
                 }
             }
 
-            try Task.checkCancellation()
-            syncState.updateCategory("cat_workouts", status: .syncing)
-            do {
-                let workoutCount = try await syncWorkouts(since: recentQueryStart(categoryID: "cat_workouts", now: syncStartedAt))
-                let existingWorkouts = syncState.categories.first(where: { $0.id == "cat_workouts" })?.recordCount ?? 0
-                syncState.updateCategory("cat_workouts", status: .completed, recordCount: existingWorkouts + workoutCount, lastSyncDate: Date())
-                total += workoutCount
-                updateLiveActivity(phase: "Workouts", operation: "Synced Workouts (\(workoutCount) records)", records: total)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                    throw error
-                } else {
-                    failedCategories.append("Workouts")
-                    syncState.updateCategory("cat_workouts", status: .failed(error.localizedDescription))
+            if HealthSyncSelection.shared.includes("cat_workouts") {
+                let querySince = recentQueryStart(categoryID: "cat_workouts", now: syncStartedAt)
+                try checkSelection()
+                syncState.updateCategory("cat_workouts", status: .syncing)
+                do {
+                    let workoutCount = try await syncWorkouts(since: querySince)
+                    let existingWorkouts = syncState.categories.first(where: { $0.id == "cat_workouts" })?.recordCount ?? 0
+                    try checkSelection()
+                    syncState.updateCategory("cat_workouts", status: .completed, recordCount: existingWorkouts + workoutCount, lastSyncDate: Date())
+                    total += workoutCount
+                    updateLiveActivity(phase: "Workouts", operation: "Synced Workouts (\(workoutCount) records)", records: total)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                        throw error
+                    } else {
+                        failedCategories.append("Workouts")
+                        syncState.updateCategory("cat_workouts", status: .failed(error.localizedDescription))
+                    }
                 }
             }
 
-            try Task.checkCancellation()
-            syncState.updateCategory("cat_bp", status: .syncing)
-            do {
-                let bpCount = try await syncBloodPressure(since: recentQueryStart(categoryID: "cat_bp", now: syncStartedAt))
-                let existingBP = syncState.categories.first(where: { $0.id == "cat_bp" })?.recordCount ?? 0
-                syncState.updateCategory("cat_bp", status: .completed, recordCount: existingBP + bpCount, lastSyncDate: Date())
-                total += bpCount
-                updateLiveActivity(phase: "Blood Pressure", operation: "Synced Blood Pressure (\(bpCount) records)", records: total)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                    throw error
-                } else {
-                    failedCategories.append("Blood Pressure")
-                    syncState.updateCategory("cat_bp", status: .failed(error.localizedDescription))
+            if HealthSyncSelection.shared.includes("cat_bp") {
+                let querySince = recentQueryStart(categoryID: "cat_bp", now: syncStartedAt)
+                try checkSelection()
+                syncState.updateCategory("cat_bp", status: .syncing)
+                do {
+                    let bpCount = try await syncBloodPressure(since: querySince)
+                    let existingBP = syncState.categories.first(where: { $0.id == "cat_bp" })?.recordCount ?? 0
+                    try checkSelection()
+                    syncState.updateCategory("cat_bp", status: .completed, recordCount: existingBP + bpCount, lastSyncDate: Date())
+                    total += bpCount
+                    updateLiveActivity(phase: "Blood Pressure", operation: "Synced Blood Pressure (\(bpCount) records)", records: total)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                        throw error
+                    } else {
+                        failedCategories.append("Blood Pressure")
+                        syncState.updateCategory("cat_bp", status: .failed(error.localizedDescription))
+                    }
                 }
             }
 
-            try Task.checkCancellation()
-            syncState.updateCategory("cat_ecg", status: .syncing)
-            do {
-                let ecgCount = try await syncECG(since: recentQueryStart(categoryID: "cat_ecg", now: syncStartedAt))
-                let existingECG = syncState.categories.first(where: { $0.id == "cat_ecg" })?.recordCount ?? 0
-                syncState.updateCategory("cat_ecg", status: .completed, recordCount: existingECG + ecgCount, lastSyncDate: Date())
-                total += ecgCount
-                updateLiveActivity(phase: "ECG", operation: "Synced ECG (\(ecgCount) records)", records: total)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                    throw error
-                } else {
-                    failedCategories.append("ECG")
-                    syncState.updateCategory("cat_ecg", status: .failed(error.localizedDescription))
+            if HealthSyncSelection.shared.includes("cat_ecg") {
+                let querySince = recentQueryStart(categoryID: "cat_ecg", now: syncStartedAt)
+                try checkSelection()
+                syncState.updateCategory("cat_ecg", status: .syncing)
+                do {
+                    let ecgCount = try await syncECG(since: querySince)
+                    let existingECG = syncState.categories.first(where: { $0.id == "cat_ecg" })?.recordCount ?? 0
+                    try checkSelection()
+                    syncState.updateCategory("cat_ecg", status: .completed, recordCount: existingECG + ecgCount, lastSyncDate: Date())
+                    total += ecgCount
+                    updateLiveActivity(phase: "ECG", operation: "Synced ECG (\(ecgCount) records)", records: total)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                        throw error
+                    } else {
+                        failedCategories.append("ECG")
+                        syncState.updateCategory("cat_ecg", status: .failed(error.localizedDescription))
+                    }
                 }
             }
 
-            try Task.checkCancellation()
-            syncState.updateCategory("cat_audiogram", status: .syncing)
-            do {
-                let audioCount = try await syncAudiograms(since: recentQueryStart(categoryID: "cat_audiogram", now: syncStartedAt))
-                let existingAudio = syncState.categories.first(where: { $0.id == "cat_audiogram" })?.recordCount ?? 0
-                syncState.updateCategory("cat_audiogram", status: .completed, recordCount: existingAudio + audioCount, lastSyncDate: Date())
-                total += audioCount
-                updateLiveActivity(phase: "Audiograms", operation: "Synced Audiograms (\(audioCount) records)", records: total)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                    throw error
-                } else {
-                    failedCategories.append("Audiograms")
-                    syncState.updateCategory("cat_audiogram", status: .failed(error.localizedDescription))
+            if HealthSyncSelection.shared.includes("cat_audiogram") {
+                let querySince = recentQueryStart(categoryID: "cat_audiogram", now: syncStartedAt)
+                try checkSelection()
+                syncState.updateCategory("cat_audiogram", status: .syncing)
+                do {
+                    let audioCount = try await syncAudiograms(since: querySince)
+                    let existingAudio = syncState.categories.first(where: { $0.id == "cat_audiogram" })?.recordCount ?? 0
+                    try checkSelection()
+                    syncState.updateCategory("cat_audiogram", status: .completed, recordCount: existingAudio + audioCount, lastSyncDate: Date())
+                    total += audioCount
+                    updateLiveActivity(phase: "Audiograms", operation: "Synced Audiograms (\(audioCount) records)", records: total)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                        throw error
+                    } else {
+                        failedCategories.append("Audiograms")
+                        syncState.updateCategory("cat_audiogram", status: .failed(error.localizedDescription))
+                    }
                 }
             }
 
-            try Task.checkCancellation()
-            syncState.updateCategory("cat_activity_summaries", status: .syncing)
-            do {
-                let activityCount = try await syncActivitySummaries(since: recentQueryStart(categoryID: "cat_activity_summaries", now: syncStartedAt))
-                let existingActivity = syncState.categories.first(where: { $0.id == "cat_activity_summaries" })?.recordCount ?? 0
-                syncState.updateCategory("cat_activity_summaries", status: .completed, recordCount: existingActivity + activityCount, lastSyncDate: Date())
-                total += activityCount
-                updateLiveActivity(phase: "Activity Rings", operation: "Synced Activity Rings (\(activityCount) records)", records: total)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                    throw error
-                } else {
-                    failedCategories.append("Activity Summaries")
-                    syncState.updateCategory("cat_activity_summaries", status: .failed(error.localizedDescription))
+            if HealthSyncSelection.shared.includes("cat_activity_summaries") {
+                let querySince = recentQueryStart(categoryID: "cat_activity_summaries", now: syncStartedAt)
+                try checkSelection()
+                syncState.updateCategory("cat_activity_summaries", status: .syncing)
+                do {
+                    let activityCount = try await syncActivitySummaries(since: querySince)
+                    let existingActivity = syncState.categories.first(where: { $0.id == "cat_activity_summaries" })?.recordCount ?? 0
+                    try checkSelection()
+                    syncState.updateCategory("cat_activity_summaries", status: .completed, recordCount: existingActivity + activityCount, lastSyncDate: Date())
+                    total += activityCount
+                    updateLiveActivity(phase: "Activity Rings", operation: "Synced Activity Rings (\(activityCount) records)", records: total)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                        throw error
+                    } else {
+                        failedCategories.append("Activity Summaries")
+                        syncState.updateCategory("cat_activity_summaries", status: .failed(error.localizedDescription))
+                    }
                 }
             }
 
-            try Task.checkCancellation()
-            syncState.updateCategory("cat_workout_routes", status: .syncing)
-            do {
-                let routeCount = try await syncWorkoutRoutes(since: recentQueryStart(categoryID: "cat_workout_routes", now: syncStartedAt))
-                let existingRoutes = syncState.categories.first(where: { $0.id == "cat_workout_routes" })?.recordCount ?? 0
-                syncState.updateCategory("cat_workout_routes", status: .completed, recordCount: existingRoutes + routeCount, lastSyncDate: Date())
-                total += routeCount
-                updateLiveActivity(phase: "Workout Routes", operation: "Synced Workout Routes (\(routeCount) records)", records: total)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                    throw error
-                } else {
-                    failedCategories.append("Workout Routes")
-                    syncState.updateCategory("cat_workout_routes", status: .failed(error.localizedDescription))
+            if HealthSyncSelection.shared.includes("cat_workout_routes") {
+                let querySince = recentQueryStart(categoryID: "cat_workout_routes", now: syncStartedAt)
+                try checkSelection()
+                syncState.updateCategory("cat_workout_routes", status: .syncing)
+                do {
+                    let routeCount = try await syncWorkoutRoutes(since: querySince)
+                    let existingRoutes = syncState.categories.first(where: { $0.id == "cat_workout_routes" })?.recordCount ?? 0
+                    try checkSelection()
+                    syncState.updateCategory("cat_workout_routes", status: .completed, recordCount: existingRoutes + routeCount, lastSyncDate: Date())
+                    total += routeCount
+                    updateLiveActivity(phase: "Workout Routes", operation: "Synced Workout Routes (\(routeCount) records)", records: total)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                        throw error
+                    } else {
+                        failedCategories.append("Workout Routes")
+                        syncState.updateCategory("cat_workout_routes", status: .failed(error.localizedDescription))
+                    }
                 }
             }
 
-            try Task.checkCancellation()
-            syncState.updateCategory("cat_medications", status: .syncing)
-            do {
-                let medCount = try await syncMedications(since: recentQueryStart(categoryID: "cat_medications", now: syncStartedAt))
-                let existingMeds = syncState.categories.first(where: { $0.id == "cat_medications" })?.recordCount ?? 0
-                syncState.updateCategory("cat_medications", status: .completed, recordCount: existingMeds + medCount, lastSyncDate: Date())
-                total += medCount
-                updateLiveActivity(phase: "Medications", operation: "Synced Medications (\(medCount) records)", records: total)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                    throw error
-                } else {
-                    failedCategories.append("Medications")
-                    syncState.updateCategory("cat_medications", status: .failed(error.localizedDescription))
+            if HealthSyncSelection.shared.includes("cat_medications") {
+                let querySince = recentQueryStart(categoryID: "cat_medications", now: syncStartedAt)
+                try checkSelection()
+                syncState.updateCategory("cat_medications", status: .syncing)
+                do {
+                    let medCount = try await syncMedications(since: querySince)
+                    let existingMeds = syncState.categories.first(where: { $0.id == "cat_medications" })?.recordCount ?? 0
+                    try checkSelection()
+                    syncState.updateCategory("cat_medications", status: .completed, recordCount: existingMeds + medCount, lastSyncDate: Date())
+                    total += medCount
+                    updateLiveActivity(phase: "Medications", operation: "Synced Medications (\(medCount) records)", records: total)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                        throw error
+                    } else {
+                        failedCategories.append("Medications")
+                        syncState.updateCategory("cat_medications", status: .failed(error.localizedDescription))
+                    }
                 }
             }
 
-            try Task.checkCancellation()
-            syncState.updateCategory("cat_vision", status: .syncing)
-            do {
-                let visionCount = try await syncVisionPrescriptions(since: recentQueryStart(categoryID: "cat_vision", now: syncStartedAt))
-                let existingVision = syncState.categories.first(where: { $0.id == "cat_vision" })?.recordCount ?? 0
-                syncState.updateCategory("cat_vision", status: .completed, recordCount: existingVision + visionCount, lastSyncDate: Date())
-                total += visionCount
-                updateLiveActivity(phase: "Vision", operation: "Synced Vision Prescriptions (\(visionCount) records)", records: total)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                    throw error
-                } else {
-                    failedCategories.append("Vision Prescriptions")
-                    syncState.updateCategory("cat_vision", status: .failed(error.localizedDescription))
+            if HealthSyncSelection.shared.includes("cat_vision") {
+                let querySince = recentQueryStart(categoryID: "cat_vision", now: syncStartedAt)
+                try checkSelection()
+                syncState.updateCategory("cat_vision", status: .syncing)
+                do {
+                    let visionCount = try await syncVisionPrescriptions(since: querySince)
+                    let existingVision = syncState.categories.first(where: { $0.id == "cat_vision" })?.recordCount ?? 0
+                    try checkSelection()
+                    syncState.updateCategory("cat_vision", status: .completed, recordCount: existingVision + visionCount, lastSyncDate: Date())
+                    total += visionCount
+                    updateLiveActivity(phase: "Vision", operation: "Synced Vision Prescriptions (\(visionCount) records)", records: total)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                        throw error
+                    } else {
+                        failedCategories.append("Vision Prescriptions")
+                        syncState.updateCategory("cat_vision", status: .failed(error.localizedDescription))
+                    }
                 }
             }
 
-            try Task.checkCancellation()
-            syncState.updateCategory("cat_state_of_mind", status: .syncing)
-            do {
-                let somCount = try await syncStateOfMind(since: recentQueryStart(categoryID: "cat_state_of_mind", now: syncStartedAt))
-                let existingSOM = syncState.categories.first(where: { $0.id == "cat_state_of_mind" })?.recordCount ?? 0
-                syncState.updateCategory("cat_state_of_mind", status: .completed, recordCount: existingSOM + somCount, lastSyncDate: Date())
-                total += somCount
-                updateLiveActivity(phase: "State of Mind", operation: "Synced State of Mind (\(somCount) records)", records: total)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                    throw error
-                } else {
-                    failedCategories.append("State of Mind")
-                    syncState.updateCategory("cat_state_of_mind", status: .failed(error.localizedDescription))
+            if HealthSyncSelection.shared.includes("cat_state_of_mind") {
+                let querySince = recentQueryStart(categoryID: "cat_state_of_mind", now: syncStartedAt)
+                try checkSelection()
+                syncState.updateCategory("cat_state_of_mind", status: .syncing)
+                do {
+                    let somCount = try await syncStateOfMind(since: querySince)
+                    let existingSOM = syncState.categories.first(where: { $0.id == "cat_state_of_mind" })?.recordCount ?? 0
+                    try checkSelection()
+                    syncState.updateCategory("cat_state_of_mind", status: .completed, recordCount: existingSOM + somCount, lastSyncDate: Date())
+                    total += somCount
+                    updateLiveActivity(phase: "State of Mind", operation: "Synced State of Mind (\(somCount) records)", records: total)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                        throw error
+                    } else {
+                        failedCategories.append("State of Mind")
+                        syncState.updateCategory("cat_state_of_mind", status: .failed(error.localizedDescription))
+                    }
                 }
             }
 
+            try checkSelection()
             if !failedCategories.isEmpty {
                 syncState.errorMessage = "Sync completed with errors in: \(failedCategories.joined(separator: ", "))"
             }
@@ -1030,7 +1114,7 @@ final class SyncService: ObservableObject {
         } catch is CancellationError {
             disconnectFreeReps()
             endLiveActivity(totalRecords: 0)
-            syncState.currentOperation = "Sync cancelled"
+            syncState.currentOperation = HealthSyncSelection.shared.isEnabled ? "Sync stopped; progress saved" : "Apple Health sync is paused"
             syncState.persist()
         } catch let error as HKError where isBackgroundSync && error.code == .errorDatabaseInaccessible {
             disconnectFreeReps()
@@ -1056,6 +1140,7 @@ final class SyncService: ObservableObject {
 
     /// Safely sends a payload to FreeReps, throwing if the service is not initialized.
     private func ingest(_ payload: FreeRepsPayload) async throws -> IngestResult {
+        try checkSelection()
         guard let freereps else {
             throw FreeRepsError.connectionFailed("FreeReps service not initialized")
         }
@@ -1065,6 +1150,7 @@ final class SyncService: ObservableObject {
     // MARK: - Activity summary sync
 
     private func syncActivitySummaries(since: Date?, until: Date? = nil) async throws -> Int {
+        try checkSelection()
         let summaries = try await healthKit.fetchActivitySummaries(from: since, until: until)
         guard !summaries.isEmpty else { return 0 }
         let calendar = Calendar.current
@@ -1085,7 +1171,7 @@ final class SyncService: ObservableObject {
             }
             guard !records.isEmpty else { continue }
             let payload = FreeRepsPayload(data: FreeRepsData(activity_summaries: records))
-            try Task.checkCancellation()
+            try checkSelection()
             let result = try await ingest(payload)
             total += result.activity_summaries_inserted ?? batch.count
         }
@@ -1095,13 +1181,15 @@ final class SyncService: ObservableObject {
     // MARK: - Workout route sync
 
     private func syncWorkoutRoutes(since: Date?, until: Date? = nil) async throws -> Int {
+        try checkSelection()
         var total = 0
         try await healthKit.streamWorkouts(from: since, until: until) { [self] workouts in
             for workout in workouts {
+                try checkSelection()
                 let routes: [HKWorkoutRoute]
                 do { routes = try await healthKit.fetchWorkoutRoutes(for: workout) } catch { continue }
                 for route in routes {
-                    try Task.checkCancellation()
+                    try checkSelection()
                     let locations: [CLLocation]
                     do { locations = try await healthKit.fetchRouteLocations(for: route) } catch { continue }
                     guard !locations.isEmpty else { continue }
@@ -1141,6 +1229,7 @@ final class SyncService: ObservableObject {
     // MARK: - Medication sync
 
     private func syncMedications(since: Date?, until: Date? = nil) async throws -> Int {
+        try checkSelection()
         if #available(iOS 26, *) {
             return try await syncMedicationsIOS26(since: since, until: until)
         }
@@ -1155,7 +1244,7 @@ final class SyncService: ObservableObject {
         if medications.isEmpty {
             let events = try await healthKit.fetchMedicationDoseEvents(from: since, until: until)
             for event in events {
-                try Task.checkCancellation()
+                try checkSelection()
                 total += try await ingestMedicationDoseEvent(event, medicationName: nil)
             }
             return total
@@ -1172,7 +1261,7 @@ final class SyncService: ObservableObject {
                 from: since, until: until, additionalPredicate: conceptPredicate
             )
             for event in events {
-                try Task.checkCancellation()
+                try checkSelection()
                 total += try await ingestMedicationDoseEvent(event, medicationName: concept.displayText)
             }
         }
@@ -1221,6 +1310,7 @@ final class SyncService: ObservableObject {
         onBatchInserted: ((Int) -> Void)? = nil
     ) async throws -> Int {
         guard let metricName = hkToFreeRepsMetricName[typeDesc.id] else { return 0 }
+        try checkSelection()
 
         // Use on-device aggregation for high-frequency discrete types (e.g. heart rate).
         if case .aggregate(let interval) = typeDesc.syncStrategy {
@@ -1259,7 +1349,7 @@ final class SyncService: ObservableObject {
                 }
                 let metric = FreeRepsMetric(name: metricName, units: typeDesc.unitString, data: points)
                 let payload = FreeRepsPayload(data: FreeRepsData(metrics: [metric]))
-                try Task.checkCancellation()
+                try checkSelection()
                 let result = try await ingest(payload)
                 total += result.metrics_inserted ?? batch.count
                 onBatchInserted?(total)
@@ -1297,7 +1387,7 @@ final class SyncService: ObservableObject {
             }
             let metric = FreeRepsMetric(name: metricName, units: typeDesc.unitString, data: points)
             let payload = FreeRepsPayload(data: FreeRepsData(metrics: [metric]))
-            try Task.checkCancellation()
+            try checkSelection()
             let result = try await ingest(payload)
             total += result.metrics_inserted ?? batch.count
             onBatchInserted?(total)
@@ -1334,7 +1424,7 @@ final class SyncService: ObservableObject {
             }
             let metric = FreeRepsMetric(name: metricName, units: typeDesc.unitString, data: points)
             let payload = FreeRepsPayload(data: FreeRepsData(metrics: [metric]))
-            try Task.checkCancellation()
+            try checkSelection()
             let result = try await ingest(payload)
             total += result.metrics_inserted ?? batch.count
             onBatchInserted?(total)
@@ -1345,8 +1435,10 @@ final class SyncService: ObservableObject {
     // MARK: - Category sync
 
     private func syncCategorySamples(since: Date?, until: Date? = nil, insertBatchSize: Int = batchSize) async throws -> Int {
+        try checkSelection()
         var total = 0
         for typeDesc in HealthDataTypes.allCategoryTypes {
+            try checkSelection()
             try await healthKit.streamCategorySamples(typeID: typeDesc.hkIdentifier, from: since, until: until) { hkBatch in
                 for batch in hkBatch.chunked(into: insertBatchSize) {
                     let samples = batch.map { s in
@@ -1361,7 +1453,7 @@ final class SyncService: ObservableObject {
                         )
                     }
                     let payload = FreeRepsPayload(data: FreeRepsData(category_samples: samples))
-                    try Task.checkCancellation()
+                    try checkSelection()
                     let result = try await ingest(payload)
                     total += result.category_samples_inserted ?? batch.count
                 }
@@ -1373,12 +1465,14 @@ final class SyncService: ObservableObject {
     // MARK: - Workout sync
 
     private func syncWorkouts(since: Date?, until: Date? = nil) async throws -> Int {
+        try checkSelection()
         var total = 0
         let hrUnit = HKUnit(from: "count/min")
         try await healthKit.streamWorkouts(from: since, until: until) { workouts in
             for batch in workouts.chunked(into: batchSize) {
                 var hbWorkouts: [FreeRepsWorkout] = []
                 for w in batch {
+                    try checkSelection()
                     // Query per-minute HR aggregates for this workout's time window
                     var hrData: [FreeRepsWorkoutHRPoint]?
                     if w.duration > 0 {
@@ -1443,7 +1537,7 @@ final class SyncService: ObservableObject {
                     ))
                 }
                 let payload = FreeRepsPayload(data: FreeRepsData(workouts: hbWorkouts))
-                try Task.checkCancellation()
+                try checkSelection()
                 let result = try await ingest(payload)
                 total += result.workouts_inserted ?? batch.count
             }
@@ -1454,6 +1548,7 @@ final class SyncService: ObservableObject {
     // MARK: - Blood pressure sync
 
     private func syncBloodPressure(since: Date?, until: Date? = nil) async throws -> Int {
+        try checkSelection()
         let correlations = try await healthKit.fetchBloodPressure(from: since, until: until)
         guard !correlations.isEmpty else { return 0 }
 
@@ -1486,6 +1581,7 @@ final class SyncService: ObservableObject {
     // MARK: - ECG sync
 
     private func syncECG(since: Date?, until: Date? = nil) async throws -> Int {
+        try checkSelection()
         let recordings = try await healthKit.fetchECG(from: since, until: until)
         guard !recordings.isEmpty else { return 0 }
 
@@ -1494,6 +1590,7 @@ final class SyncService: ObservableObject {
         for batch in recordings.chunked(into: 50) {
             var items: [FreeRepsECG] = []
             for ecg in batch {
+                try checkSelection()
                 let voltages = try await healthKit.fetchECGVoltageMeasurements(for: ecg)
                 let mvUnit = HKUnit(from: "mV")
                 let voltageArray = voltages.compactMap { v -> Double? in
@@ -1511,7 +1608,7 @@ final class SyncService: ObservableObject {
                 ))
             }
             guard !items.isEmpty else { continue }
-            try Task.checkCancellation()
+            try checkSelection()
             let payload = FreeRepsPayload(data: FreeRepsData(ecg_recordings: items))
             let result = try await ingest(payload)
             total += result.ecg_recordings_inserted ?? items.count
@@ -1522,6 +1619,7 @@ final class SyncService: ObservableObject {
     // MARK: - Audiogram sync
 
     private func syncAudiograms(since: Date?, until: Date? = nil) async throws -> Int {
+        try checkSelection()
         let audiograms = try await healthKit.fetchAudiograms(from: since, until: until)
         guard !audiograms.isEmpty else { return 0 }
 
@@ -1542,7 +1640,7 @@ final class SyncService: ObservableObject {
                     source: ag.sourceRevision.source.name
                 )
             }
-            try Task.checkCancellation()
+            try checkSelection()
             let payload = FreeRepsPayload(data: FreeRepsData(audiograms: items))
             let result = try await ingest(payload)
             total += result.audiograms_inserted ?? items.count
@@ -1553,6 +1651,7 @@ final class SyncService: ObservableObject {
     // MARK: - Vision prescription sync
 
     private func syncVisionPrescriptions(since: Date?, until: Date? = nil) async throws -> Int {
+        try checkSelection()
         let prescriptions = try await healthKit.fetchVisionPrescriptions(from: since, until: until)
         guard !prescriptions.isEmpty else { return 0 }
 
@@ -1619,7 +1718,7 @@ final class SyncService: ObservableObject {
                     source: p.sourceRevision.source.name
                 )
             }
-            try Task.checkCancellation()
+            try checkSelection()
             let payload = FreeRepsPayload(data: FreeRepsData(vision_prescriptions: items))
             let result = try await ingest(payload)
             total += result.vision_prescriptions_inserted ?? items.count
@@ -1630,6 +1729,7 @@ final class SyncService: ObservableObject {
     // MARK: - State of Mind sync
 
     private func syncStateOfMind(since: Date?, until: Date? = nil) async throws -> Int {
+        try checkSelection()
         if #available(iOS 18, *) {
             return try await syncStateOfMindIOS18(since: since, until: until)
         }
@@ -1654,7 +1754,7 @@ final class SyncService: ObservableObject {
                     source: sample.sourceRevision.source.name
                 )
             }
-            try Task.checkCancellation()
+            try checkSelection()
             let payload = FreeRepsPayload(data: FreeRepsData(state_of_mind: items))
             let result = try await ingest(payload)
             total += result.state_of_mind_inserted ?? items.count

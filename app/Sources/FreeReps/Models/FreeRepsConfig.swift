@@ -1,4 +1,41 @@
 import Foundation
+import Combine
+
+/// App-level sharing choices, independent of Apple's opaque read permissions.
+@MainActor
+final class HealthSyncSelection: ObservableObject {
+    static let shared = HealthSyncSelection()
+    @Published private(set) var isEnabled: Bool
+    @Published private(set) var disabledCategories: Set<String>
+    @Published private(set) var revision = 0
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        isEnabled = defaults.object(forKey: "healthSyncEnabled") as? Bool ?? true
+        disabledCategories = Set(defaults.stringArray(forKey: "healthSyncDisabledCategories") ?? [])
+    }
+
+    func includes(_ category: String) -> Bool { !disabledCategories.contains(category) }
+
+    func setEnabled(_ enabled: Bool) {
+        guard isEnabled != enabled else { return }
+        isEnabled = enabled
+        defaults.set(enabled, forKey: "healthSyncEnabled")
+        revision += 1
+    }
+
+    func setCategory(_ category: String, enabled: Bool) {
+        guard includes(category) != enabled else { return }
+        if enabled { disabledCategories.remove(category) } else { disabledCategories.insert(category) }
+        defaults.set(disabledCategories.sorted(), forKey: "healthSyncDisabledCategories")
+        revision += 1
+    }
+
+    func checkRevision(_ expected: Int) throws {
+        guard isEnabled, revision == expected else { throw CancellationError() }
+    }
+}
 
 enum FreeRepsConfigError: LocalizedError {
     case invalidServerAddress

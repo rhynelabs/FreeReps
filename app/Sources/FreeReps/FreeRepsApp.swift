@@ -103,6 +103,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         let isFullSyncResume = UserDefaults.standard.bool(forKey: "pendingFullSyncResume")
 
         let syncTask: Task<Void, Never> = Task { @MainActor in
+            guard HealthSyncSelection.shared.isEnabled else {
+                task.setTaskCompleted(success: true)
+                return
+            }
             // If a foreground sync is already running, skip — it will handle persisting
             // state and scheduling follow-up work on its own.
             guard !SyncService.isSyncRunning else {

@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 struct SyncDashboardView: View {
     @ObservedObject var vm: SyncViewModel
+    @ObservedObject private var selection = HealthSyncSelection.shared
     @EnvironmentObject var importState: ImportState
     @State private var navigateToHealthPermissions = false
     @State private var showFilePicker = false
@@ -17,6 +18,11 @@ struct SyncDashboardView: View {
                     VStack(spacing: 16) {
                         statusHeader
                         syncButtons
+                        if !selection.isEnabled {
+                            Text("Apple Health sync is paused. Resume in Settings → Apple Health.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
                         if vm.isAnySyncRunning {
                             overallProgress
                         }
@@ -25,7 +31,7 @@ struct SyncDashboardView: View {
                 }
 
                 // No-full-sync warning banner
-                if !vm.hasCompletedFullSync && !vm.isAnySyncRunning {
+                if selection.isEnabled && !vm.hasCompletedFullSync && !vm.isAnySyncRunning {
                     Section {
                         noticeBanner(
                             icon: "exclamationmark.triangle.fill",
@@ -95,6 +101,12 @@ struct SyncDashboardView: View {
                             onSync: { vm.startCategorySync(categoryID: cat.id) },
                             isSyncRunning: vm.isAnySyncRunning
                         )
+                        .disabled(!selection.isEnabled || !selection.includes(cat.id))
+                        if !selection.includes(cat.id) {
+                            Text("Not selected for sync")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
 
@@ -192,8 +204,8 @@ struct SyncDashboardView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(vm.isAnySyncRunning)
-                .opacity(vm.isAnySyncRunning ? 0.5 : 1)
+                .disabled(vm.isAnySyncRunning || !selection.isEnabled)
+                .opacity(vm.isAnySyncRunning || !selection.isEnabled ? 0.5 : 1)
 
                 if vm.isAnySyncRunning {
                     Button {
@@ -214,7 +226,7 @@ struct SyncDashboardView: View {
             Button("Import / Resume History") {
                 vm.startFullSync()
             }
-            .disabled(vm.isAnySyncRunning)
+            .disabled(vm.isAnySyncRunning || !selection.isEnabled)
 
             Button {
                 showFilePicker = true

@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     let syncViewModel: SyncViewModel
     @StateObject private var vm = SettingsViewModel()
+    @ObservedObject private var healthSelection = HealthSyncSelection.shared
     @AppStorage("keepScreenOnDuringSync") private var keepScreenOnDuringSync = true
     @AppStorage("backgroundSyncEnabled") private var backgroundSyncEnabled = true
 
@@ -51,13 +52,16 @@ struct SettingsView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Background Sync")
                                     .font(.subheadline.weight(.semibold))
-                                Text(backgroundSyncEnabled
+                                Text(!healthSelection.isEnabled ? "Paused while Apple Health is disconnected" : backgroundSyncEnabled
                                     ? "Health data syncs automatically via FreeReps"
                                     : "No data is synced in the background")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                         }
+                    }
+                    .onChange(of: backgroundSyncEnabled) { _, _ in
+                        BackgroundSyncManager.shared.startObserving()
                     }
 
                     Toggle(isOn: $keepScreenOnDuringSync) {

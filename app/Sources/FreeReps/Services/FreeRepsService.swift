@@ -100,6 +100,11 @@ actor FreeRepsService {
         self.session = URLSession(configuration: sessionConfig)
     }
 
+    /// Cancels in-flight requests, e.g. when the user pauses Health sync.
+    func cancelRequests() {
+        session.invalidateAndCancel()
+    }
+
     /// POST a FreeReps payload to FreeReps and return the ingest result.
     func ingest(_ payload: FreeRepsPayload) async throws -> IngestResult {
         let url = try configuration.validatedBaseURL().appendingPathComponent("api/v1/ingest/")

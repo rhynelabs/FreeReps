@@ -15,9 +15,35 @@ final class HealthKitService {
 
     // MARK: - Authorization
 
+    @MainActor
+    static var selectedReadTypes: Set<HKObjectType> {
+        let selection = HealthSyncSelection.shared
+        var types = Set<HKObjectType>()
+        for (category, descriptors) in HealthDataTypes.quantityTypesByCategory where selection.includes("qty_\(category.rawValue)") {
+            for descriptor in descriptors { if let type = descriptor.hkType { types.insert(type) } }
+        }
+        if selection.includes("cat_category") {
+            for descriptor in HealthDataTypes.allCategoryTypes { if let type = descriptor.hkType { types.insert(type) } }
+        }
+        if selection.includes("cat_workouts") || selection.includes("cat_workout_routes") { types.insert(HKObjectType.workoutType()) }
+        if selection.includes("cat_workout_routes") { types.insert(HKSeriesType.workoutRoute()) }
+        if selection.includes("cat_ecg") { types.insert(HKObjectType.electrocardiogramType()) }
+        if selection.includes("cat_audiogram") { types.insert(HKObjectType.audiogramSampleType()) }
+        if selection.includes("cat_activity_summaries") { types.insert(HKObjectType.activitySummaryType()) }
+        if selection.includes("cat_bp") {
+            // Correlations cannot be requested directly; authorize their component quantities.
+            types.insert(HKQuantityType(.bloodPressureSystolic))
+            types.insert(HKQuantityType(.bloodPressureDiastolic))
+        }
+        if #available(iOS 18, *), selection.includes("cat_state_of_mind") { types.insert(HKObjectType.stateOfMindType()) }
+        return types
+    }
+
+    @MainActor
     func requestAllPermissions() async throws {
         guard isAvailable else { throw HKError(.errorHealthDataUnavailable) }
-        let readTypes = HealthDataTypes.allReadTypes
+        let readTypes = Self.selectedReadTypes
+        guard !readTypes.isEmpty else { return }
         try await store.requestAuthorization(toShare: [], read: readTypes)
         await requestVisionPrescriptionAuthorization()
         if #available(iOS 26, *) {
