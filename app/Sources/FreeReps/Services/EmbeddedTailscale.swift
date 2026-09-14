@@ -1,5 +1,6 @@
 import Foundation
 import TailscaleKit
+import Darwin
 
 enum EmbeddedTailscaleError: LocalizedError {
     case notSignedIn
@@ -22,7 +23,14 @@ private final class TailscaleLogFile: LogSink {
     private let file: FileHandle?
     private let lock = NSLock()
 
-    var logFileHandle: Int32? { pipe.fileHandleForWriting.fileDescriptor }
+    /// Tailscale takes ownership of the descriptor and closes it with the node.
+    /// Keep the pipe's descriptor for later node restarts and hand each node its
+    /// own duplicate. Reusing the original makes the next node write to a guarded,
+    /// already-closed descriptor and iOS terminates the app with EXC_GUARD.
+    var logFileHandle: Int32? {
+        let descriptor = Darwin.dup(pipe.fileHandleForWriting.fileDescriptor)
+        return descriptor >= 0 ? descriptor : nil
+    }
 
     init() {
         let url = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -89,7 +97,8 @@ final class EmbeddedTailscale: ObservableObject {
     private var connectTask: Task<Void, Error>?
     private let stateDirectory: URL
     private static let signedInKey = "embeddedTailscaleSignedIn"
-    /// One sink for the app's lifetime, so Go never writes to a closed pipe.
+    /// One sink for the app's lifetime. Each node receives its own duplicated
+    /// write descriptor from the sink.
     private static let log = TailscaleLogFile()
 
     private init() {
