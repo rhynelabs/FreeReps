@@ -27,6 +27,16 @@ struct ServerAddressTests {
                 // A useful validation error, never a forced-unwrap crash.
             }
         }
+        var tailnet = FreeRepsConfig(host: "ignored.example", port: 8080)
+        tailnet.connectionMode = .tailscale
+        tailnet.tailnetHost = "freereps.tail1234.ts.net"
+        let tailnetURL = try tailnet.validatedBaseURL()
+        precondition(tailnetURL.absoluteString == "https://freereps.tail1234.ts.net:443")
+        precondition(tailnet.usesEmbeddedTailscale)
+        let saved = try JSONDecoder().decode(FreeRepsConfig.self, from: try JSONEncoder().encode(tailnet))
+        precondition(saved == tailnet)
+        let legacy = try JSONDecoder().decode(FreeRepsConfig.self, from: Data("{\"host\":\"old.example\",\"port\":443}".utf8))
+        precondition(legacy.connectionMode == .address, "Existing installations keep their address")
         let local = try FreeRepsConfig(host: "localhost", port: 8080, useHTTPS: false).validatedBaseURL()
         precondition(local.absoluteString == "http://localhost:8080")
         let test = try FreeRepsConfig(host: "production.example", port: 443, testMode: true,
@@ -36,6 +46,6 @@ struct ServerAddressTests {
             _ = try FreeRepsConfig(host: "localhost", port: 0).validatedBaseURL()
             preconditionFailure("Accepted port zero")
         } catch is FreeRepsConfigError {}
-        print("Server address tests passed (23 cases)")
+        print("Server address tests passed (23 cases, connection modes)")
     }
 }

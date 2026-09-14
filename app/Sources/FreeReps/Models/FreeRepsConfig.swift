@@ -61,6 +61,16 @@ enum FreeRepsConfigError: LocalizedError {
 }
 
 struct FreeRepsConfig: Codable, Equatable {
+    enum ConnectionMode: String, Codable, CaseIterable {
+        /// FreeReps runs Tailscale itself; no system VPN.
+        case tailscale
+        /// A reachable address: via the Tailscale app, the home network or a proxy.
+        case address
+    }
+
+    var connectionMode: ConnectionMode = .address
+    /// MagicDNS name of the server, used in `.tailscale` mode.
+    var tailnetHost: String = ""
     var host: String
     var port: UInt16
     var useHTTPS: Bool = true
@@ -97,12 +107,18 @@ struct FreeRepsConfig: Codable, Equatable {
         backfillMonths: 24
     )
 
+    /// Test mode always connects directly to its own server.
+    var usesEmbeddedTailscale: Bool { !testMode && connectionMode == .tailscale }
+
     func validatedBaseURL() throws -> URL {
         let effectiveHost: String
         let effectivePort: UInt16
         if testMode {
             effectiveHost = testHost
             effectivePort = testPort
+        } else if connectionMode == .tailscale {
+            effectiveHost = tailnetHost
+            effectivePort = 443
         } else {
             effectiveHost = host
             effectivePort = port
@@ -140,11 +156,14 @@ struct FreeRepsConfig: Codable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case host, port, useHTTPS, testMode, testHost, testPort, backfillMonths, backfillYears
+        case connectionMode, tailnetHost, host, port, useHTTPS, testMode, testHost, testPort, backfillMonths, backfillYears
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Configurations saved before connection modes existed used an address.
+        connectionMode = try c.decodeIfPresent(ConnectionMode.self, forKey: .connectionMode) ?? .address
+        tailnetHost = try c.decodeIfPresent(String.self, forKey: .tailnetHost) ?? ""
         host = try c.decode(String.self, forKey: .host)
         port = try c.decode(UInt16.self, forKey: .port)
         useHTTPS = try c.decodeIfPresent(Bool.self, forKey: .useHTTPS) ?? true
@@ -164,6 +183,8 @@ struct FreeRepsConfig: Codable, Equatable {
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(connectionMode, forKey: .connectionMode)
+        try c.encode(tailnetHost, forKey: .tailnetHost)
         try c.encode(host, forKey: .host)
         try c.encode(port, forKey: .port)
         try c.encode(useHTTPS, forKey: .useHTTPS)
