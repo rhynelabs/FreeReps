@@ -1,34 +1,50 @@
 import Foundation
 import zlib
 
-/// Local troubleshooting events. Never records credentials, response bodies or health values.
+/// Local troubleshooting events, one JSON object per line. Never records
+/// credentials, response bodies or health values.
 actor SyncTrace {
     static let shared = SyncTrace()
     static var fileURL: URL {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("freereps-sync-trace.json")
+            .appendingPathComponent("freereps-sync-trace.jsonl")
     }
+    /// Past this size the older half is dropped when the app next starts.
+    private static let maxBytes = 8 << 20
 
     struct Event: Codable {
         let date: Date
         let stage: String
         let fields: [String: String]
     }
-    private var events: [Event] = []
+    private var handle: FileHandle?
 
-    private init() {
-        if let data = try? Data(contentsOf: Self.fileURL),
-           let saved = try? JSONDecoder().decode([Event].self, from: data) {
-            events = Array(saved.suffix(1000))
-        }
-    }
+    private init() {}
 
     func record(_ stage: String, _ fields: [String: String] = [:]) {
-        events.append(Event(date: Date(), stage: stage, fields: fields))
-        if events.count > 1000 { events.removeFirst(events.count - 1000) }
-        if let data = try? JSONEncoder().encode(events) {
-            try? data.write(to: Self.fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        guard var line = try? JSONEncoder().encode(Event(date: Date(), stage: stage, fields: fields)) else { return }
+        line.append(0x0A)
+        if handle == nil { handle = Self.openForAppending() }
+        try? handle?.write(contentsOf: line)
+    }
+
+    private static func openForAppending() -> FileHandle? {
+        let url = fileURL
+        let manager = FileManager.default
+        if let size = (try? manager.attributesOfItem(atPath: url.path)[.size] as? Int) ?? nil, size > maxBytes,
+           let data = try? Data(contentsOf: url) {
+            let tail = data[(data.count / 2)...]
+            if let newline = tail.firstIndex(of: 0x0A) {
+                try? data[(newline + 1)...].write(to: url, options: .atomic)
+            }
         }
+        if !manager.fileExists(atPath: url.path) {
+            manager.createFile(atPath: url.path, contents: nil,
+                               attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
+        }
+        guard let handle = try? FileHandle(forWritingTo: url) else { return nil }
+        _ = try? handle.seekToEnd()
+        return handle
     }
 }
 
