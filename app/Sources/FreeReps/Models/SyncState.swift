@@ -19,6 +19,7 @@ struct PersistedSnapshot: Codable {
     let backfillCursors: [String: Date]?
     let backfillAnchorDate: Date?
     var anchors: [String: Data]? = nil
+    var routesPending: [String: Date]? = nil
 }
 
 // MARK: -
@@ -91,6 +92,11 @@ class SyncState: ObservableObject {
     /// samples it covers are on the server. A daily sync reads only what was
     /// added after its anchor.
     var anchors: [String: Data] = [:]
+    /// Workouts (UUID string → end date) the routes anchor has passed but that
+    /// had no route yet: the watch can deliver the route a while after the
+    /// workout. Each is checked again on the next runs until it has one or is
+    /// too old to expect one.
+    var routesPending: [String: Date] = [:]
     /// Rows the server reported as newly inserted in the current or last run. Not persisted;
     /// this is the number the Live Activity shows.
     @Published var newRecordsThisRun = 0
@@ -131,6 +137,7 @@ class SyncState: ObservableObject {
         backfillCursors = [:]
         backfillAnchorDate = nil
         anchors = [:]
+        routesPending = [:]
         hasCompletedFullSync = false
         lastSyncDate = nil
         totalRecords = 0
@@ -149,6 +156,7 @@ class SyncState: ObservableObject {
     func resetCategoryLocalState(_ id: String) {
         backfillCursors.removeValue(forKey: id)
         anchors = anchors.filter { !$0.key.hasPrefix("\(id)/") }
+        if id == "cat_workout_routes" { routesPending = [:] }
         guard let idx = categories.firstIndex(where: { $0.id == id }) else { return }
         categories[idx].status = .idle
         categories[idx].recordCount = 0
@@ -180,7 +188,8 @@ class SyncState: ObservableObject {
             hasCompletedFullSync: hasCompletedFullSync,
             backfillCursors: backfillCursors.isEmpty ? nil : backfillCursors,
             backfillAnchorDate: backfillAnchorDate,
-            anchors: anchors.isEmpty ? nil : anchors
+            anchors: anchors.isEmpty ? nil : anchors,
+            routesPending: routesPending.isEmpty ? nil : routesPending
         )
         if let data = try? JSONEncoder().encode(snap) {
             defaults.set(data, forKey: Self.userDefaultsKey)
@@ -198,6 +207,7 @@ class SyncState: ObservableObject {
         backfillCursors = snap.backfillCursors ?? [:]
         backfillAnchorDate = snap.backfillAnchorDate
         anchors = snap.anchors ?? [:]
+        routesPending = snap.routesPending ?? [:]
         for persisted in snap.categories {
             guard let idx = categories.firstIndex(where: { $0.id == persisted.id }) else { continue }
             categories[idx].recordCount = persisted.recordCount

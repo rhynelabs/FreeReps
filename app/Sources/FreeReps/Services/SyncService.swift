@@ -1003,7 +1003,7 @@ final class SyncService: ObservableObject {
                 ("cat_ecg", "ECG", { @MainActor date in try await self.syncECG(since: date) }),
                 ("cat_audiogram", "Audiograms", { @MainActor date in try await self.syncAudiograms(since: date) }),
                 ("cat_activity_summaries", "Activity Rings", { @MainActor date in try await self.syncActivitySummaries(since: date) }),
-                ("cat_workout_routes", "Workout Routes", { @MainActor date in try await self.syncWorkoutRoutes(since: date) }),
+                ("cat_workout_routes", "Workout Routes", { @MainActor date in try await self.syncWorkoutRoutes(since: date, anchored: true) }),
                 ("cat_medications", "Medications", { @MainActor date in try await self.syncMedications(since: date) }),
                 ("cat_vision", "Vision Prescriptions", { @MainActor date in try await self.syncVisionPrescriptions(since: date) }),
                 ("cat_state_of_mind", "State of Mind", { @MainActor date in try await self.syncStateOfMind(since: date) }),
@@ -1123,50 +1123,102 @@ final class SyncService: ObservableObject {
 
     // MARK: - Workout route sync
 
-    private func syncWorkoutRoutes(since: Date?, until: Date? = nil) async throws -> Int {
+    /// How long after a workout ends a route may still arrive. Beyond this the
+    /// workout is taken to have none (indoor, treadmill, no GPS).
+    private static let routeGracePeriod: TimeInterval = 48 * 3600
+
+    private func syncWorkoutRoutes(since: Date?, until: Date? = nil, anchored: Bool = false) async throws -> Int {
         try checkSelection()
         var total = 0
-        try await healthKit.streamWorkouts(from: since, until: until) { [self] workouts in
-            for workout in workouts {
-                try checkSelection()
-                let routes: [HKWorkoutRoute]
-                do { routes = try await healthKit.fetchWorkoutRoutes(for: workout) } catch { continue }
-                for route in routes {
-                    try checkSelection()
-                    let locations: [CLLocation]
-                    do { locations = try await healthKit.fetchRouteLocations(for: route) } catch { continue }
-                    guard !locations.isEmpty else { continue }
-
-                    let routePoints = locations.map { loc in
-                        FreeRepsRoutePoint(
-                            latitude: loc.coordinate.latitude,
-                            longitude: loc.coordinate.longitude,
-                            altitude: loc.altitude,
-                            course: loc.course,
-                            courseAccuracy: loc.courseAccuracy,
-                            horizontalAccuracy: loc.horizontalAccuracy,
-                            verticalAccuracy: loc.verticalAccuracy,
-                            timestamp: haeDate(loc.timestamp),
-                            speed: loc.speed,
-                            speedAccuracy: loc.speedAccuracy
-                        )
-                    }
-                    // Send workout with route data — FreeReps uses ON CONFLICT DO NOTHING for the workout itself
-                    let hbWorkout = FreeRepsWorkout(
-                        id: workout.uuid.uuidString,
-                        name: workout.activityTypeName,
-                        start: haeDate(workout.startDate),
-                        end: haeDate(workout.endDate),
-                        duration: workout.duration,
-                        route: routePoints
-                    )
-                    let payload = FreeRepsPayload(data: FreeRepsData(workouts: [hbWorkout]))
-                    _ = try await ingest(payload)
+        if anchored, let start = since {
+            // Its own anchor, not the one of "cat_workouts": the two categories
+            // are enabled and reset independently. A failed upload leaves the
+            // anchor where it was, so the next run reads the same workouts again.
+            //
+            // The anchor tracks workouts, and the watch can deliver a workout
+            // before its route. A workout the anchor has passed without a route
+            // is kept on a retry list and checked again first on each run.
+            total += try await uploadPendingRoutes()
+            let key = Self.anchorKey(category: "cat_workout_routes", type: "workouts")
+            let changes = try await healthKit.changedWorkouts(anchor: syncState.anchors[key], fallbackSince: start)
+            for workout in changes.added {
+                if try await uploadRoutes(of: workout) {
                     total += 1
+                    syncState.routesPending.removeValue(forKey: workout.uuid.uuidString)
+                } else {
+                    syncState.routesPending[workout.uuid.uuidString] = workout.endDate
+                }
+            }
+            syncState.anchors[key] = changes.anchor
+        } else {
+            try await healthKit.streamWorkouts(from: since, until: until) { [self] workouts in
+                for workout in workouts {
+                    if try await uploadRoutes(of: workout) { total += 1 }
                 }
             }
         }
         return total
+    }
+
+    /// Retries the workouts still waiting for a route. One that has a route now
+    /// leaves the list once uploaded; one past the grace period leaves it
+    /// without; one deleted from Health stays until the grace period passes.
+    private func uploadPendingRoutes() async throws -> Int {
+        let cutoff = Date().addingTimeInterval(-Self.routeGracePeriod)
+        syncState.routesPending = syncState.routesPending.filter { $0.value >= cutoff }
+        let uuids = syncState.routesPending.keys.compactMap { UUID(uuidString: $0) }
+        guard !uuids.isEmpty else { return 0 }
+        var total = 0
+        for workout in try await healthKit.workouts(uuids: uuids) {
+            guard try await uploadRoutes(of: workout) else { continue }
+            syncState.routesPending.removeValue(forKey: workout.uuid.uuidString)
+            total += 1
+        }
+        return total
+    }
+
+    /// Sends the workout's route to the server. `false` when the workout has no
+    /// route yet — or none could be read, which is treated the same way, as a
+    /// retry costs one query and a lost route costs the map.
+    private func uploadRoutes(of workout: HKWorkout) async throws -> Bool {
+        try checkSelection()
+        var uploaded = false
+        let routes: [HKWorkoutRoute]
+        do { routes = try await healthKit.fetchWorkoutRoutes(for: workout) } catch { return false }
+        for route in routes {
+            try checkSelection()
+            let locations: [CLLocation]
+            do { locations = try await healthKit.fetchRouteLocations(for: route) } catch { continue }
+            guard !locations.isEmpty else { continue }
+
+            let routePoints = locations.map { loc in
+                FreeRepsRoutePoint(
+                    latitude: loc.coordinate.latitude,
+                    longitude: loc.coordinate.longitude,
+                    altitude: loc.altitude,
+                    course: loc.course,
+                    courseAccuracy: loc.courseAccuracy,
+                    horizontalAccuracy: loc.horizontalAccuracy,
+                    verticalAccuracy: loc.verticalAccuracy,
+                    timestamp: haeDate(loc.timestamp),
+                    speed: loc.speed,
+                    speedAccuracy: loc.speedAccuracy
+                )
+            }
+            // Send workout with route data — FreeReps uses ON CONFLICT DO NOTHING for the workout itself
+            let hbWorkout = FreeRepsWorkout(
+                id: workout.uuid.uuidString,
+                name: workout.activityTypeName,
+                start: haeDate(workout.startDate),
+                end: haeDate(workout.endDate),
+                duration: workout.duration,
+                route: routePoints
+            )
+            let payload = FreeRepsPayload(data: FreeRepsData(workouts: [hbWorkout]))
+            _ = try await ingest(payload)
+            uploaded = true
+        }
+        return uploaded
     }
 
     // MARK: - Medication sync

@@ -360,6 +360,28 @@ final class HealthKitService {
         }
     }
 
+    /// The workouts HealthKit still holds under these UUIDs; a deleted one is
+    /// simply absent from the result.
+    func workouts(uuids: [UUID]) async throws -> [HKWorkout] {
+        guard !uuids.isEmpty else { return [] }
+        let predicate = HKQuery.predicateForObjects(with: Set(uuids))
+        return try await withCheckedThrowingContinuation { continuation in
+            let query = HKSampleQuery(
+                sampleType: .workoutType(),
+                predicate: predicate,
+                limit: HKObjectQueryNoLimit,
+                sortDescriptors: nil
+            ) { _, samples, error in
+                if let error = error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: (samples as? [HKWorkout]) ?? [])
+                }
+            }
+            store.execute(query)
+        }
+    }
+
     // MARK: - Workout Routes
 
     func fetchWorkoutRoutes(for workout: HKWorkout) async throws -> [HKWorkoutRoute] {
