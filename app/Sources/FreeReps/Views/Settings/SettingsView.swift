@@ -83,7 +83,7 @@ struct SettingsView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Advanced")
                                     .font(.subheadline.weight(.semibold))
-                                Text("Backfill settings, reset sync state")
+                                Text("Older data start date, reset sync state")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }

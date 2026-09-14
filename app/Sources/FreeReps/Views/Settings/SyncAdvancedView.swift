@@ -18,10 +18,10 @@ struct SyncAdvancedView: View {
                     Text("2 Years").tag(24)
                     Text("All Data").tag(0)
                 } label: {
-                    Text("Initial Backfill")
+                    Text("Older Data")
                 }
             } footer: {
-                Text("How far back to sync HealthKit data on first full sync. Subsequent syncs only check recent data.")
+                Text("Sync Older Data sends everything in Apple Health from this point on. Sync Now only looks at recent data.")
             }
 
             Section {
