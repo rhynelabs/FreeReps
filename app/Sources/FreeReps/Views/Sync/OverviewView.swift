@@ -84,10 +84,11 @@ struct OverviewView: View {
                     .foregroundStyle(statusIcon.color)
                     .frame(width: 40)
                     .symbolEffect(.pulse, isActive: vm.isAnySyncRunning)
-                    .contentTransition(.symbolEffect(.replace))
-                    // The icon is the one thing that animates between states; the
-                    // outer transaction below is nil, so it asks for its own.
-                    .animation(.default, value: statusIcon.name)
+                    // The symbols share the filled circle, so a replace effect
+                    // draws the old and new glyph half transparent over each
+                    // other while the tint blends green to blue — the "ghost".
+                    // The icon swaps in one frame like the texts beside it.
+                    .contentTransition(.identity)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(statusTitle)
                         .font(.headline)
