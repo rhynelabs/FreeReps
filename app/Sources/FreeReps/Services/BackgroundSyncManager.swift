@@ -121,7 +121,7 @@ final class BackgroundSyncManager {
             }
         }
 
-        let state = SyncState()
+        let state = SyncState.shared
         let service = SyncService(syncState: state)
         service.isBackgroundSync = true
         service.suppressLiveActivity = true

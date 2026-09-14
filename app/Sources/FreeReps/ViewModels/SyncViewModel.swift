@@ -15,7 +15,7 @@ final class SyncViewModel: ObservableObject {
     @Published var showPrerequisiteAlert = false
 
     init() {
-        let state = SyncState()
+        let state = SyncState.shared
         self.syncState = state
         self.syncService = SyncService(syncState: state)
         // Forward SyncState changes so SwiftUI views subscribed to this

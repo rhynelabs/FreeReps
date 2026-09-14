@@ -71,8 +71,10 @@ final class SyncService: ObservableObject {
 
     init(syncState: SyncState) {
         self.syncState = syncState
-        setupCategories()
-        syncState.restore()
+        if syncState.categories.isEmpty {
+            setupCategories()
+            syncState.restore()
+        }
     }
 
     private func setupCategories() {
@@ -263,7 +265,7 @@ final class SyncService: ObservableObject {
     // MARK: - Single-category sync
 
     func runSingleCategorySync(categoryID: String, config: FreeRepsConfig) async {
-        guard !syncState.isAnySyncRunning else { return }
+        guard !Self.isSyncRunning, !syncState.isAnySyncRunning else { return }
         syncState.isFullSyncRunning = true
         SyncService.isSyncRunning = true
         defer { SyncService.isSyncRunning = false }
@@ -350,7 +352,7 @@ final class SyncService: ObservableObject {
     // MARK: - Historical backfill (windowed, resumable)
 
     func runHistoricalBackfill(config: FreeRepsConfig) async {
-        guard !syncState.isAnySyncRunning else { return }
+        guard !Self.isSyncRunning, !syncState.isAnySyncRunning else { return }
         syncState.isFullSyncRunning = true
         SyncService.isSyncRunning = true
         defer { SyncService.isSyncRunning = false }
@@ -698,10 +700,17 @@ final class SyncService: ObservableObject {
     // MARK: - Incremental sync
 
     func runIncrementalSync(config: FreeRepsConfig) async {
-        guard !syncState.isAnySyncRunning else { return }
+        guard !Self.isSyncRunning, !syncState.isAnySyncRunning else { return }
         syncState.isIncrementalSyncRunning = true
         SyncService.isSyncRunning = true
-        defer { SyncService.isSyncRunning = false }
+        defer {
+            syncState.isIncrementalSyncRunning = false
+            SyncService.isSyncRunning = false
+            for i in syncState.categories.indices where syncState.categories[i].status == .syncing {
+                syncState.categories[i].status = .idle
+            }
+            syncState.persist()
+        }
         syncState.errorMessage = nil
         startLiveActivity(isFullSync: false)
 
@@ -975,7 +984,7 @@ final class SyncService: ObservableObject {
 
             syncState.lastSyncDate = Date()
             syncState.currentOperation = "Incremental sync done (\(total) records)"
-            if !isBackgroundSync { syncState.persist() }
+            syncState.persist()
             endLiveActivity(totalRecords: total)
             disconnectFreeReps()
 
@@ -983,13 +992,13 @@ final class SyncService: ObservableObject {
             disconnectFreeReps()
             endLiveActivity(totalRecords: 0)
             syncState.currentOperation = "Sync cancelled"
-            if !isBackgroundSync { syncState.persist() }
+            syncState.persist()
         } catch {
             disconnectFreeReps()
             endLiveActivity(totalRecords: 0)
             syncState.errorMessage = error.localizedDescription
             syncState.currentOperation = ""
-            if !isBackgroundSync { syncState.persist() }
+            syncState.persist()
         }
 
         syncState.isIncrementalSyncRunning = false

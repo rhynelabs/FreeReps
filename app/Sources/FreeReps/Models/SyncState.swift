@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 // MARK: - Persistence helpers
 
@@ -68,6 +69,13 @@ struct CategorySyncState: Identifiable {
 
 @MainActor
 class SyncState: ObservableObject {
+    // Foreground views and background jobs must update the same snapshot.
+    static let shared = SyncState()
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
     @Published var isFullSyncRunning = false
     @Published var isIncrementalSyncRunning = false
     @Published var categories: [CategorySyncState] = []
@@ -95,6 +103,7 @@ class SyncState: ObservableObject {
     }
 
     func resetAllLocalState() {
+        overallProgress = 0
         backfillCursors = [:]
         backfillAnchorDate = nil
         hasCompletedFullSync = false
@@ -107,6 +116,7 @@ class SyncState: ObservableObject {
             categories[i].recordCount = 0
             categories[i].lastSyncDate = nil
             categories[i].currentProgress = 0
+            categories[i].latestHealthKitDate = nil
         }
         persist()
     }
@@ -155,13 +165,13 @@ class SyncState: ObservableObject {
             backfillAnchorDate: backfillAnchorDate
         )
         if let data = try? JSONEncoder().encode(snap) {
-            UserDefaults.standard.set(data, forKey: Self.userDefaultsKey)
+            defaults.set(data, forKey: Self.userDefaultsKey)
         }
     }
 
     func restore() {
         guard
-            let data = UserDefaults.standard.data(forKey: Self.userDefaultsKey),
+            let data = defaults.data(forKey: Self.userDefaultsKey),
             let snap = try? JSONDecoder().decode(PersistedSnapshot.self, from: data)
         else { return }
         lastSyncDate = snap.lastSyncDate

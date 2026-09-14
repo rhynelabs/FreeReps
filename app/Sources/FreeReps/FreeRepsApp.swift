@@ -109,7 +109,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                 task.setTaskCompleted(success: true)
                 return
             }
-            let state = SyncState()
+            let state = SyncState.shared
             let service = SyncService(syncState: state)
             service.isBackgroundSync = true
             if isFullSyncResume {
