@@ -10,6 +10,9 @@ struct OverviewView: View {
     @ObservedObject var vm: SyncViewModel
     @ObservedObject private var selection = HealthSyncSelection.shared
     @StateObject private var server = ServerOverview()
+    /// Ticks so "Synced 4 minutes ago" ages while the page stays open.
+    @State private var now = Date()
+    private let clock = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationStack {
@@ -24,11 +27,22 @@ struct OverviewView: View {
                 BrandFooter()
             }
             .navigationTitle("Overview")
-            .refreshable { await server.load() }
+            .refreshable {
+                // Pulling down means "get the newest data", not just re-read the server.
+                if !vm.isAnySyncRunning, selection.isEnabled { vm.startRecentSync() }
+                await server.load()
+            }
             .task { await server.load() }
-            .onAppear { vm.refreshLatestHealthKitDates() }
+            .onAppear {
+                now = Date()
+                vm.refreshLatestHealthKitDates()
+            }
+            .onReceive(clock) { now = $0 }
             .onChange(of: vm.isAnySyncRunning) { _, running in
-                if !running { Task { await server.load() } }
+                if !running {
+                    now = Date()
+                    Task { await server.load() }
+                }
             }
         }
     }
@@ -79,7 +93,6 @@ struct OverviewView: View {
                 }
             }
             .padding(.vertical, 4)
-            .animation(.default, value: statusTitle)
 
             if vm.isAnySyncRunning {
                 Button(vm.isFullSyncRunning ? "Stop" : "Cancel Sync", role: .destructive) { vm.cancelSync() }
@@ -119,8 +132,14 @@ struct OverviewView: View {
         case .failed(let message): return message
         case .behind(let count): return count == 1 ? "1 category has newer data." : "\(count) categories have newer data."
         case .neverSynced: return "Send your Health data to your server."
-        case .upToDate(let date): return "Synced \(date.formatted(.relative(presentation: .named)))"
+        case .upToDate(let date): return syncedLabel(date)
         }
+    }
+
+    /// "Synced just now" for the first minute, then "Synced 4 minutes ago".
+    private func syncedLabel(_ date: Date) -> String {
+        if now.timeIntervalSince(date) < 60 { return "Synced just now" }
+        return "Synced \(date.formatted(.relative(presentation: .named)))"
     }
 
     private var isFailed: Bool {
@@ -156,7 +175,7 @@ struct OverviewView: View {
             if let stats = server.stats {
                 statRows(stats)
             } else {
-                statRows(.init(metrics: 1_000_000, workouts: 100, sleepNights: 100, earliest: .now))
+                statRows(.init(metrics: 1_000_000, workouts: 100, sleepNights: 100, earliest: .now, latest: .now))
                     .redacted(reason: .placeholder)
             }
         } header: {
@@ -170,6 +189,9 @@ struct OverviewView: View {
 
     @ViewBuilder
     private func statRows(_ stats: ServerOverview.Stats) -> some View {
+        if let latest = stats.latest {
+            LabeledContent("Latest Data", value: latest, format: .dateTime.month(.abbreviated).day().hour().minute())
+        }
         LabeledContent("Health Metrics", value: stats.metrics, format: .number)
         LabeledContent("Workouts", value: stats.workouts, format: .number)
         LabeledContent("Sleep Nights", value: stats.sleepNights, format: .number)
@@ -209,6 +231,8 @@ final class ServerOverview: ObservableObject {
         let workouts: Int
         let sleepNights: Int
         let earliest: Date?
+        /// Newest sample the server holds, whatever sent it.
+        let latest: Date?
     }
 
     struct Night {
@@ -246,22 +270,43 @@ final class ServerOverview: ObservableObject {
         return Stats(metrics: json["total_metric_rows"] as? Int ?? 0,
                      workouts: json["total_workouts"] as? Int ?? 0,
                      sleepNights: json["total_sleep_nights"] as? Int ?? 0,
-                     earliest: (json["earliest_data"] as? String).flatMap(date))
+                     earliest: (json["earliest_data"] as? String).flatMap(date),
+                     latest: (json["latest_data"] as? String).flatMap(date))
     }
 
-    /// The newest session that ended within the last 24 hours.
+    /// The newest session that ended within the last 24 hours. Falls back to the
+    /// sleep stages of that stretch: the server builds the session from them
+    /// after an upload, and until it has, the stages are what it holds.
     private static func decodeLastNight(_ data: Data) -> Night? {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let sessions = json["sessions"] as? [[String: Any]] else { return nil }
-        let nights = sessions.compactMap { session -> Night? in
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let recent = { (end: Date) in Date().timeIntervalSince(end) < 24 * 3600 }
+        let sessions = (json["sessions"] as? [[String: Any]] ?? []).compactMap { session -> Night? in
             guard let hours = session["TotalSleep"] as? Double, hours > 0,
                   let start = (session["SleepStart"] as? String).flatMap(date),
                   let end = (session["SleepEnd"] as? String).flatMap(date) else { return nil }
             return Night(hours: hours, start: start, end: end)
         }
-        return nights
-            .filter { Date().timeIntervalSince($0.end) < 24 * 3600 }
-            .max { $0.end < $1.end }
+        if let night = sessions.filter({ recent($0.end) }).max(by: { $0.end < $1.end }) { return night }
+
+        let asleep: Set<String> = ["Core", "Deep", "REM", "Asleep"]
+        let stages = (json["stages"] as? [[String: Any]] ?? []).compactMap { stage -> (start: Date, end: Date, hours: Double)? in
+            guard let start = (stage["StartTime"] as? String).flatMap(date),
+                  let end = (stage["EndTime"] as? String).flatMap(date),
+                  let name = stage["Stage"] as? String else { return nil }
+            let hours = asleep.contains(name) ? (stage["DurationHr"] as? Double ?? 0) : 0
+            return (start, end, hours)
+        }
+        .filter { recent($0.end) }
+        .sorted { $0.start < $1.start }
+        // A break of more than three hours separates a nap from the night.
+        var night: [(start: Date, end: Date, hours: Double)] = []
+        for stage in stages {
+            if let last = night.last, stage.start.timeIntervalSince(last.end) > 3 * 3600 { night = [] }
+            night.append(stage)
+        }
+        guard let first = night.first, let last = night.last else { return nil }
+        let hours = night.reduce(0) { $0 + $1.hours }
+        return hours > 0 ? Night(hours: hours, start: first.start, end: last.end) : nil
     }
 
     private static func date(_ text: String) -> Date? {
