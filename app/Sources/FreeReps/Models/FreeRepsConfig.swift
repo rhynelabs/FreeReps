@@ -1,5 +1,13 @@
 import Foundation
 
+enum FreeRepsConfigError: LocalizedError {
+    case invalidServerAddress
+
+    var errorDescription: String? {
+        "Enter a server hostname or an http(s) address without a path, login, query or fragment."
+    }
+}
+
 struct FreeRepsConfig: Codable, Equatable {
     var host: String
     var port: UInt16
@@ -37,7 +45,7 @@ struct FreeRepsConfig: Codable, Equatable {
         backfillMonths: 24
     )
 
-    var baseURL: URL {
+    func validatedBaseURL() throws -> URL {
         let effectiveHost: String
         let effectivePort: UInt16
         if testMode {
@@ -47,8 +55,28 @@ struct FreeRepsConfig: Codable, Equatable {
             effectiveHost = host
             effectivePort = port
         }
-        let scheme = useHTTPS ? "https" : "http"
-        return URL(string: "\(scheme)://\(effectiveHost):\(effectivePort)")!
+        let input = effectiveHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty, effectivePort > 0,
+              !input.contains(where: { $0.isWhitespace }), !input.contains("\\") else {
+            throw FreeRepsConfigError.invalidServerAddress
+        }
+        let hasScheme = input.contains("://")
+        let address = hasScheme ? input : "\(useHTTPS ? "https" : "http")://\(input)"
+        guard var components = URLComponents(string: address),
+              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let hostname = components.host, !hostname.isEmpty,
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil,
+              components.path.allSatisfy({ $0 == "/" }),
+              components.port.map({ (1...65535).contains($0) }) ?? true else {
+            throw FreeRepsConfigError.invalidServerAddress
+        }
+        components.scheme = scheme
+        // A pasted URL owns its scheme and port. A hostname uses the saved controls.
+        if components.port == nil && !hasScheme { components.port = Int(effectivePort) }
+        components.path = ""
+        guard let url = components.url else { throw FreeRepsConfigError.invalidServerAddress }
+        return url
     }
 
     /// Earliest date to backfill from, based on `backfillMonths`.

@@ -56,10 +56,10 @@ struct ImportResult: Codable {
 actor FreeRepsService {
 
     private let session: URLSession
-    private let baseURL: URL
+    private let configuration: FreeRepsConfig
 
     init(config: FreeRepsConfig) {
-        self.baseURL = config.baseURL
+        self.configuration = config
         let sessionConfig = URLSessionConfiguration.default
         sessionConfig.timeoutIntervalForRequest = 120
         sessionConfig.timeoutIntervalForResource = 300
@@ -69,7 +69,7 @@ actor FreeRepsService {
 
     /// POST a FreeReps payload to FreeReps and return the ingest result.
     func ingest(_ payload: FreeRepsPayload) async throws -> IngestResult {
-        let url = baseURL.appendingPathComponent("api/v1/ingest/")
+        let url = try configuration.validatedBaseURL().appendingPathComponent("api/v1/ingest/")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -94,7 +94,7 @@ actor FreeRepsService {
 
     /// Upload a CSV file to the unified import endpoint.
     func uploadCSV(data: Data) async throws -> ImportResult {
-        let url = baseURL.appendingPathComponent("api/v1/import")
+        let url = try configuration.validatedBaseURL().appendingPathComponent("api/v1/import")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("text/csv", forHTTPHeaderField: "Content-Type")
@@ -119,7 +119,7 @@ actor FreeRepsService {
 
     /// Ping FreeReps to verify connectivity and identity.
     func ping() async throws -> String {
-        let url = baseURL.appendingPathComponent("api/v1/me")
+        let url = try configuration.validatedBaseURL().appendingPathComponent("api/v1/me")
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
 
@@ -139,7 +139,10 @@ actor FreeRepsService {
 
     /// GET a JSON response from a FreeReps endpoint.
     func get(path: String, queryItems: [URLQueryItem] = []) async throws -> Data {
-        var components = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
+        let url = try configuration.validatedBaseURL().appendingPathComponent(path)
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            throw FreeRepsError.invalidURL
+        }
         if !queryItems.isEmpty {
             components.queryItems = queryItems
         }
