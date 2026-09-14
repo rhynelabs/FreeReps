@@ -47,6 +47,7 @@
 		AABB00000000000000020061 /* TailscaleKit.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = AABB00000000000000010060 /* TailscaleKit.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		AABB00000000000000020062 /* EmbeddedTailscale.swift in Sources */ = {isa = PBXBuildFile; fileRef = AABB00000000000000010061 /* EmbeddedTailscale.swift */; };
 		AABB00000000000000020063 /* OverviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AABB00000000000000010062 /* OverviewView.swift */; };
+		AABB00000000000000020064 /* OverviewCards.swift in Sources */ = {isa = PBXBuildFile; fileRef = AABB00000000000000010063 /* OverviewCards.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -127,6 +128,7 @@
 		AABB00000000000000010060 /* TailscaleKit.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = TailscaleKit.xcframework; path = Vendor/TailscaleKit.xcframework; sourceTree = SOURCE_ROOT; };
 		AABB00000000000000010061 /* EmbeddedTailscale.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmbeddedTailscale.swift; sourceTree = "<group>"; };
 		AABB00000000000000010062 /* OverviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverviewView.swift; sourceTree = "<group>"; };
+		AABB00000000000000010063 /* OverviewCards.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverviewCards.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -231,6 +233,7 @@
 				AABB0000000000000001000E /* CategoryStatusCard.swift */,
 				AABB0000000000000001000F /* SyncDashboardView.swift */,
 				AABB00000000000000010062 /* OverviewView.swift */,
+				AABB00000000000000010063 /* OverviewCards.swift */,
 			);
 			path = Sync;
 			sourceTree = "<group>";
@@ -407,6 +410,7 @@
 				AABB00000000000000020041 /* FreeRepsService.swift in Sources */,
 				AABB00000000000000020062 /* EmbeddedTailscale.swift in Sources */,
 				AABB00000000000000020063 /* OverviewView.swift in Sources */,
+				AABB00000000000000020064 /* OverviewCards.swift in Sources */,
 				AABB00000000000000020042 /* FreeRepsPayload.swift in Sources */,
 				AABB00000000000000020004 /* SyncState.swift in Sources */,
 				AABB00000000000000020005 /* HealthDataType.swift in Sources */,

@@ -21,12 +21,17 @@ struct OverviewView: View {
                 if server.stats == nil, case .failed(let message) = server.state {
                     unreachableSection(message)
                 } else {
+                    todaySection
                     lastNightSection
+                    workoutsSection
                     serverSection
                 }
                 BrandFooter()
             }
             .navigationTitle("Overview")
+            // Five cards have to share one screen; the default gap between them is
+            // sized for pages with two.
+            .listSectionSpacing(.compact)
             .refreshable {
                 // Pulling down means "get the newest data", not just re-read the server.
                 if !vm.isAnySyncRunning, selection.isEnabled { vm.startRecentSync() }
@@ -146,10 +151,132 @@ struct OverviewView: View {
         if case .failed = status { return true } else { return false }
     }
 
+    // MARK: - Today
+
+    @Environment(\.colorScheme) private var scheme
+
+    /// The header names the day the card shows. It is "Today" only when the
+    /// data is from today; a phone that has not synced since Thursday reads
+    /// "Thursday" over Thursday's numbers instead of an empty today.
+    private var todaySection: some View {
+        Section(Self.dayLabel(server.activity?.day ?? server.steps?.day ?? Date())) {
+            if let activity = server.activity {
+                activityRows(activity)
+            } else if server.state == .loading {
+                activityRows(Self.placeholderActivity)
+                    .redacted(reason: .placeholder)
+            } else {
+                Text("No activity recorded")
+                    .foregroundStyle(.secondary)
+            }
+
+            if let steps = server.steps {
+                stepsRows(steps)
+            } else if server.state == .loading {
+                stepsRows(Self.placeholderSteps)
+                    .redacted(reason: .placeholder)
+            }
+        }
+    }
+
+    private func activityRows(_ activity: ServerOverview.Activity) -> some View {
+        // The three rings as columns, with no heading of their own: the day
+        // above the card and the three names under the numbers say what this is.
+        HStack(alignment: .top, spacing: 14) {
+            ActivityColumn(title: "Move", value: activity.move, goal: activity.moveGoal,
+                           unit: "KCAL", color: FitnessColor.move(scheme))
+            ActivityColumn(title: "Exercise", value: activity.exercise, goal: activity.exerciseGoal,
+                           unit: "MIN", color: FitnessColor.exercise(scheme))
+            ActivityColumn(title: "Stand", value: activity.stand, goal: activity.standGoal,
+                           unit: "HR", color: FitnessColor.stand(scheme))
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func stepsRows(_ steps: ServerOverview.Steps) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Steps")
+                    .font(.headline)
+                Spacer()
+                Text(steps.total, format: .number)
+                    .font(.system(size: 22, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+            }
+            StepsChart(hours: steps.hours, color: FitnessColor.steps(scheme))
+        }
+        .padding(.vertical, 4)
+    }
+
+    private static var placeholderActivity: ServerOverview.Activity {
+        .init(day: Calendar.current.startOfDay(for: Date()), move: 472, moveGoal: 750,
+              exercise: 36, exerciseGoal: 30, stand: 7, standGoal: 12)
+    }
+
+    private static var placeholderSteps: ServerOverview.Steps {
+        var hours = [Double](repeating: 0, count: 24)
+        for hour in 7..<21 { hours[hour] = Double((hour * 137) % 400 + 60) }
+        return .init(day: Calendar.current.startOfDay(for: Date()), total: 5_242, hours: hours)
+    }
+
+    // MARK: - Day labels
+
+    /// "Today", "Yesterday", then "3 Days Ago", "2 Weeks Ago" — a section
+    /// header, so every word is capitalized.
+    private static func dayLabel(_ day: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(day) { return "Today" }
+        if calendar.isDateInYesterday(day) { return "Yesterday" }
+        return relativeLabel(day)
+    }
+
+    /// The night is named by the morning it ended in: "Last Night" when that
+    /// was today, "2 Nights Ago" when yesterday, then the same words as the
+    /// day header so the two read alike.
+    private static func nightLabel(_ end: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(end) { return "Last Night" }
+        if calendar.isDateInYesterday(end) { return "2 Nights Ago" }
+        return relativeLabel(end)
+    }
+
+    private static func relativeLabel(_ date: Date) -> String {
+        let calendar = Calendar.current
+        let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: date),
+                                           to: calendar.startOfDay(for: Date())).day ?? 0
+        // Foundation rounds to weeks and months on its own past a week.
+        if days < 7 { return "\(days) Days Ago" }
+        return date.formatted(.relative(presentation: .numeric, unitsStyle: .wide)).capitalized
+    }
+
+    // MARK: - Workouts
+
+    private var workoutsSection: some View {
+        Section("Recent Workouts") {
+            if let workouts = server.workouts, !workouts.isEmpty {
+                ForEach(workouts) { WorkoutRow(workout: $0) }
+            } else if server.workouts == nil, server.state == .loading {
+                ForEach(Self.placeholderWorkouts) { WorkoutRow(workout: $0) }
+                    .redacted(reason: .placeholder)
+            } else {
+                Text("No workouts in the last two weeks")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private static var placeholderWorkouts: [ServerOverview.Workout] {
+        (0..<3).map { index in
+            .init(id: "placeholder-\(index)", name: "Outdoor Walk",
+                  start: Date().addingTimeInterval(Double(-index) * 86_400),
+                  duration: 2_580, distanceMeters: 6_398)
+        }
+    }
+
     // MARK: - Server
 
     private var lastNightSection: some View {
-        Section("Last Night") {
+        Section(server.lastNight.map { Self.nightLabel($0.end) } ?? "Last Night") {
             if let night = server.lastNight {
                 nightRows(night)
             } else if server.state == .loading {
@@ -267,6 +394,35 @@ final class ServerOverview: ObservableObject {
         let latest: Date?
     }
 
+    /// One day of Apple's activity rings, as the watch closed them.
+    struct Activity {
+        /// Local midnight of the day the rings belong to.
+        let day: Date
+        let move: Double
+        let moveGoal: Double
+        let exercise: Double
+        let exerciseGoal: Double
+        let stand: Double
+        let standGoal: Double
+    }
+
+    /// One day's steps, and how they fell across the hours of this time zone.
+    struct Steps {
+        /// Local midnight of the day the steps belong to.
+        let day: Date
+        let total: Int
+        /// Twenty-four values, midnight first.
+        let hours: [Double]
+    }
+
+    struct Workout: Identifiable {
+        let id: String
+        let name: String
+        let start: Date
+        let duration: TimeInterval
+        let distanceMeters: Double?
+    }
+
     struct Night {
         let hours: Double
         let start: Date
@@ -301,25 +457,166 @@ final class ServerOverview: ObservableObject {
     @Published private(set) var state: State = .loading
     @Published private(set) var stats: Stats?
     @Published private(set) var lastNight: Night?
+    @Published private(set) var activity: Activity?
+    @Published private(set) var steps: Steps?
+    @Published private(set) var workouts: [Workout]?
 
     func load() async {
         // Placeholders while nothing is known; a refresh keeps the last values on screen.
         if stats == nil { state = .loading }
         let service = FreeRepsService(config: .load())
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: today) ?? today
+        let day = { (offset: Int) in
+            (calendar.date(byAdding: .day, value: offset, to: today) ?? today)
+                .formatted(.iso8601.year().month().day())
+        }
+
+        // All five requests go out together. Only the two the page has always
+        // shown decide whether the server counts as reachable; a server that
+        // does not answer for rings, steps or workouts leaves those cards empty
+        // instead of hiding everything behind "not reachable".
+        //
+        // Rings and sleep are asked for weeks, not days: the card names the day
+        // it shows, so a phone that has not synced for a while still shows its
+        // newest day rather than an empty today.
+        async let statsData = service.get(path: "api/v1/stats")
+        async let sleepData = service.get(path: "api/v1/sleep", queryItems: [
+            URLQueryItem(name: "start", value: day(-30)),
+        ])
+        async let activityData: Data? = try? await service.get(path: "api/v1/activity-summaries", queryItems: [
+            URLQueryItem(name: "start", value: day(-14)),
+            URLQueryItem(name: "end", value: day(1)),
+        ])
+        async let dailyStepsData: Data? = try? await service.get(path: "api/v1/timeseries", queryItems: [
+            URLQueryItem(name: "metric", value: "step_count"),
+            URLQueryItem(name: "start", value: Self.timestamp(calendar.date(byAdding: .day, value: -14, to: today) ?? today)),
+            URLQueryItem(name: "end", value: Self.timestamp(tomorrow)),
+            URLQueryItem(name: "agg", value: "daily"),
+        ])
+        async let workoutData: Data? = try? await service.get(path: "api/v1/workouts", queryItems: [
+            URLQueryItem(name: "start", value: day(-14)),
+        ])
+
         do {
-            let statsData = try await service.get(path: "api/v1/stats")
-            let since = Calendar.current.date(byAdding: .day, value: -2, to: Date()) ?? Date()
-            let sleepData = try await service.get(path: "api/v1/sleep", queryItems: [
-                URLQueryItem(name: "start", value: since.formatted(.iso8601.year().month().day())),
-            ])
-            stats = Self.decodeStats(statsData)
-            lastNight = Self.decodeLastNight(sleepData)
+            let (statsBody, sleepBody) = try await (statsData, sleepData)
+            let activityBody = await activityData
+            let dailyStepsBody = await dailyStepsData
+            let workoutBody = await workoutData
+            stats = Self.decodeStats(statsBody)
+            lastNight = Self.decodeLastNight(sleepBody)
+            activity = activityBody.flatMap(Self.decodeActivity)
+            workouts = workoutBody.flatMap(Self.decodeWorkouts)
+
+            // The day the card shows: the newest with rings, else the newest
+            // with steps. Its hours are a second, dependent request.
+            let shown = activity?.day ?? dailyStepsBody.flatMap(Self.newestStepsDay)
+            if let shown, let next = calendar.date(byAdding: .day, value: 1, to: shown) {
+                let stepsBody = try? await service.get(path: "api/v1/timeseries", queryItems: [
+                    URLQueryItem(name: "metric", value: "step_count"),
+                    URLQueryItem(name: "start", value: Self.timestamp(shown)),
+                    URLQueryItem(name: "end", value: Self.timestamp(next)),
+                    URLQueryItem(name: "agg", value: "hourly"),
+                ])
+                steps = stepsBody.flatMap { Self.decodeSteps($0, day: shown) }
+            } else {
+                steps = nil
+            }
             state = .loaded
         } catch is CancellationError {
             return
         } catch {
             state = .failed(error.localizedDescription)
         }
+    }
+
+    /// The newest day with any ring above zero. The server dates a summary at
+    /// midnight UTC, so the day is read in UTC and rebuilt in the local calendar
+    /// — the two name the same day.
+    private static func decodeActivity(_ data: Data) -> Activity? {
+        guard let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
+        let local = Calendar.current
+
+        return rows.compactMap { row -> Activity? in
+            guard let stamp = (row["Date"] as? String).flatMap(date),
+                  let day = local.date(from: utc.dateComponents([.year, .month, .day], from: stamp)) else { return nil }
+            let activity = Activity(day: day,
+                                    move: row["ActiveEnergy"] as? Double ?? 0,
+                                    moveGoal: row["ActiveEnergyGoal"] as? Double ?? 0,
+                                    exercise: row["ExerciseTime"] as? Double ?? 0,
+                                    exerciseGoal: row["ExerciseTimeGoal"] as? Double ?? 0,
+                                    stand: row["StandHours"] as? Double ?? 0,
+                                    standGoal: row["StandHoursGoal"] as? Double ?? 0)
+            // A day whose rings are all still at zero has not been recorded yet.
+            return activity.move + activity.exercise + activity.stand > 0 ? activity : nil
+        }
+        .max { $0.day < $1.day }
+    }
+
+    /// Local midnight of the newest daily bucket that holds steps. A daily
+    /// bucket is a UTC day; naming the local day after its UTC date is right
+    /// for the fallback this serves.
+    private static func newestStepsDay(_ data: Data) -> Date? {
+        guard let points = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
+        return points.compactMap { point -> Date? in
+            guard let stamp = (point["time"] as? String).flatMap(date),
+                  let value = point["avg"] as? Double, value > 0 else { return nil }
+            return Calendar.current.date(from: utc.dateComponents([.year, .month, .day], from: stamp))
+        }
+        .max()
+    }
+
+    /// Hourly buckets into the 24 hours of this time zone. The server buckets in
+    /// UTC; reading each bucket's start in the local calendar puts it back where
+    /// the user walked it.
+    private static func decodeSteps(_ data: Data, day: Date) -> Steps? {
+        guard let points = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
+        var hours = [Double](repeating: 0, count: 24)
+        for point in points {
+            guard let stamp = (point["time"] as? String).flatMap(date),
+                  let value = point["avg"] as? Double, value > 0 else { continue }
+            let hour = Calendar.current.component(.hour, from: stamp)
+            hours[min(max(hour, 0), 23)] += value
+        }
+        return Steps(day: day, total: Int(hours.reduce(0, +).rounded()), hours: hours)
+    }
+
+    /// The three newest workouts of the requested stretch.
+    private static func decodeWorkouts(_ data: Data) -> [Workout]? {
+        guard let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
+        return rows.compactMap { row -> Workout? in
+            guard let id = row["ID"] as? String,
+                  let start = (row["StartTime"] as? String).flatMap(date) else { return nil }
+            let name = (row["alpha_session_name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                ?? (row["Name"] as? String ?? "Workout")
+            // Distances arrive in meters, kilometers or miles depending on the source.
+            let distance = (row["Distance"] as? Double).map { value -> Double in
+                switch (row["DistanceUnits"] as? String ?? "m").lowercased() {
+                case "km": return value * 1000
+                case "mi": return value * 1609.344
+                default: return value
+                }
+            }
+            return Workout(id: id, name: name, start: start,
+                           duration: row["DurationSec"] as? Double ?? 0,
+                           distanceMeters: distance)
+        }
+        .sorted { $0.start > $1.start }
+        .prefix(3)
+        .map { $0 }
+    }
+
+    /// An instant the server parses as RFC 3339, so a range means local midnight
+    /// and not midnight UTC.
+    private static func timestamp(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.string(from: date)
     }
 
     private static func decodeStats(_ data: Data) -> Stats? {
@@ -331,12 +628,11 @@ final class ServerOverview: ObservableObject {
                      latest: (json["latest_data"] as? String).flatMap(date))
     }
 
-    /// The newest session that ended within the last 24 hours. Falls back to the
-    /// sleep stages of that stretch: the server builds the session from them
-    /// after an upload, and until it has, the stages are what it holds.
+    /// The newest session the server holds. Falls back to the newest stretch of
+    /// sleep stages: the server builds the session from them after an upload,
+    /// and until it has, the stages are what it holds.
     private static func decodeLastNight(_ data: Data) -> Night? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        let recent = { (end: Date) in Date().timeIntervalSince(end) < 24 * 3600 }
 
         let asleep: Set<String> = ["Core", "Deep", "REM", "Asleep"]
         let stages = (json["stages"] as? [[String: Any]] ?? []).compactMap { stage -> (start: Date, end: Date, kind: Night.Kind, hours: Double)? in
@@ -359,11 +655,11 @@ final class ServerOverview: ObservableObject {
                 .map { Night.Stage(start: $0.start, end: $0.end, kind: $0.kind) }
             return Night(hours: hours, start: start, end: end, stages: within)
         }
-        if let night = sessions.filter({ recent($0.end) }).max(by: { $0.end < $1.end }) { return night }
+        if let night = sessions.max(by: { $0.end < $1.end }) { return night }
 
         // A break of more than three hours separates a nap from the night.
         var night: [(start: Date, end: Date, kind: Night.Kind, hours: Double)] = []
-        for stage in stages where recent(stage.end) {
+        for stage in stages {
             if let last = night.last, stage.start.timeIntervalSince(last.end) > 3 * 3600 { night = [] }
             night.append(stage)
         }
@@ -385,9 +681,11 @@ final class ServerOverview: ObservableObject {
 
 /// A hypnogram of one night in the style of the Health app's sleep widget: one
 /// lane per stage from Awake down to Deep, every stage a chunky rounded bar
-/// placed by its time within the night, every transition a soft line fading
-/// from the color it leaves to the color it enters. The colors carry the lanes,
-/// so there are no row labels.
+/// placed by its time within the night, every transition a straight vertical
+/// line fading from the color it leaves to the color it enters. The bars are
+/// the only opaque element; the lines are translucent and sit in a faint wide
+/// glow, which is how Health keeps the stages in front and the path behind.
+/// The colors carry the lanes, so there are no row labels.
 ///
 /// Drawn in a single `Canvas`, so a night with sixty stages costs one pass and
 /// no view identity churn.
