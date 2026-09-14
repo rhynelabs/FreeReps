@@ -274,7 +274,7 @@ final class SyncService: ObservableObject {
         startLiveActivity(isFullSync: false)
 
         let anchor = Date()
-        let epoch = Calendar.current.date(from: DateComponents(year: 2000, month: 1, day: 1))!
+        let epoch = config.backfillStartDate
 
         do {
             connectFreeReps(config: config)
@@ -772,16 +772,16 @@ final class SyncService: ObservableObject {
             _ = try await freereps.ping()
 
             // Find last sync date from UserDefaults-backed syncState.
-            let distantPast = Calendar.current.date(from: DateComponents(year: 2000, month: 1, day: 1))!
+            // Daily sync has a bounded bootstrap. Older history is a separate operation.
+            let distantPast = syncStartedAt.addingTimeInterval(-7 * 24 * 3600)
             let since = syncState.lastSyncDate ?? distantPast
             // Apply a 7-day lookback for HealthKit queries so late-arriving samples (e.g. apps
             // that backfill historical entries into HealthKit after the fact) are captured.
             // FreeReps uses ON CONFLICT DO NOTHING, making re-syncing the overlap window safe.
-            let querySince = syncState.lastSyncDate.map { $0.addingTimeInterval(-7 * 24 * 3600) } ?? distantPast
 
             let opLabel = syncState.lastSyncDate != nil
                 ? "Incremental sync from \(since.formatted(date: .abbreviated, time: .shortened))\u{2026}"
-                : "Full historical sync (fetching all data since 2000)\u{2026}"
+                : "Syncing recent data (last 7 days)\u{2026}"
             syncState.currentOperation = opLabel
 
             var total = 0
@@ -789,6 +789,7 @@ final class SyncService: ObservableObject {
 
             for (cat, types) in HealthDataTypes.quantityTypesByCategory {
                 let catID = "qty_\(cat.rawValue)"
+                let querySince = recentQueryStart(categoryID: catID, now: syncStartedAt)
                 try Task.checkCancellation()
 
                 syncState.updateCategory(catID, status: .syncing)
@@ -829,7 +830,7 @@ final class SyncService: ObservableObject {
             try Task.checkCancellation()
             syncState.updateCategory("cat_category", status: .syncing)
             do {
-                let catCount = try await syncCategorySamples(since: querySince)
+                let catCount = try await syncCategorySamples(since: recentQueryStart(categoryID: "cat_category", now: syncStartedAt))
                 let existingCat = syncState.categories.first(where: { $0.id == "cat_category" })?.recordCount ?? 0
                 syncState.updateCategory("cat_category", status: .completed, recordCount: existingCat + catCount, lastSyncDate: Date())
                 total += catCount
@@ -848,7 +849,7 @@ final class SyncService: ObservableObject {
             try Task.checkCancellation()
             syncState.updateCategory("cat_workouts", status: .syncing)
             do {
-                let workoutCount = try await syncWorkouts(since: querySince)
+                let workoutCount = try await syncWorkouts(since: recentQueryStart(categoryID: "cat_workouts", now: syncStartedAt))
                 let existingWorkouts = syncState.categories.first(where: { $0.id == "cat_workouts" })?.recordCount ?? 0
                 syncState.updateCategory("cat_workouts", status: .completed, recordCount: existingWorkouts + workoutCount, lastSyncDate: Date())
                 total += workoutCount
@@ -867,7 +868,7 @@ final class SyncService: ObservableObject {
             try Task.checkCancellation()
             syncState.updateCategory("cat_bp", status: .syncing)
             do {
-                let bpCount = try await syncBloodPressure(since: querySince)
+                let bpCount = try await syncBloodPressure(since: recentQueryStart(categoryID: "cat_bp", now: syncStartedAt))
                 let existingBP = syncState.categories.first(where: { $0.id == "cat_bp" })?.recordCount ?? 0
                 syncState.updateCategory("cat_bp", status: .completed, recordCount: existingBP + bpCount, lastSyncDate: Date())
                 total += bpCount
@@ -886,7 +887,7 @@ final class SyncService: ObservableObject {
             try Task.checkCancellation()
             syncState.updateCategory("cat_ecg", status: .syncing)
             do {
-                let ecgCount = try await syncECG(since: querySince)
+                let ecgCount = try await syncECG(since: recentQueryStart(categoryID: "cat_ecg", now: syncStartedAt))
                 let existingECG = syncState.categories.first(where: { $0.id == "cat_ecg" })?.recordCount ?? 0
                 syncState.updateCategory("cat_ecg", status: .completed, recordCount: existingECG + ecgCount, lastSyncDate: Date())
                 total += ecgCount
@@ -905,7 +906,7 @@ final class SyncService: ObservableObject {
             try Task.checkCancellation()
             syncState.updateCategory("cat_audiogram", status: .syncing)
             do {
-                let audioCount = try await syncAudiograms(since: querySince)
+                let audioCount = try await syncAudiograms(since: recentQueryStart(categoryID: "cat_audiogram", now: syncStartedAt))
                 let existingAudio = syncState.categories.first(where: { $0.id == "cat_audiogram" })?.recordCount ?? 0
                 syncState.updateCategory("cat_audiogram", status: .completed, recordCount: existingAudio + audioCount, lastSyncDate: Date())
                 total += audioCount
@@ -924,7 +925,7 @@ final class SyncService: ObservableObject {
             try Task.checkCancellation()
             syncState.updateCategory("cat_activity_summaries", status: .syncing)
             do {
-                let activityCount = try await syncActivitySummaries(since: querySince)
+                let activityCount = try await syncActivitySummaries(since: recentQueryStart(categoryID: "cat_activity_summaries", now: syncStartedAt))
                 let existingActivity = syncState.categories.first(where: { $0.id == "cat_activity_summaries" })?.recordCount ?? 0
                 syncState.updateCategory("cat_activity_summaries", status: .completed, recordCount: existingActivity + activityCount, lastSyncDate: Date())
                 total += activityCount
@@ -943,7 +944,7 @@ final class SyncService: ObservableObject {
             try Task.checkCancellation()
             syncState.updateCategory("cat_workout_routes", status: .syncing)
             do {
-                let routeCount = try await syncWorkoutRoutes(since: querySince)
+                let routeCount = try await syncWorkoutRoutes(since: recentQueryStart(categoryID: "cat_workout_routes", now: syncStartedAt))
                 let existingRoutes = syncState.categories.first(where: { $0.id == "cat_workout_routes" })?.recordCount ?? 0
                 syncState.updateCategory("cat_workout_routes", status: .completed, recordCount: existingRoutes + routeCount, lastSyncDate: Date())
                 total += routeCount
@@ -962,7 +963,7 @@ final class SyncService: ObservableObject {
             try Task.checkCancellation()
             syncState.updateCategory("cat_medications", status: .syncing)
             do {
-                let medCount = try await syncMedications(since: querySince)
+                let medCount = try await syncMedications(since: recentQueryStart(categoryID: "cat_medications", now: syncStartedAt))
                 let existingMeds = syncState.categories.first(where: { $0.id == "cat_medications" })?.recordCount ?? 0
                 syncState.updateCategory("cat_medications", status: .completed, recordCount: existingMeds + medCount, lastSyncDate: Date())
                 total += medCount
@@ -981,7 +982,7 @@ final class SyncService: ObservableObject {
             try Task.checkCancellation()
             syncState.updateCategory("cat_vision", status: .syncing)
             do {
-                let visionCount = try await syncVisionPrescriptions(since: querySince)
+                let visionCount = try await syncVisionPrescriptions(since: recentQueryStart(categoryID: "cat_vision", now: syncStartedAt))
                 let existingVision = syncState.categories.first(where: { $0.id == "cat_vision" })?.recordCount ?? 0
                 syncState.updateCategory("cat_vision", status: .completed, recordCount: existingVision + visionCount, lastSyncDate: Date())
                 total += visionCount
@@ -1000,7 +1001,7 @@ final class SyncService: ObservableObject {
             try Task.checkCancellation()
             syncState.updateCategory("cat_state_of_mind", status: .syncing)
             do {
-                let somCount = try await syncStateOfMind(since: querySince)
+                let somCount = try await syncStateOfMind(since: recentQueryStart(categoryID: "cat_state_of_mind", now: syncStartedAt))
                 let existingSOM = syncState.categories.first(where: { $0.id == "cat_state_of_mind" })?.recordCount ?? 0
                 syncState.updateCategory("cat_state_of_mind", status: .completed, recordCount: existingSOM + somCount, lastSyncDate: Date())
                 total += somCount
@@ -1044,6 +1045,11 @@ final class SyncService: ObservableObject {
         }
 
         syncState.isIncrementalSyncRunning = false
+    }
+
+    private func recentQueryStart(categoryID: String, now: Date) -> Date {
+        let confirmed = syncState.categories.first { $0.id == categoryID }?.lastSyncDate
+        return (confirmed ?? now).addingTimeInterval(-7 * 24 * 3600)
     }
 
     // MARK: - Ingest helper

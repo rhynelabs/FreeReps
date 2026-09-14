@@ -181,9 +181,9 @@ struct SyncDashboardView: View {
         VStack(spacing: 12) {
             HStack(spacing: 12) {
                 Button {
-                    vm.startFullSync()
+                    vm.startRecentSync()
                 } label: {
-                    Label("Full Sync", systemImage: "arrow.clockwise.icloud.fill")
+                    Label("Sync Recent Data", systemImage: "arrow.clockwise.icloud.fill")
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
                         .background(Color.blue, in: RoundedRectangle(cornerRadius: 10))
@@ -210,6 +210,11 @@ struct SyncDashboardView: View {
                     .buttonStyle(.plain)
                 }
             }
+
+            Button("Import / Resume History") {
+                vm.startFullSync()
+            }
+            .disabled(vm.isAnySyncRunning)
 
             Button {
                 showFilePicker = true

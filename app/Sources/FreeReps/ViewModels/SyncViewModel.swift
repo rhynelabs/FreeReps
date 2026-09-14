@@ -68,6 +68,16 @@ final class SyncViewModel: ObservableObject {
         syncService.taskForCancellation = task
     }
 
+    func startRecentSync() {
+        let config = FreeRepsConfig.load()
+        let task = Task {
+            await syncService.runIncrementalSync(config: config)
+            refreshLatestHealthKitDates()
+        }
+        syncTask = task
+        syncService.taskForCancellation = task
+    }
+
     func cancelSync() {
         syncTask?.cancel()
         syncTask = nil
