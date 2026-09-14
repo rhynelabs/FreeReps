@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -22,7 +21,6 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	info := userInfoFromContext(r)
 	writeJSON(w, http.StatusOK, info)
 }
-
 
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	var payload models.HealthPayload
@@ -53,14 +51,11 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		// every stage of every user, which made a batch with a few sleep rows
 		// cost as much as the whole history.
 		//
-		// The stages are committed by now. A client that gives up on the
-		// request here must not leave them without a session, so the rebuild
-		// outlives the request context.
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
-		defer cancel()
-		if _, err := s.db.BackfillSleepSessionsFor(ctx, s.log, uid, result.SleepStagesFrom, result.SleepStagesTo); err != nil {
-			s.log.Warn("sleep session backfill after REST ingest failed", "error", err)
-		}
+		// The stages are committed by now, and the response reports nothing
+		// the backfill produces (sleep_sessions_inserted counts the sessions
+		// the payload itself carried), so the client is answered first and
+		// the sessions are built behind it. See sleepBackfillRunner.
+		s.sleepBackfill.Request(uid, result.SleepStagesFrom, result.SleepStagesTo)
 	}
 
 	s.db.InvalidateAllAvailableMetrics()

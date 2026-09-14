@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/claude/freereps/internal/hevy"
 	"github.com/claude/freereps/internal/ingest/alpha"
@@ -43,6 +44,10 @@ type Server struct {
 	// HAE TCP import state (only one import at a time)
 	importMu     sync.Mutex
 	activeImport *haeImportState
+
+	// sleepBackfill builds sleep sessions after a REST ingest, detached from
+	// the request and serialized per user.
+	sleepBackfill *sleepBackfillRunner
 
 	// users resolves Tailscale logins to user IDs. It lives on the Server
 	// rather than inside TailscaleIdentity because identityMiddleware builds
@@ -83,6 +88,14 @@ func New(db *storage.DB, healthProvider *health.Provider, alphaProvider *alpha.P
 		log:    log,
 		router: chi.NewRouter(),
 		users:  newCachedUserStore(db),
+	}
+	s.sleepBackfill = &sleepBackfillRunner{
+		log:     log,
+		timeout: sleepBackfillTimeout,
+		run: func(ctx context.Context, userID int, from, to time.Time) error {
+			_, err := db.BackfillSleepSessionsFor(ctx, log, userID, from, to)
+			return err
+		},
 	}
 	s.routes()
 	return s

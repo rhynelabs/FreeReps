@@ -66,6 +66,14 @@ of the sleep stages the request inserted. The unscoped
 `BackfillSleepSessions` stays for startup and for the end of an HAE TCP
 import, where one full pass per run is the right size.
 
+The rebuild runs after the response, not before it
+(`server/internal/server/sleep_backfill.go`, `sleepBackfillRunner`): a
+detached goroutine with a 30-second timeout, at most one per user at a time.
+A request that arrives while the user's run is active widens the span of a
+single follow-up run instead of starting its own. The response never reported
+what the backfill built — `sleep_sessions_inserted` counts the aggregated
+sessions the payload itself carried — so nothing the client reads changed.
+
 **Reasoning.** The unscoped backfill reads every stage of every user and
 regroups them into nights, so a 500-row batch that happened to carry sleep
 data paid for the whole history — and did so on every batch of a history
@@ -75,8 +83,22 @@ the insert is `ON CONFLICT DO NOTHING` (2026-03-26 incident), so a night
 truncated at the window edge would become a short session nothing later
 corrects.
 
+Even scoped, the rebuild on the request path made a batch with sleep stages
+take 400–2,400 ms where a same-size batch of stand hours took 85 ms, and the
+client gains nothing by waiting for it — the stages are committed before it
+starts. Detaching it without a guard would let a history upload, with many
+sleep batches in flight for one user, start one rebuild per batch over the
+same nights; the per-user single flight bounds that at two runs however many
+requests overlap, and the merged span means the follow-up misses none of
+them.
+
 **Trigger to re-open.** A sleep source whose stages chain across more than
-three days with gaps under 12 hours, or a change to the night-grouping rule.
+three days with gaps under 12 hours, a change to the night-grouping rule, or
+a client that needs the sessions of the batch it just sent to be queryable
+when the response arrives.
+
+**Revisions.** 2026-09-14: the rebuild moved off the request path, serialized
+per user; the scoping is unchanged.
 
 ---
 
