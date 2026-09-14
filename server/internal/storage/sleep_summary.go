@@ -9,20 +9,20 @@ import (
 
 // SleepSummaryPeriod holds aggregated sleep stats for one time period.
 type SleepSummaryPeriod struct {
-	Period                    string  `json:"period"`
-	Nights                    int     `json:"nights"`
-	AvgTotalSleepHr           float64 `json:"avg_total_sleep_hr"`
-	AvgDeepHr                 float64 `json:"avg_deep_hr"`
-	AvgREMHr                  float64 `json:"avg_rem_hr"`
-	AvgCoreHr                 float64 `json:"avg_core_hr"`
-	AvgInBedHr                float64 `json:"avg_in_bed_hr"`
-	AvgEfficiencyPct          float64 `json:"avg_efficiency_pct"`
-	AvgDeepPct                float64 `json:"avg_deep_pct"`
-	AvgREMPct                 float64 `json:"avg_rem_pct"`
-	AvgBedtime                string  `json:"avg_bedtime"`
-	AvgWaketime               string  `json:"avg_waketime"`
-	BedtimeConsistencyStdHr   float64 `json:"bedtime_consistency_stddev_hr"`
-	WaketimeConsistencyStdHr  float64 `json:"waketime_consistency_stddev_hr"`
+	Period                   string  `json:"period"`
+	Nights                   int     `json:"nights"`
+	AvgTotalSleepHr          float64 `json:"avg_total_sleep_hr"`
+	AvgDeepHr                float64 `json:"avg_deep_hr"`
+	AvgREMHr                 float64 `json:"avg_rem_hr"`
+	AvgCoreHr                float64 `json:"avg_core_hr"`
+	AvgInBedHr               float64 `json:"avg_in_bed_hr"`
+	AvgEfficiencyPct         float64 `json:"avg_efficiency_pct"`
+	AvgDeepPct               float64 `json:"avg_deep_pct"`
+	AvgREMPct                float64 `json:"avg_rem_pct"`
+	AvgBedtime               string  `json:"avg_bedtime"`
+	AvgWaketime              string  `json:"avg_waketime"`
+	BedtimeConsistencyStdHr  float64 `json:"bedtime_consistency_stddev_hr"`
+	WaketimeConsistencyStdHr float64 `json:"waketime_consistency_stddev_hr"`
 }
 
 // sleepTimingRow holds raw timing data from the DB for circular mean computation.
@@ -35,6 +35,8 @@ type sleepTimingRow struct {
 // GetSleepSummary returns aggregated sleep stats per period with circular bedtime/waketime averages.
 func (db *DB) GetSleepSummary(ctx context.Context, start, end time.Time, bucket string, userID int) ([]SleepSummaryPeriod, error) {
 	trunc := truncInterval(bucket)
+	// The column is a DATE; see dateBounds.
+	from, to := dateBounds(start, end)
 
 	// Query 1: Aggregated duration/stage stats per period
 	aggRows, err := db.Pool.Query(ctx,
@@ -52,7 +54,7 @@ func (db *DB) GetSleepSummary(ctx context.Context, start, end time.Time, bucket 
 		 WHERE date >= $2 AND date < $3 AND user_id = $4
 		 GROUP BY period
 		 ORDER BY period DESC`,
-		trunc, start, end, userID)
+		trunc, from, to, userID)
 	if err != nil {
 		return nil, fmt.Errorf("querying sleep summary: %w", err)
 	}
@@ -83,7 +85,7 @@ func (db *DB) GetSleepSummary(ctx context.Context, start, end time.Time, bucket 
 		 FROM sleep_sessions
 		 WHERE date >= $2 AND date < $3 AND user_id = $4
 		 ORDER BY period, date`,
-		trunc, start, end, userID)
+		trunc, from, to, userID)
 	if err != nil {
 		return nil, fmt.Errorf("querying sleep timing: %w", err)
 	}

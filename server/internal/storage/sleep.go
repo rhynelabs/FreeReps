@@ -76,14 +76,17 @@ type SleepSessionResult struct {
 	ID int64
 }
 
-// QuerySleepSessions retrieves sleep sessions in a date range.
+// QuerySleepSessions retrieves the sleep sessions dated on any day that
+// [start, end) touches. See dateBounds for why the instants are not passed
+// through as they are.
 func (db *DB) QuerySleepSessions(ctx context.Context, start, end time.Time, userID int) ([]SleepSessionResult, error) {
+	from, to := dateBounds(start, end)
 	rows, err := db.Pool.Query(ctx,
 		`SELECT id, user_id, date, total_sleep, asleep, core, deep, rem, in_bed, sleep_start, sleep_end, in_bed_start, in_bed_end
 		 FROM sleep_sessions
 		 WHERE date >= $1 AND date < $2 AND user_id = $3
 		 ORDER BY date DESC`,
-		start, end, userID)
+		from, to, userID)
 	if err != nil {
 		return nil, fmt.Errorf("querying sleep sessions: %w", err)
 	}
@@ -281,14 +284,24 @@ func nightsOverlapping(nights [][]models.SleepStageRow, from, to time.Time) [][]
 	return kept
 }
 
-// insertBackfillSession writes one night as a session and, when the night
-// was new, its sleep_analysis metric. Returns 1 when a session was created,
-// 0 when a direct source already owns that date.
-func (db *DB) insertBackfillSession(ctx context.Context, userID int, night []models.SleepStageRow) (int, error) {
+// nightSession sums one night's stages into the session row the backfill
+// writes. Split from the insert so the grouping and the date can be checked
+// without a database.
+//
+// The night is dated by the UTC day its last stage ends on, computed in UTC
+// on purpose: the stage times come back from pgx in the process time zone,
+// and a time.Time bound to the DATE column encodes as the calendar day in
+// its own location. Truncating in that location would date a night ending
+// 07:46Z as the previous day on a host west of UTC, where it collides with
+// the night before and ON CONFLICT DO NOTHING drops it for good. The UTC day
+// is not the user's day — for a user in UTC+2, a night that ends before
+// 02:00 local time is dated the day before — but it is the one convention
+// every reader of the column shares (dateBounds, the aggregated ingest path).
+func nightSession(userID int, night []models.SleepStageRow) models.SleepSessionRow {
 	sleepStart := night[0].StartTime
 	sleepEnd := night[len(night)-1].EndTime
 
-	var deep, core, rem, awake, inBedDur float64
+	var deep, core, rem float64
 	for _, s := range night {
 		switch s.Stage {
 		case "Deep":
@@ -297,18 +310,14 @@ func (db *DB) insertBackfillSession(ctx context.Context, userID int, night []mod
 			core += s.DurationHr
 		case "REM":
 			rem += s.DurationHr
-		case "Awake":
-			awake += s.DurationHr
-		case "In Bed":
-			inBedDur += s.DurationHr
 		}
 	}
 
 	totalSleep := deep + core + rem
 	inBed := sleepEnd.Sub(sleepStart).Hours()
-	date := sleepEnd.Truncate(24 * time.Hour)
+	date := sleepEnd.UTC().Truncate(24 * time.Hour)
 
-	session := models.SleepSessionRow{
+	return models.SleepSessionRow{
 		UserID:     userID,
 		Date:       date,
 		TotalSleep: totalSleep,
@@ -322,6 +331,14 @@ func (db *DB) insertBackfillSession(ctx context.Context, userID int, night []mod
 		InBedStart: sleepStart,
 		InBedEnd:   sleepEnd,
 	}
+}
+
+// insertBackfillSession writes one night as a session and, when the night
+// was new, its sleep_analysis metric. Returns 1 when a session was created,
+// 0 when a direct source already owns that date.
+func (db *DB) insertBackfillSession(ctx context.Context, userID int, night []models.SleepStageRow) (int, error) {
+	session := nightSession(userID, night)
+	date, totalSleep := session.Date, session.TotalSleep
 
 	// Use DO NOTHING: backfill is a fallback — don't overwrite sessions
 	// from direct sources (Oura, HAE) which have more accurate data.

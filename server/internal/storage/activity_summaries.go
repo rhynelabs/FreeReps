@@ -140,14 +140,17 @@ func dedupeActivitySummaryRows(rows []models.ActivitySummaryRow) []models.Activi
 	return kept
 }
 
-// QueryActivitySummaries retrieves activity summaries in a date range for a user.
+// QueryActivitySummaries retrieves the activity summaries dated on any day
+// that [start, end) touches. See dateBounds for why the instants are not
+// passed through as they are.
 func (db *DB) QueryActivitySummaries(ctx context.Context, start, end time.Time, userID int) ([]models.ActivitySummaryRow, error) {
+	from, to := dateBounds(start, end)
 	rows, err := db.Pool.Query(ctx,
 		`SELECT user_id, date, active_energy, active_energy_goal, exercise_time, exercise_time_goal, stand_hours, stand_hours_goal
 		 FROM activity_summaries
 		 WHERE date >= $1 AND date < $2 AND user_id = $3
 		 ORDER BY date DESC`,
-		start, end, userID)
+		from, to, userID)
 	if err != nil {
 		return nil, fmt.Errorf("querying activity summaries: %w", err)
 	}
