@@ -18,6 +18,7 @@ struct PersistedSnapshot: Codable {
     let hasCompletedFullSync: Bool?
     let backfillCursors: [String: Date]?
     let backfillAnchorDate: Date?
+    var anchors: [String: Data]? = nil
 }
 
 // MARK: -
@@ -86,6 +87,10 @@ class SyncState: ObservableObject {
     @Published var hasCompletedFullSync: Bool = false
     @Published var backfillCursors: [String: Date] = [:]
     @Published var backfillAnchorDate: Date?
+    /// HealthKit query anchors by `SyncService.anchorKey`, each stored once the
+    /// samples it covers are on the server. A daily sync reads only what was
+    /// added after its anchor.
+    var anchors: [String: Data] = [:]
     /// Rows the server reported as newly inserted in the current or last run. Not persisted;
     /// this is the number the Live Activity shows.
     @Published var newRecordsThisRun = 0
@@ -125,6 +130,7 @@ class SyncState: ObservableObject {
         overallProgress = 0
         backfillCursors = [:]
         backfillAnchorDate = nil
+        anchors = [:]
         hasCompletedFullSync = false
         lastSyncDate = nil
         totalRecords = 0
@@ -142,6 +148,7 @@ class SyncState: ObservableObject {
 
     func resetCategoryLocalState(_ id: String) {
         backfillCursors.removeValue(forKey: id)
+        anchors = anchors.filter { !$0.key.hasPrefix("\(id)/") }
         guard let idx = categories.firstIndex(where: { $0.id == id }) else { return }
         categories[idx].status = .idle
         categories[idx].recordCount = 0
@@ -172,7 +179,8 @@ class SyncState: ObservableObject {
             totalRecords: totalRecords,
             hasCompletedFullSync: hasCompletedFullSync,
             backfillCursors: backfillCursors.isEmpty ? nil : backfillCursors,
-            backfillAnchorDate: backfillAnchorDate
+            backfillAnchorDate: backfillAnchorDate,
+            anchors: anchors.isEmpty ? nil : anchors
         )
         if let data = try? JSONEncoder().encode(snap) {
             defaults.set(data, forKey: Self.userDefaultsKey)
@@ -189,6 +197,7 @@ class SyncState: ObservableObject {
         hasCompletedFullSync = snap.hasCompletedFullSync ?? false
         backfillCursors = snap.backfillCursors ?? [:]
         backfillAnchorDate = snap.backfillAnchorDate
+        anchors = snap.anchors ?? [:]
         for persisted in snap.categories {
             guard let idx = categories.firstIndex(where: { $0.id == persisted.id }) else { continue }
             categories[idx].recordCount = persisted.recordCount

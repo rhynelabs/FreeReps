@@ -562,6 +562,45 @@ final class HealthKitService {
         }
     }
 
+    // MARK: - Changes since an anchor
+
+    /// What HealthKit added since `anchor`, and the anchor to keep for next time.
+    /// Without an anchor the read starts at `fallbackSince`; with one, HealthKit
+    /// returns every sample added since, whatever date it carries. Deleted
+    /// samples are not reported: the server keeps what it was sent.
+    struct Changes<S: HKSample> {
+        let added: [S]
+        let anchor: Data
+    }
+
+    func changedQuantitySamples(typeID: HKQuantityTypeIdentifier, anchor: Data?, fallbackSince: Date) async throws -> Changes<HKQuantitySample> {
+        let type = HKQuantityType(typeID)
+        return try await changes(.quantitySample(type: type, predicate: anchor == nil ? Self.since(fallbackSince) : nil), anchor: anchor)
+    }
+
+    func changedCategorySamples(typeID: HKCategoryTypeIdentifier, anchor: Data?, fallbackSince: Date) async throws -> Changes<HKCategorySample> {
+        let type = HKCategoryType(typeID)
+        return try await changes(.categorySample(type: type, predicate: anchor == nil ? Self.since(fallbackSince) : nil), anchor: anchor)
+    }
+
+    func changedWorkouts(anchor: Data?, fallbackSince: Date) async throws -> Changes<HKWorkout> {
+        try await changes(.workout(anchor == nil ? Self.since(fallbackSince) : nil), anchor: anchor)
+    }
+
+    private static func since(_ date: Date) -> NSPredicate {
+        HKQuery.predicateForSamples(withStart: date, end: nil, options: .strictStartDate)
+    }
+
+    private func changes<S: HKSample>(_ predicate: HKSamplePredicate<S>, anchor anchorData: Data?) async throws -> Changes<S> {
+        try Task.checkCancellation()
+        let anchor = anchorData.flatMap { try? NSKeyedUnarchiver.unarchivedObject(ofClass: HKQueryAnchor.self, from: $0) }
+        let descriptor = HKAnchoredObjectQueryDescriptor(predicates: [predicate], anchor: anchor)
+        let result = try await descriptor.result(for: store)
+        let added = result.addedSamples.sorted { $0.startDate < $1.startDate }
+        let data = try NSKeyedArchiver.archivedData(withRootObject: result.newAnchor, requiringSecureCoding: true)
+        return Changes(added: added, anchor: data)
+    }
+
     // MARK: - Streaming queries (memory-efficient paged reads)
     //
     // Uses HKSampleQuery with offset-based pagination for full syncs to guarantee

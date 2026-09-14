@@ -38,6 +38,79 @@ actor AsyncSemaphore {
     }
 }
 
+// MARK: - MetricUploader
+
+/// Collects metric points from several Health types and uploads them in full
+/// batches, a few requests at a time. Small types share a request, and a type
+/// with many rows keeps reading while its earlier pages upload.
+actor MetricUploader {
+    /// An upload that failed, wrapped so a reader can tell it from its own errors.
+    struct UploadFailed: Error { let underlying: Error }
+
+    private let batchSize: Int
+    private let maxInFlight: Int
+    private let ingest: @Sendable (FreeRepsPayload) async throws -> IngestResult
+    private var pending: [FreeRepsMetric] = []
+    private var pendingRows = 0
+    private var inFlight: [Task<Int, Error>] = []
+    private var inserted = 0
+
+    init(batchSize: Int, maxInFlight: Int, ingest: @escaping @Sendable (FreeRepsPayload) async throws -> IngestResult) {
+        self.batchSize = batchSize
+        self.maxInFlight = maxInFlight
+        self.ingest = ingest
+    }
+
+    func add(_ metric: FreeRepsMetric) async throws {
+        var points = metric.data[...]
+        while !points.isEmpty {
+            let piece = points.prefix(batchSize - pendingRows)
+            pending.append(FreeRepsMetric(name: metric.name, units: metric.units, data: Array(piece)))
+            pendingRows += piece.count
+            points = points.dropFirst(piece.count)
+            if pendingRows >= batchSize { try await flush() }
+        }
+    }
+
+    /// Uploads what is left and waits for every request. Returns the rows inserted.
+    func finish() async throws -> Int {
+        try await flush()
+        while !inFlight.isEmpty { try await reapOldest() }
+        return inserted
+    }
+
+    func cancel() {
+        for task in inFlight { task.cancel() }
+        inFlight = []
+        pending = []
+        pendingRows = 0
+    }
+
+    private func flush() async throws {
+        guard pendingRows > 0 else { return }
+        let payload = FreeRepsPayload(data: FreeRepsData(metrics: pending))
+        let rows = pendingRows
+        pending = []
+        pendingRows = 0
+        while inFlight.count >= maxInFlight { try await reapOldest() }
+        let ingest = self.ingest
+        inFlight.append(Task {
+            do {
+                return try await ingest(payload).metrics_inserted ?? rows
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw UploadFailed(underlying: error)
+            }
+        })
+    }
+
+    private func reapOldest() async throws {
+        let task = inFlight.removeFirst()
+        inserted += try await task.value
+    }
+}
+
 // MARK: - SyncService
 
 @MainActor
@@ -116,10 +189,14 @@ final class SyncService: ObservableObject {
         syncState.overallProgress = 0
     }
 
-    private func advanceRun() {
-        runStepsDone += 1
+    private func advanceRun(by steps: Int = 1) {
+        runStepsDone += steps
         syncState.overallProgress = min(1, Double(runStepsDone) / Double(runStepsTotal))
     }
+
+    /// Where a category's HealthKit anchors live in `SyncState.anchors`; the
+    /// category prefix lets a reset drop them together.
+    static func anchorKey(category: String, type: String) -> String { "\(category)/\(type)" }
 
     /// Windows left to read for a category between `start` and `anchor`.
     private func windowsLeft(for catID: String, from start: Date, until anchor: Date) -> Int {
@@ -698,22 +775,8 @@ final class SyncService: ObservableObject {
             var retries = 0
             while true {
                 do {
-                    let semaphore = AsyncSemaphore(value: 5)
-                    windowTotal = try await withThrowingTaskGroup(of: Int.self) { group in
-                        for typeDesc in types {
-                            group.addTask {
-                                await semaphore.wait()
-                                defer { Task { await semaphore.signal() } }
-                                return try await self.syncQuantityType(
-                                    typeDesc: typeDesc,
-                                    since: cursor, until: windowEnd
-                                )
-                            }
-                        }
-                        var sum = 0
-                        for try await count in group { sum += count }
-                        return sum
-                    }
+                    let windowStart = cursor
+                    windowTotal = try await uploadQuantityTypes(types, since: { _ in windowStart }, until: windowEnd).inserted
                     break
                 } catch is CancellationError {
                     throw CancellationError()
@@ -866,14 +929,6 @@ final class SyncService: ObservableObject {
             _ = try await freereps.ping()
             try checkSelection()
 
-            // Find last sync date from UserDefaults-backed syncState.
-            // Daily sync has a bounded bootstrap. Older history is a separate operation.
-            let distantPast = syncStartedAt.addingTimeInterval(-7 * 24 * 3600)
-            let since = syncState.lastSyncDate ?? distantPast
-            // Apply a 7-day lookback for HealthKit queries so late-arriving samples (e.g. apps
-            // that backfill historical entries into HealthKit after the fact) are captured.
-            // FreeReps uses ON CONFLICT DO NOTHING, making re-syncing the overlap window safe.
-
             syncState.currentOperation = "Checking for new data\u{2026}"
 
             // Mirrored into the state so the app shows the same number as the Live Activity.
@@ -893,44 +948,39 @@ final class SyncService: ObservableObject {
             for (cat, types) in quantityCategories {
                 let catID = "qty_\(cat.rawValue)"
                 let querySince = recentQueryStart(categoryID: catID, now: syncStartedAt)
+                let bucketSince = recentBucketStart(categoryID: catID, now: syncStartedAt)
                 try checkSelection()
 
                 syncState.updateCategory(catID, status: .syncing)
                 var catDelta = 0
                 var failedTypes: [String] = []
-                // Each type is one Health read and one upload; a few at a time keeps the
-                // server busy while Health is still reading the next.
-                let semaphore = AsyncSemaphore(value: 5)
-                try await withThrowingTaskGroup(of: (Int, String?).self) { group in
-                    for typeDesc in types {
-                        group.addTask { @MainActor [self] in
-                            await semaphore.wait()
-                            defer { Task { await semaphore.signal() } }
-                            try checkSelection()
-                            defer { advanceRun() }
-                            do {
-                                await SyncTrace.shared.record("quantity.started", ["type": typeDesc.id])
-                                let count = try await syncQuantityType(typeDesc: typeDesc, since: querySince)
-                                await SyncTrace.shared.record("quantity.finished", ["type": typeDesc.id])
-                                return (count, nil)
-                            } catch is CancellationError {
-                                throw CancellationError()
-                            } catch {
-                                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                                    throw error
-                                }
-                                let cause = error as NSError
-                                await SyncTrace.shared.record("quantity.failed", ["type": typeDesc.id,
-                                    "domain": cause.domain, "code": String(cause.code)])
-                                return (0, "\(typeDesc.displayName): \(error.localizedDescription) [\(cause.domain):\(cause.code)]")
+                var databaseInaccessible: Error?
+                do {
+                    // Individual samples come through a HealthKit anchor, so only what was
+                    // added since the last run is read; hourly buckets are recomputed for
+                    // the last day, because late samples change the sums of past hours.
+                    let outcome = try await uploadQuantityTypes(
+                        types,
+                        since: { $0.syncStrategy.isIndividual ? querySince : bucketSince },
+                        anchorKey: { Self.anchorKey(category: catID, type: $0.id) },
+                        onTypeFailed: { typeDesc, error in
+                            if self.isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                                databaseInaccessible = error
                             }
+                            let cause = error as NSError
+                            failedTypes.append("\(typeDesc.displayName): \(error.localizedDescription) [\(cause.domain):\(cause.code)]")
                         }
-                    }
-                    for try await (count, failure) in group {
-                        catDelta += count
-                        if let failure { failedTypes.append(failure) }
-                    }
+                    )
+                    catDelta = outcome.inserted
+                    if failedTypes.isEmpty { syncState.anchors.merge(outcome.anchors) { _, new in new } }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    let cause = error as NSError
+                    failedTypes.append("\(error.localizedDescription) [\(cause.domain):\(cause.code)]")
                 }
+                if let databaseInaccessible { throw databaseInaccessible }
+                advanceRun(by: types.count)
                 let existing = syncState.categories.first(where: { $0.id == catID })?.recordCount ?? 0
                 if failedTypes.isEmpty {
                     try checkSelection()
@@ -1012,9 +1062,21 @@ final class SyncService: ObservableObject {
         syncState.isIncrementalSyncRunning = false
     }
 
+    /// Where a read without a HealthKit anchor starts: a week before the last
+    /// confirmed sync, so entries other apps write into the past still arrive.
     private func recentQueryStart(categoryID: String, now: Date) -> Date {
         let confirmed = syncState.categories.first { $0.id == categoryID }?.lastSyncDate
         return (confirmed ?? now).addingTimeInterval(-7 * 24 * 3600)
+    }
+
+    /// Where hourly buckets are recomputed from: a day back, which covers a
+    /// watch that syncs its samples to the iPhone hours late. The first run
+    /// takes the same week as everything else.
+    private func recentBucketStart(categoryID: String, now: Date) -> Date {
+        guard syncState.categories.first(where: { $0.id == categoryID })?.lastSyncDate != nil else {
+            return recentQueryStart(categoryID: categoryID, now: now)
+        }
+        return now.addingTimeInterval(-26 * 3600)
     }
 
     // MARK: - Ingest helper
@@ -1180,135 +1242,116 @@ final class SyncService: ObservableObject {
 
     // MARK: - Quantity sync
 
-    /// Streams HealthKit samples in pages using cursor-based HKSampleQuery pagination,
-    /// inserting each page via FreeReps HTTP before requesting the next. Peak memory stays
-    /// flat regardless of total record count.
-    private func syncQuantityType(
+    /// Reads one quantity type and hands the points to `sink` as they come, in
+    /// pieces of at most `batchSize` rows. Returns the new HealthKit anchor when
+    /// `anchorKey` is set: the read then covers everything added since the last
+    /// anchor, or since `since` when there is none yet.
+    private func readQuantityType(
         typeDesc: QuantityTypeDescriptor,
         since: Date?,
         until: Date? = nil,
-        insertBatchSize: Int = batchSize,
-        onBatchInserted: ((Int) -> Void)? = nil
-    ) async throws -> Int {
-        guard let metricName = hkToFreeRepsMetricName[typeDesc.id] else { return 0 }
+        anchorKey: String? = nil,
+        sink: (FreeRepsMetric) async throws -> Void
+    ) async throws -> Data? {
+        guard let metricName = hkToFreeRepsMetricName[typeDesc.id] else { return nil }
         try checkSelection()
+        let start = since ?? Calendar.current.date(from: DateComponents(year: 2000, month: 1, day: 1))!
+        let end = until ?? Date()
 
-        // Use on-device aggregation for high-frequency discrete types (e.g. heart rate).
-        if case .aggregate(let interval) = typeDesc.syncStrategy {
-            return try await syncQuantityTypeAggregated(
-                typeDesc: typeDesc, metricName: metricName, interval: interval,
-                since: since, until: until, insertBatchSize: insertBatchSize,
-                onBatchInserted: onBatchInserted
-            )
+        switch typeDesc.syncStrategy {
+        case .aggregate(let interval):
+            // On-device min/avg/max buckets for high-frequency discrete types.
+            let buckets = try await healthKit.queryAggregatedStatistics(
+                typeID: typeDesc.hkIdentifier, unit: typeDesc.unit, from: start, until: end, interval: interval)
+            let points = buckets.map { FreeRepsMetricDataPoint(date: haeDate($0.startDate), Min: $0.min, Avg: $0.avg, Max: $0.max) }
+            if !points.isEmpty { try await sink(FreeRepsMetric(name: metricName, units: typeDesc.unitString, data: points)) }
+            return nil
+
+        case .aggregateCumulative(let interval):
+            // Hourly sums for steps, energy and distance; individual samples would double-count.
+            let buckets = try await healthKit.queryCumulativeStatistics(
+                typeID: typeDesc.hkIdentifier, unit: typeDesc.unit, from: start, until: end, interval: interval)
+            let points = buckets.map { FreeRepsMetricDataPoint(date: haeDate($0.startDate), qty: $0.sum) }
+            if !points.isEmpty { try await sink(FreeRepsMetric(name: metricName, units: typeDesc.unitString, data: points)) }
+            return nil
+
+        case .individual:
+            func metric(_ samples: [HKQuantitySample]) -> FreeRepsMetric {
+                FreeRepsMetric(name: metricName, units: typeDesc.unitString, data: samples.map { s in
+                    FreeRepsMetricDataPoint(date: haeDate(s.startDate),
+                                            qty: s.quantity.doubleValue(for: typeDesc.unit),
+                                            source_uuid: s.uuid.uuidString)
+                })
+            }
+            if let anchorKey {
+                let changes = try await healthKit.changedQuantitySamples(
+                    typeID: typeDesc.hkIdentifier, anchor: syncState.anchors[anchorKey], fallbackSince: start)
+                for page in changes.added.chunked(into: batchSize) { try await sink(metric(page)) }
+                return changes.anchor
+            }
+            // Skip empty windows without paging through them.
+            if let hkType = typeDesc.hkType, until != nil,
+               !(try await healthKit.sampleExists(for: hkType, from: start, to: end)) { return nil }
+            try await healthKit.streamQuantitySamples(typeID: typeDesc.hkIdentifier, from: since, until: until) { page in
+                try await sink(metric(page))
+            }
+            return nil
         }
+    }
 
-        // Use cumulative SUM aggregation for step/energy/distance types.
-        if case .aggregateCumulative(let interval) = typeDesc.syncStrategy {
-            // A failed upload must not change the data representation. Re-sending
-            // individual samples after partial bucket uploads can double-count totals.
-            return try await syncQuantityTypeCumulative(
-                typeDesc: typeDesc, metricName: metricName, interval: interval,
-                since: since, until: until, insertBatchSize: insertBatchSize,
-                onBatchInserted: onBatchInserted
-            )
+    /// Reads a category's quantity types a few at a time and uploads them through
+    /// one `MetricUploader`, so small types share a request and reads overlap with
+    /// uploads. Returns the rows the server inserted and the anchors to keep.
+    private func uploadQuantityTypes(
+        _ types: [QuantityTypeDescriptor],
+        since: @escaping (QuantityTypeDescriptor) -> Date?,
+        until: Date? = nil,
+        anchorKey: ((QuantityTypeDescriptor) -> String)? = nil,
+        onTypeFailed: ((QuantityTypeDescriptor, Error) -> Void)? = nil
+    ) async throws -> (inserted: Int, anchors: [String: Data]) {
+        let uploader = MetricUploader(batchSize: batchSize, maxInFlight: 3) { [self] payload in
+            try await ingest(payload)
         }
-
-        // Individual samples path — skip empty windows to avoid unnecessary streaming.
-        if let start = since, let end = until, let hkType = typeDesc.hkType {
-            if !(try await healthKit.sampleExists(for: hkType, from: start, to: end)) { return 0 }
-        }
-
-        var total = 0
-        try await healthKit.streamQuantitySamples(typeID: typeDesc.hkIdentifier, from: since, until: until) { hkBatch in
-            for batch in hkBatch.chunked(into: insertBatchSize) {
-                let points = batch.map { s in
-                    FreeRepsMetricDataPoint(
-                        date: haeDate(s.startDate),
-                        qty: s.quantity.doubleValue(for: typeDesc.unit),
-                        source_uuid: s.uuid.uuidString
-                    )
+        let semaphore = AsyncSemaphore(value: 5)
+        var anchors: [String: Data] = [:]
+        do {
+            try await withThrowingTaskGroup(of: (String, Data)?.self) { group in
+                for typeDesc in types {
+                    group.addTask { @MainActor [self] in
+                        await semaphore.wait()
+                        defer { Task { await semaphore.signal() } }
+                        try checkSelection()
+                        let key = anchorKey?(typeDesc)
+                        do {
+                            await SyncTrace.shared.record("quantity.started", ["type": typeDesc.id])
+                            let anchor = try await readQuantityType(typeDesc: typeDesc, since: since(typeDesc), until: until,
+                                                                    anchorKey: key) { try await uploader.add($0) }
+                            await SyncTrace.shared.record("quantity.finished", ["type": typeDesc.id])
+                            if let key, let anchor { return (key, anchor) }
+                            return nil
+                        } catch is CancellationError {
+                            throw CancellationError()
+                        } catch let error as MetricUploader.UploadFailed {
+                            throw error.underlying
+                        } catch {
+                            let cause = error as NSError
+                            await SyncTrace.shared.record("quantity.failed", ["type": typeDesc.id,
+                                "domain": cause.domain, "code": String(cause.code)])
+                            guard let onTypeFailed else { throw error }
+                            onTypeFailed(typeDesc, error)
+                            return nil
+                        }
+                    }
                 }
-                let metric = FreeRepsMetric(name: metricName, units: typeDesc.unitString, data: points)
-                let payload = FreeRepsPayload(data: FreeRepsData(metrics: [metric]))
-                try checkSelection()
-                let result = try await ingest(payload)
-                total += result.metrics_inserted ?? batch.count
-                onBatchInserted?(total)
+                for try await pair in group {
+                    if let (key, anchor) = pair { anchors[key] = anchor }
+                }
             }
-        }
-        return total
-    }
-
-    private func syncQuantityTypeAggregated(
-        typeDesc: QuantityTypeDescriptor,
-        metricName: String,
-        interval: TimeInterval,
-        since: Date?,
-        until: Date?,
-        insertBatchSize: Int,
-        onBatchInserted: ((Int) -> Void)?
-    ) async throws -> Int {
-        let start = since ?? Calendar.current.date(from: DateComponents(year: 2000, month: 1, day: 1))!
-        let end = until ?? Date()
-
-        let buckets = try await healthKit.queryAggregatedStatistics(
-            typeID: typeDesc.hkIdentifier,
-            unit: typeDesc.unit,
-            from: start, until: end,
-            interval: interval
-        )
-
-        var total = 0
-        for batch in buckets.chunked(into: insertBatchSize) {
-            let points = batch.map { b in
-                FreeRepsMetricDataPoint(
-                    date: haeDate(b.startDate),
-                    Min: b.min, Avg: b.avg, Max: b.max
-                )
-            }
-            let metric = FreeRepsMetric(name: metricName, units: typeDesc.unitString, data: points)
-            let payload = FreeRepsPayload(data: FreeRepsData(metrics: [metric]))
-            try checkSelection()
-            let result = try await ingest(payload)
-            total += result.metrics_inserted ?? batch.count
-            onBatchInserted?(total)
-        }
-        return total
-    }
-
-    private func syncQuantityTypeCumulative(
-        typeDesc: QuantityTypeDescriptor,
-        metricName: String,
-        interval: TimeInterval,
-        since: Date?,
-        until: Date?,
-        insertBatchSize: Int,
-        onBatchInserted: ((Int) -> Void)?
-    ) async throws -> Int {
-        let start = since ?? Calendar.current.date(from: DateComponents(year: 2000, month: 1, day: 1))!
-        let end = until ?? Date()
-
-        let buckets = try await healthKit.queryCumulativeStatistics(
-            typeID: typeDesc.hkIdentifier,
-            unit: typeDesc.unit,
-            from: start, until: end,
-            interval: interval
-        )
-
-        var total = 0
-        for batch in buckets.chunked(into: insertBatchSize) {
-            let points = batch.map { b in
-                FreeRepsMetricDataPoint(
-                    date: haeDate(b.startDate),
-                    qty: b.sum
-                )
-            }
-            let metric = FreeRepsMetric(name: metricName, units: typeDesc.unitString, data: points)
-            let payload = FreeRepsPayload(data: FreeRepsData(metrics: [metric]))
-            try checkSelection()
-            let result = try await ingest(payload)
-            total += result.metrics_inserted ?? batch.count
-            onBatchInserted?(total)
+            let inserted = try await uploader.finish()
+            return (inserted, anchors)
+        } catch {
+            await uploader.cancel()
+            throw error
         }
         return total
     }
@@ -1340,7 +1383,6 @@ final class SyncService: ObservableObject {
                 }
             }
         }
-        return total
     }
 
     // MARK: - Workout sync

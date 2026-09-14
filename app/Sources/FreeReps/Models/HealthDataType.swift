@@ -61,6 +61,11 @@ enum QuantitySyncStrategy {
     case aggregate(interval: TimeInterval)
     /// Aggregate cumulative metrics into time buckets with SUM (steps, energy, distance, etc.).
     case aggregateCumulative(interval: TimeInterval)
+
+    var isIndividual: Bool {
+        if case .individual = self { return true }
+        return false
+    }
 }
 
 struct QuantityTypeDescriptor: Identifiable {
