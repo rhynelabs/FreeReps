@@ -49,7 +49,10 @@ The tables held 1,174 weekly chunks for 1.8 GB. Most chunks were only kilobytes
 or a few megabytes, while a history run created 84 new chunks in three minutes,
 each through TimescaleDB's DDL path. Merging reduced them to 88 without changing
 the row counts. Even the largest resulting yearly chunk is far below the
-working-set target for the server's 4 GB of memory.
+working-set target for the server's 4 GB of memory. It also closed the dashboard
+latest-value lookup left on the roadmap: after the merge, a real app launch
+served the first timeseries request in 103 ms and warm requests in 2–4 ms,
+instead of spending about 0.65 seconds in that lookup alone.
 
 **Trigger to re-open.** The database moves to substantially faster storage, its
 memory changes, ingest batches change size, or measurements with the real app
