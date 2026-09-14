@@ -14,48 +14,32 @@ struct SettingsView: View {
                     NavigationLink {
                         FreeRepsSettingsView(vm: vm)
                     } label: {
-                        HStack(spacing: 12) {
+                        SettingsRow(Text("FreeReps Connection")) {
                             iconBox("server.rack", color: .orange)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("FreeReps Connection")
-                                    .font(.subheadline.weight(.semibold))
-                                Text(verbatim: connectionSummary)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
+                        } subtitle: {
+                            Text(verbatim: connectionSummary).lineLimit(1)
                         }
                     }
 
                     NavigationLink {
                         HealthPermissionsView(vm: vm)
                     } label: {
-                        HStack(spacing: 12) {
+                        SettingsRow(Text("Apple Health Sync")) {
                             iconBox("heart.fill", color: .red)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Apple Health Sync")
-                                    .font(.subheadline.weight(.semibold))
-                                Text(vm.healthConnection == .connected ? "Connected" : "Not connected")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
+                        } subtitle: {
+                            Text(vm.healthConnection == .connected ? "Connected" : "Not connected")
                         }
                     }
                 }
 
                 Section("Sync") {
                     Toggle(isOn: $backgroundSyncEnabled) {
-                        HStack(spacing: 12) {
+                        SettingsRow(Text("Background Sync")) {
                             iconBox("arrow.triangle.2.circlepath", color: backgroundSyncEnabled ? .blue : .secondary)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Background Sync")
-                                    .font(.subheadline.weight(.semibold))
-                                Text(!healthSelection.isEnabled ? "Paused while Apple Health is disconnected" : backgroundSyncEnabled
-                                    ? "Health data syncs automatically via FreeReps"
-                                    : "No data is synced in the background")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
+                        } subtitle: {
+                            Text(!healthSelection.isEnabled ? "Paused while Apple Health is disconnected" : backgroundSyncEnabled
+                                ? "Health data syncs automatically via FreeReps"
+                                : "No data is synced in the background")
                         }
                     }
                     .onChange(of: backgroundSyncEnabled) { _, _ in
@@ -63,30 +47,20 @@ struct SettingsView: View {
                     }
 
                     Toggle(isOn: $keepScreenOnDuringSync) {
-                        HStack(spacing: 12) {
+                        SettingsRow(Text("Keep Screen On")) {
                             iconBox("sun.max.fill", color: .yellow)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Keep Screen On")
-                                    .font(.subheadline.weight(.semibold))
-                                Text("Prevent display sleep during full sync")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
+                        } subtitle: {
+                            Text("Prevent display sleep during full sync")
                         }
                     }
 
                     NavigationLink {
                         SyncAdvancedView(vm: vm, syncViewModel: syncViewModel)
                     } label: {
-                        HStack(spacing: 12) {
+                        SettingsRow(Text("Advanced")) {
                             iconBox("gearshape.fill", color: .gray)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Advanced")
-                                    .font(.subheadline.weight(.semibold))
-                                Text("Older data start date, reset sync state")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
+                        } subtitle: {
+                            Text("Older data start date, reset sync state")
                         }
                     }
                 }
@@ -118,10 +92,8 @@ struct SettingsView: View {
                     NavigationLink {
                         AcknowledgementsView()
                     } label: {
-                        HStack(spacing: 12) {
+                        SettingsRow(Text("Acknowledgements")) {
                             iconBox("doc.text.fill", color: .indigo)
-                            Text("Acknowledgements")
-                                .font(.subheadline.weight(.semibold))
                         }
                     }
                 }
@@ -157,5 +129,45 @@ struct SettingsView: View {
                 .font(.system(size: 18))
                 .foregroundStyle(.white)
         }
+    }
+}
+
+/// A list row in the typography of the iOS Settings app: a body-weight title
+/// over a secondary subtitle, behind a leading icon of fixed width so the
+/// titles of neighbouring rows line up. Semibold titles and caption subtitles
+/// read as flimsy next to Apple's own rows, so the fonts are fixed here rather
+/// than chosen per row.
+struct SettingsRow<Icon: View, Subtitle: View>: View {
+    private let title: Text
+    private let icon: Icon
+    private let subtitle: Subtitle
+
+    init(_ title: Text, @ViewBuilder icon: () -> Icon, @ViewBuilder subtitle: () -> Subtitle) {
+        self.title = title
+        self.icon = icon()
+        self.subtitle = subtitle()
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            icon.frame(width: 36)
+            // Concrete colours rather than the hierarchical styles: inside a
+            // destructive button those would inherit the red tint, and only the
+            // icon is meant to carry it.
+            VStack(alignment: .leading, spacing: 2) {
+                title
+                    .font(.body)
+                    .foregroundStyle(Color.primary)
+                subtitle
+                    .font(.subheadline)
+                    .foregroundStyle(Color.secondary)
+            }
+        }
+    }
+}
+
+extension SettingsRow where Subtitle == EmptyView {
+    init(_ title: Text, @ViewBuilder icon: () -> Icon) {
+        self.init(title, icon: icon) { EmptyView() }
     }
 }

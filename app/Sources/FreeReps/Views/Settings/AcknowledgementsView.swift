@@ -6,7 +6,7 @@ struct AcknowledgementsView: View {
             Section("Based On") {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("HealthBeat")
-                        .font(.headline)
+                        .font(.body)
                     Text("by kempu")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
@@ -16,8 +16,8 @@ struct AcknowledgementsView: View {
                     Link("github.com/kempu/HealthBeat", destination: URL(string: "https://github.com/kempu/HealthBeat")!)
                         .font(.subheadline)
                     Text("Licensed under the MIT License")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
                 .padding(.vertical, 4)
             }

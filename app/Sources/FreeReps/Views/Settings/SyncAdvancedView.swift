@@ -28,16 +28,13 @@ struct SyncAdvancedView: View {
                 Button(role: .destructive) {
                     showResetSyncConfirmation = true
                 } label: {
-                    HStack(spacing: 12) {
+                    // Only the icon carries the destructive tint; the text keeps
+                    // the same weight as the other settings rows.
+                    SettingsRow(Text("Reset Sync State")) {
                         Image(systemName: "arrow.counterclockwise")
                             .foregroundStyle(.red)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Reset Sync State")
-                                .font(.subheadline.weight(.semibold))
-                            Text("Clears all sync progress. Next sync will re-send all data.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
+                    } subtitle: {
+                        Text("Clears all sync progress. Next sync will re-send all data.")
                     }
                 }
                 .disabled(syncViewModel.isAnySyncRunning)
