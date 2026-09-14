@@ -1195,7 +1195,7 @@ final class SyncService: ObservableObject {
                 let resumeAt = syncState.backfillCursors[catID] ?? historicalStart
                 if resumeAt > cursor { retries = 0 }
                 cursor = resumeAt
-                guard retries < 3 else {
+                guard retries < 3, Self.isRetryable(error) else {
                     throw backfillFailure(error, category: catID, start: cursor,
                                           end: min(cursor.addingTimeInterval(windowSize), anchor))
                 }
@@ -1303,6 +1303,14 @@ final class SyncService: ObservableObject {
     /// a blip, so the pauses grow to cover one.
     private static let retryDelays: [Duration] = [.seconds(2), .seconds(5), .seconds(10)]
 
+    /// Whether another attempt at the same window can end differently. An
+    /// encoding error is the client's own and repeats on every attempt; three
+    /// timed retries of it only cancelled the uploads running alongside.
+    private static func isRetryable(_ error: Error) -> Bool {
+        if case FreeRepsError.encodingError = error { return false }
+        return true
+    }
+
     /// Backfills a special (non-quantity) category in 90-day windows, resuming from cursor.
     private func backfillSpecialCategory(
         catID: String,
@@ -1329,15 +1337,15 @@ final class SyncService: ObservableObject {
                 "category": catID, "index": String(windowIdx), "total": String(totalWindows),
             ])
             var retries = 0
-            var windowTotal = 0
+            var window: SpecialWindow = (inserted: 0, rows: 0)
             while true {
                 do {
-                    windowTotal = try await syncSpecialWindow(catID: catID, displayName: displayName,
-                                                              index: windowIdx, start: cursor, end: windowEnd)
+                    window = try await syncSpecialWindow(catID: catID, displayName: displayName,
+                                                         index: windowIdx, start: cursor, end: windowEnd)
                     break
                 } catch is CancellationError {
                     throw CancellationError()
-                } catch where retries < 3 {
+                } catch where retries < 3 && Self.isRetryable(error) {
                     retries += 1
                     try await Task.sleep(for: Self.retryDelays[retries - 1])
                 } catch {
@@ -1346,13 +1354,12 @@ final class SyncService: ObservableObject {
             }
             await SyncTrace.shared.record("window.finished", [
                 "category": catID, "index": String(windowIdx), "total": String(totalWindows),
-                "inserted": String(windowTotal),
+                "inserted": String(window.inserted), "rows": String(window.rows),
             ])
-            total += windowTotal
-            syncState.newRecordsThisRun += windowTotal
+            total += window.inserted
+            syncState.newRecordsThisRun += window.inserted
             partialSteps.removeValue(forKey: "\(catID)/\(windowIdx)")
-            // These categories report rows inserted, not sent; close enough for the estimate.
-            windowAcknowledged(catID, key: "\(catID)/\(windowIdx)", rows: windowTotal)
+            windowAcknowledged(catID, key: "\(catID)/\(windowIdx)", rows: window.rows)
 
             cursor = windowEnd
             windowIdx += 1
@@ -1364,31 +1371,41 @@ final class SyncService: ObservableObject {
         return total
     }
 
+    /// What a window of a special category sent: the records the UI counts,
+    /// and the rows the server looked at, which weigh the progress. Workouts
+    /// and routes carry points that outnumber the records by thousands; the
+    /// other categories report rows inserted, not sent, close enough for the
+    /// estimate.
+    private typealias SpecialWindow = (inserted: Int, rows: Int)
+
     /// One window of a special category. Category samples go through a batching
     /// uploader whose acknowledgements credit part of the window's step; the
     /// other categories are small enough to count per window.
-    private func syncSpecialWindow(catID: String, displayName: String, index: Int, start: Date, end: Date) async throws -> Int {
+    private func syncSpecialWindow(catID: String, displayName: String, index: Int, start: Date, end: Date) async throws -> SpecialWindow {
         switch catID {
         case "cat_category":
             let run = runID
             let key = "\(catID)/\(index)"
-            return try await syncCategorySamples(since: start, until: end) { @MainActor [self] ack in
+            let inserted = try await syncCategorySamples(since: start, until: end) { @MainActor [self] ack in
                 guard run == runID else { return }
                 categoryRows(displayName, add: ack.rows)
                 partialStep(key, fraction: Double(ack.windowBatchesAcked) / Double(max(ack.windowBatchesSent, 1)))
                 windowRows(key, rows: ack.rows)
                 updateLiveActivity(phase: displayName, operation: syncState.currentOperation, records: syncState.newRecordsThisRun)
             }
+            return (inserted, inserted)
         case "cat_workouts":
             return try await syncWorkouts(since: start, until: end)
         case "cat_bp":
-            return try await syncBloodPressure(since: start, until: end)
+            let inserted = try await syncBloodPressure(since: start, until: end)
+            return (inserted, inserted)
         case "cat_activity_summaries":
-            return try await syncActivitySummaries(since: start, until: end)
+            let inserted = try await syncActivitySummaries(since: start, until: end)
+            return (inserted, inserted)
         case "cat_workout_routes":
             return try await syncWorkoutRoutes(since: start, until: end)
         default:
-            return 0
+            return (0, 0)
         }
     }
 
@@ -1535,12 +1552,12 @@ final class SyncService: ObservableObject {
             // Special categories, one at a time; each is a single Health read.
             let specials: [(id: String, name: String, sync: (Date) async throws -> Int)] = [
                 ("cat_category", "Health Events", { @MainActor date in try await self.syncCategorySamples(since: date, anchored: true) }),
-                ("cat_workouts", "Workouts", { @MainActor date in try await self.syncWorkouts(since: date, anchored: true) }),
+                ("cat_workouts", "Workouts", { @MainActor date in try await self.syncWorkouts(since: date, anchored: true).inserted }),
                 ("cat_bp", "Blood Pressure", { @MainActor date in try await self.syncBloodPressure(since: date) }),
                 ("cat_ecg", "ECG", { @MainActor date in try await self.syncECG(since: date) }),
                 ("cat_audiogram", "Audiograms", { @MainActor date in try await self.syncAudiograms(since: date) }),
                 ("cat_activity_summaries", "Activity Rings", { @MainActor date in try await self.syncActivitySummaries(since: date) }),
-                ("cat_workout_routes", "Workout Routes", { @MainActor date in try await self.syncWorkoutRoutes(since: date, anchored: true) }),
+                ("cat_workout_routes", "Workout Routes", { @MainActor date in try await self.syncWorkoutRoutes(since: date, anchored: true).inserted }),
                 ("cat_medications", "Medications", { @MainActor date in try await self.syncMedications(since: date) }),
                 ("cat_vision", "Vision Prescriptions", { @MainActor date in try await self.syncVisionPrescriptions(since: date) }),
                 ("cat_state_of_mind", "State of Mind", { @MainActor date in try await self.syncStateOfMind(since: date) }),
@@ -1673,9 +1690,9 @@ final class SyncService: ObservableObject {
     /// workout is taken to have none (indoor, treadmill, no GPS).
     private static let routeGracePeriod: TimeInterval = 48 * 3600
 
-    private func syncWorkoutRoutes(since: Date?, until: Date? = nil, anchored: Bool = false) async throws -> Int {
+    private func syncWorkoutRoutes(since: Date?, until: Date? = nil, anchored: Bool = false) async throws -> SpecialWindow {
         try checkSelection()
-        var total = 0
+        var total: SpecialWindow = (inserted: 0, rows: 0)
         if anchored, let start = since {
             // Its own anchor, not the one of "cat_workouts": the two categories
             // are enabled and reset independently. A failed upload leaves the
@@ -1684,12 +1701,15 @@ final class SyncService: ObservableObject {
             // The anchor tracks workouts, and the watch can deliver a workout
             // before its route. A workout the anchor has passed without a route
             // is kept on a retry list and checked again first on each run.
-            total += try await uploadPendingRoutes()
+            let pending = try await uploadPendingRoutes()
+            total.inserted += pending.inserted
+            total.rows += pending.rows
             let key = Self.anchorKey(category: "cat_workout_routes", type: "workouts")
             let changes = try await healthKit.changedWorkouts(anchor: syncState.anchors[key], fallbackSince: start)
             for outcome in try await uploadRoutes(forEach: changes.added) {
                 if outcome.uploaded {
-                    total += 1
+                    total.inserted += 1
+                    total.rows += outcome.points
                     syncState.routesPending.removeValue(forKey: outcome.uuid)
                 } else {
                     syncState.routesPending[outcome.uuid] = outcome.endDate
@@ -1698,7 +1718,10 @@ final class SyncService: ObservableObject {
             syncState.anchors[key] = changes.anchor
         } else {
             try await healthKit.streamWorkouts(from: since, until: until) { [self] workouts in
-                total += try await uploadRoutes(forEach: workouts).filter(\.uploaded).count
+                for outcome in try await uploadRoutes(forEach: workouts) where outcome.uploaded {
+                    total.inserted += 1
+                    total.rows += outcome.points
+                }
             }
         }
         return total
@@ -1708,7 +1731,9 @@ final class SyncService: ObservableObject {
     private struct RouteOutcome {
         let uuid: String
         let endDate: Date
-        let uploaded: Bool
+        /// Route points the server took; none when the workout has no route yet.
+        let points: Int
+        var uploaded: Bool { points > 0 }
     }
 
     /// How many workouts have their routes read and uploaded at once. Each
@@ -1736,7 +1761,7 @@ final class SyncService: ObservableObject {
                     running += 1
                     group.addTask { @MainActor [self] in
                         RouteOutcome(uuid: workout.uuid.uuidString, endDate: workout.endDate,
-                                     uploaded: try await uploadRoutes(of: workout))
+                                     points: try await uploadRoutes(of: workout))
                     }
                 }
                 guard let outcome = try await group.next() else { break }
@@ -1750,48 +1775,39 @@ final class SyncService: ObservableObject {
     /// Retries the workouts still waiting for a route. One that has a route now
     /// leaves the list once uploaded; one past the grace period leaves it
     /// without; one deleted from Health stays until the grace period passes.
-    private func uploadPendingRoutes() async throws -> Int {
+    private func uploadPendingRoutes() async throws -> SpecialWindow {
         let cutoff = Date().addingTimeInterval(-Self.routeGracePeriod)
         syncState.routesPending = syncState.routesPending.filter { $0.value >= cutoff }
         let uuids = syncState.routesPending.keys.compactMap { UUID(uuidString: $0) }
-        guard !uuids.isEmpty else { return 0 }
-        var total = 0
+        guard !uuids.isEmpty else { return (0, 0) }
+        var total: SpecialWindow = (inserted: 0, rows: 0)
         let workouts = try await healthKit.workouts(uuids: uuids)
         for outcome in try await uploadRoutes(forEach: workouts) where outcome.uploaded {
             syncState.routesPending.removeValue(forKey: outcome.uuid)
-            total += 1
+            total.inserted += 1
+            total.rows += outcome.points
         }
         return total
     }
 
-    /// Sends the workout's route to the server. `false` when the workout has no
-    /// route yet — or none could be read, which is treated the same way, as a
-    /// retry costs one query and a lost route costs the map.
-    private func uploadRoutes(of workout: HKWorkout) async throws -> Bool {
+    /// Sends the workout's route to the server and returns the points sent.
+    /// Zero when the workout has no route yet — or none could be read, which
+    /// is treated the same way, as a retry costs one query and a lost route
+    /// costs the map. A route the encoder refuses is skipped the same way:
+    /// the fault is in the data, so sending it again cannot help.
+    private func uploadRoutes(of workout: HKWorkout) async throws -> Int {
         try checkSelection()
-        var uploaded = false
+        var points = 0
         let routes: [HKWorkoutRoute]
-        do { routes = try await healthKit.fetchWorkoutRoutes(for: workout) } catch { return false }
+        do { routes = try await healthKit.fetchWorkoutRoutes(for: workout) } catch { return 0 }
         for route in routes {
             try checkSelection()
             let locations: [CLLocation]
             do { locations = try await healthKit.fetchRouteLocations(for: route) } catch { continue }
             guard !locations.isEmpty else { continue }
 
-            let routePoints = locations.map { loc in
-                FreeRepsRoutePoint(
-                    latitude: loc.coordinate.latitude,
-                    longitude: loc.coordinate.longitude,
-                    altitude: loc.altitude,
-                    course: loc.course,
-                    courseAccuracy: loc.courseAccuracy,
-                    horizontalAccuracy: loc.horizontalAccuracy,
-                    verticalAccuracy: loc.verticalAccuracy,
-                    timestamp: haeDate(loc.timestamp),
-                    speed: loc.speed,
-                    speedAccuracy: loc.speedAccuracy
-                )
-            }
+            let routePoints = locations.compactMap(Self.routePoint)
+            guard !routePoints.isEmpty else { continue }
             // Send workout with route data — FreeReps uses ON CONFLICT DO NOTHING for the workout itself
             let hbWorkout = FreeRepsWorkout(
                 id: workout.uuid.uuidString,
@@ -1802,10 +1818,36 @@ final class SyncService: ObservableObject {
                 route: routePoints
             )
             let payload = FreeRepsPayload(data: FreeRepsData(workouts: [hbWorkout]))
-            _ = try await ingest(payload)
-            uploaded = true
+            do {
+                _ = try await ingest(payload)
+            } catch FreeRepsError.encodingError(let field) {
+                await SyncTrace.shared.record("route.skipped", ["workout": workout.uuid.uuidString, "field": field])
+                continue
+            }
+            points += routePoints.count
         }
-        return uploaded
+        return points
+    }
+
+    /// A location as a route point, or nil when its coordinate is not a
+    /// number. The other fields keep CoreLocation's negative "invalid"
+    /// sentinels; only NaN and infinity become nil, as the encoder rejects
+    /// them (see `FreeRepsRoutePoint`).
+    private static func routePoint(_ loc: CLLocation) -> FreeRepsRoutePoint? {
+        func finite(_ value: Double) -> Double? { value.isFinite ? value : nil }
+        guard loc.coordinate.latitude.isFinite, loc.coordinate.longitude.isFinite else { return nil }
+        return FreeRepsRoutePoint(
+            latitude: loc.coordinate.latitude,
+            longitude: loc.coordinate.longitude,
+            altitude: finite(loc.altitude),
+            course: finite(loc.course),
+            courseAccuracy: finite(loc.courseAccuracy),
+            horizontalAccuracy: finite(loc.horizontalAccuracy),
+            verticalAccuracy: finite(loc.verticalAccuracy),
+            timestamp: haeDate(loc.timestamp),
+            speed: finite(loc.speed),
+            speedAccuracy: finite(loc.speedAccuracy)
+        )
     }
 
     // MARK: - Medication sync
@@ -2137,9 +2179,9 @@ final class SyncService: ObservableObject {
 
     // MARK: - Workout sync
 
-    private func syncWorkouts(since: Date?, until: Date? = nil, anchored: Bool = false) async throws -> Int {
+    private func syncWorkouts(since: Date?, until: Date? = nil, anchored: Bool = false) async throws -> SpecialWindow {
         try checkSelection()
-        var total = 0
+        var total: SpecialWindow = (inserted: 0, rows: 0)
         let hrUnit = HKUnit(from: "count/min")
         func upload(_ workouts: [HKWorkout]) async throws {
             for batch in workouts.chunked(into: batchSize) {
@@ -2212,7 +2254,8 @@ final class SyncService: ObservableObject {
                 let payload = FreeRepsPayload(data: FreeRepsData(workouts: hbWorkouts))
                 try checkSelection()
                 let result = try await ingest(payload)
-                total += result.workouts_inserted ?? batch.count
+                total.inserted += result.workouts_inserted ?? batch.count
+                total.rows += payload.data.rowCount
             }
         }
         if anchored, let start = since {

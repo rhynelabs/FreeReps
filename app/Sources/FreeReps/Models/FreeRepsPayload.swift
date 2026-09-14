@@ -82,17 +82,21 @@ struct FreeRepsWorkoutHRPoint: Encodable {
     let source: String
 }
 
+/// The optional fields are nil where CoreLocation has no finite value:
+/// `JSONEncoder` refuses NaN and infinity, and a 2022 route carried one in
+/// `courseAccuracy`, which failed the whole request. The server reads null
+/// as zero.
 struct FreeRepsRoutePoint: Encodable {
     let latitude: Double
     let longitude: Double
-    let altitude: Double
-    let course: Double
-    let courseAccuracy: Double
-    let horizontalAccuracy: Double
-    let verticalAccuracy: Double
+    let altitude: Double?
+    let course: Double?
+    let courseAccuracy: Double?
+    let horizontalAccuracy: Double?
+    let verticalAccuracy: Double?
     let timestamp: String
-    let speed: Double
-    let speedAccuracy: Double
+    let speed: Double?
+    let speedAccuracy: Double?
 }
 
 // MARK: - ECG recordings
@@ -483,10 +487,22 @@ extension HKWorkoutActivityType {
 }
 
 extension FreeRepsData {
-    /// Rows the server will look at, for the sync trace.
+    /// Rows the server will look at, for the sync trace and the progress
+    /// estimate. A workout counts its route and heart-rate points too: a route
+    /// request of 20,000 points takes the server as long as a 5,000-row
+    /// metric batch, and counted as one row it left the bar at 99 % while the
+    /// routes still had a sixth of their windows to go.
     var rowCount: Int {
-        metrics.reduce(0) { $0 + $1.data.count }
-            + workouts.count + ecg_recordings.count + audiograms.count + activity_summaries.count
+        let workoutRows = workouts.reduce(0) { $0 + $1.rowCount }
+        return metrics.reduce(0) { $0 + $1.data.count }
+            + workoutRows + ecg_recordings.count + audiograms.count + activity_summaries.count
             + medications.count + vision_prescriptions.count + state_of_mind.count + category_samples.count
+    }
+}
+
+extension FreeRepsWorkout {
+    /// The workout and every point it carries.
+    var rowCount: Int {
+        1 + (route?.count ?? 0) + (heartRateData?.count ?? 0)
     }
 }
