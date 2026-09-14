@@ -431,10 +431,10 @@ final class SyncService: ObservableObject {
     }
 
     /// Requests of a run in flight at once, across every uploader. The server
-    /// is the limit: with 27 in flight it inserted no more rows per second
-    /// than with eight, but a 5,000-row batch took 3 s in the median and 11 s
-    /// at worst, and one request timed out.
-    private static let requestSlotCount = 8
+    /// is the limit: a live NAS benchmark sustained 64,100 rows/s with four
+    /// writers, versus 54,800 with six and 56,200 with eight. More writers
+    /// only lengthened the RAID write queue and made completion bursty.
+    private static let requestSlotCount = 4
     private var requestSlots = AsyncSemaphore(value: requestSlotCount)
 
     private func beginRun(steps: Int, weighRows: Bool = false) {
