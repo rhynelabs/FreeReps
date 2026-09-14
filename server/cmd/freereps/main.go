@@ -79,11 +79,6 @@ func main() {
 	db.SetSourcePriority(cfg.SourcePriority)
 	log.Info("database connected")
 
-	// Backfill sleep sessions from stages (idempotent — ON CONFLICT DO NOTHING)
-	if err := db.BackfillSleepSessions(ctx, log); err != nil {
-		log.Warn("sleep session backfill failed", "error", err)
-	}
-
 	// Seed demo data if requested (via -demo flag or FREEREPS_DEMO=true env var)
 	if *demoMode || os.Getenv("FREEREPS_DEMO") == "true" {
 		if err := demo.Seed(ctx, db, log); err != nil {
@@ -94,6 +89,12 @@ func main() {
 
 	// MCP stdio mode: serve MCP protocol over stdin/stdout, then exit
 	if *mcpMode {
+		// Preserve the standalone mode's existing maintenance behavior. The
+		// HTTP server below runs it in the background because it has a listener
+		// whose availability must not wait for historical data.
+		if err := db.BackfillSleepSessions(ctx, log); err != nil {
+			log.Warn("sleep session backfill failed", "error", err)
+		}
 		log.Info("starting MCP stdio server")
 		mcpSrv := freerepsmcp.New(db, Version, log)
 		if err := mcpserver.ServeStdio(mcpSrv,
@@ -201,6 +202,15 @@ func main() {
 		if err := httpSrv.Serve(listener); err != nil && err != http.ErrServerClosed {
 			log.Error("server error", "error", err)
 			os.Exit(1)
+		}
+	}()
+
+	// The full backfill can read years of sleep stages. It is idempotent and
+	// not required to serve requests, so never hold server availability behind
+	// it during a restart.
+	go func() {
+		if err := db.BackfillSleepSessions(syncCtx, log); err != nil && syncCtx.Err() == nil {
+			log.Warn("sleep session backfill failed", "error", err)
 		}
 	}()
 

@@ -213,13 +213,9 @@ func (db *DB) BackfillSleepSessionsFor(ctx context.Context, log *slog.Logger, us
 		return 0, fmt.Errorf("querying stages: %w", err)
 	}
 
-	var created int
-	for _, night := range nightsOverlapping(groupNights(stages), from, to) {
-		n, err := db.insertBackfillSession(ctx, userID, night)
-		if err != nil {
-			return created, err
-		}
-		created += n
+	created, err := db.insertBackfillSessions(ctx, userID, nightsOverlapping(groupNights(stages), from, to))
+	if err != nil {
+		return created, err
 	}
 
 	if created > 0 {
@@ -237,13 +233,9 @@ func (db *DB) backfillUserSleepSessions(ctx context.Context, log *slog.Logger, u
 		return 0, fmt.Errorf("querying stages: %w", err)
 	}
 
-	var created int
-	for _, night := range groupNights(stages) {
-		n, err := db.insertBackfillSession(ctx, userID, night)
-		if err != nil {
-			return created, err
-		}
-		created += n
+	created, err := db.insertBackfillSessions(ctx, userID, groupNights(stages))
+	if err != nil {
+		return created, err
 	}
 
 	if created > 0 {
@@ -350,40 +342,78 @@ func nightSession(userID int, night []models.SleepStageRow) models.SleepSessionR
 	}
 }
 
-// insertBackfillSession writes one night as a session and, when the night
-// was new, its sleep_analysis metric. Returns 1 when a session was created,
-// 0 when a direct source already owns that date.
-func (db *DB) insertBackfillSession(ctx context.Context, userID int, night []models.SleepStageRow) (int, error) {
-	session := nightSession(userID, night)
-	date, totalSleep := session.Date, session.TotalSleep
+// A VALUES statement stays below PostgreSQL's 65,535-parameter limit and
+// turns a full multi-year backfill into a few commits instead of one commit
+// per night.
+const maxBackfillSessionsPerBatch = 1000
 
-	// Use DO NOTHING: backfill is a fallback — don't overwrite sessions
-	// from direct sources (Oura, HAE) which have more accurate data.
-	tag, err := db.Pool.Exec(ctx,
-		`INSERT INTO sleep_sessions (user_id, date, total_sleep, asleep, core, deep, rem, in_bed, sleep_start, sleep_end, in_bed_start, in_bed_end)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-		 ON CONFLICT (user_id, date) DO NOTHING`,
-		session.UserID, session.Date, session.TotalSleep, session.Asleep,
-		session.Core, session.Deep, session.REM, session.InBed,
-		session.SleepStart, session.SleepEnd, session.InBedStart, session.InBedEnd)
-	if err != nil {
-		return 0, fmt.Errorf("inserting backfill session: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return 0, nil // session already exists from a direct source
+// insertBackfillSessions writes the sessions and their derived metrics in the
+// same transaction. A server interruption can therefore never leave a
+// session whose metric was not written, which the old two-transaction path
+// could not repair on its next ON CONFLICT DO NOTHING run.
+func (db *DB) insertBackfillSessions(ctx context.Context, userID int, nights [][]models.SleepStageRow) (int, error) {
+	if len(nights) == 0 {
+		return 0, nil
 	}
 
-	qty := totalSleep
-	sleepMetric := models.HealthMetricRow{
-		Time:       date.Add(12 * time.Hour), // noon UTC for stable dedup
-		UserID:     userID,
-		MetricName: "sleep_analysis",
-		Source:     "FreeReps Backfill",
-		Units:      "hr",
-		Qty:        &qty,
+	sessions := make([]models.SleepSessionRow, len(nights))
+	for i, night := range nights {
+		sessions[i] = nightSession(userID, night)
 	}
-	if _, _, err := db.InsertHealthMetrics(ctx, []models.HealthMetricRow{sleepMetric}); err != nil {
-		return 1, fmt.Errorf("inserting backfill sleep_analysis metric: %w", err)
+
+	var created int
+	for start := 0; start < len(sessions); start += maxBackfillSessionsPerBatch {
+		end := min(start+maxBackfillSessionsPerBatch, len(sessions))
+		batchCreated, err := db.insertBackfillSessionBatch(ctx, sessions[start:end])
+		created += batchCreated
+		if err != nil {
+			return created, err
+		}
 	}
-	return 1, nil
+	return created, nil
+}
+
+func (db *DB) insertBackfillSessionBatch(ctx context.Context, sessions []models.SleepSessionRow) (int, error) {
+	args := make([]any, 0, len(sessions)*12)
+	values := make([]string, 0, len(sessions))
+	for i, session := range sessions {
+		base := i * 12
+		values = append(values, fmt.Sprintf(
+			"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6,
+			base+7, base+8, base+9, base+10, base+11, base+12,
+		))
+		args = append(args,
+			session.UserID, session.Date, session.TotalSleep, session.Asleep,
+			session.Core, session.Deep, session.REM, session.InBed,
+			session.SleepStart, session.SleepEnd, session.InBedStart, session.InBedEnd,
+		)
+	}
+
+	// DO NOTHING is deliberate: backfill is a fallback and must not overwrite
+	// a session from a direct source such as Oura or HAE.
+	query := `WITH inserted_sessions AS (
+		INSERT INTO sleep_sessions (user_id, date, total_sleep, asleep, core, deep, rem, in_bed, sleep_start, sleep_end, in_bed_start, in_bed_end)
+		VALUES ` + strings.Join(values, ",") + `
+		ON CONFLICT (user_id, date) DO NOTHING
+		RETURNING user_id, date, total_sleep
+	), inserted_metrics AS (
+		INSERT INTO health_metrics (time, user_id, metric_name, source, units, qty)
+		SELECT (date::timestamp + interval '12 hours') AT TIME ZONE 'UTC',
+		       user_id, 'sleep_analysis', 'FreeReps Backfill', 'hr', total_sleep
+		FROM inserted_sessions
+		ON CONFLICT (metric_name, source, time, user_id) DO NOTHING
+		RETURNING user_id
+	)
+	SELECT count(*)::int FROM inserted_sessions`
+
+	var created int
+	err := db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
+		created = 0
+		if err := tx.QueryRow(ctx, query, args...).Scan(&created); err != nil {
+			return fmt.Errorf("inserting backfill sessions: %w", err)
+		}
+		return nil
+	})
+	return created, err
 }
