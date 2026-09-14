@@ -72,3 +72,6 @@ Pods/
 *.ipa
 *.dSYM.zip
 *.dSYM
+
+# iOS: TailscaleKit is built by app/scripts/build-tailscalekit.sh
+app/Vendor/
