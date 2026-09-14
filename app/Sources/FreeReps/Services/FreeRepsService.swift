@@ -254,7 +254,15 @@ actor FreeRepsService {
         return data
     }
 
-    private func performRequest(_ request: URLRequest, retryingStaleTailscale: Bool = true) async throws -> (Data, URLResponse) {
+    /// Errors the node's loopback proxy produces while it is not usable: "bad URL"
+    /// for the first seconds after the node starts, before the peer path exists,
+    /// and connection errors once iOS has reclaimed the proxy in the background.
+    private static let proxyErrors: Set<URLError.Code> = [.badURL, .cannotConnectToHost, .networkConnectionLost]
+    /// Pauses before another attempt through the proxy; the last one restarts the node.
+    private static let proxyRetryDelays: [Duration] = [.seconds(1), .seconds(2), .seconds(3)]
+
+    private func performRequest(_ request: URLRequest, trace: [String: String] = [:],
+                                attempt: Int = 0) async throws -> (Data, URLResponse) {
         try Task.checkCancellation()
         let started = Date()
         let requestID = UUID().uuidString
@@ -283,13 +291,15 @@ actor FreeRepsService {
             if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
                 throw CancellationError()
             }
-            // The node's local proxy does not survive every suspension; start a fresh node once.
-            let proxyLost: Set<URLError.Code> = [.cannotConnectToHost, .networkConnectionLost]
-            if configuration.usesEmbeddedTailscale, retryingStaleTailscale,
-               let code = (error as? URLError)?.code, proxyLost.contains(code) {
+            if configuration.usesEmbeddedTailscale, attempt < Self.proxyRetryDelays.count,
+               let code = (error as? URLError)?.code, Self.proxyErrors.contains(code) {
+                await SyncTrace.shared.record("http.retry", ["request_id": requestID, "attempt": String(attempt + 1)])
+                try await Task.sleep(for: Self.proxyRetryDelays[attempt])
                 self.session = nil
-                try await EmbeddedTailscale.shared.restart()
-                return try await performRequest(request, retryingStaleTailscale: false)
+                if attempt == Self.proxyRetryDelays.count - 1 {
+                    try await EmbeddedTailscale.shared.restart()
+                }
+                return try await performRequest(request, trace: trace, attempt: attempt + 1)
             }
             throw FreeRepsError.connectionFailed(error.localizedDescription)
         }
