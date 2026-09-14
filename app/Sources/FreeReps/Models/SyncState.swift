@@ -8,6 +8,7 @@ struct PersistedCategory: Codable {
     let recordCount: Int
     let lastSyncDate: Date?
     let completed: Bool
+    var failureMessage: String? = nil
 }
 
 struct PersistedSnapshot: Codable {
@@ -151,12 +152,16 @@ class SyncState: ObservableObject {
     func persist() {
         let snap = PersistedSnapshot(
             lastSyncDate: lastSyncDate,
-            categories: categories.map {
+            categories: categories.map { category in
                 PersistedCategory(
-                    id: $0.id,
-                    recordCount: $0.recordCount,
-                    lastSyncDate: $0.lastSyncDate,
-                    completed: $0.status == .completed
+                    id: category.id,
+                    recordCount: category.recordCount,
+                    lastSyncDate: category.lastSyncDate,
+                    completed: category.status == .completed,
+                    failureMessage: {
+                        if case .failed(let message) = category.status { return message }
+                        return nil
+                    }()
                 )
             },
             totalRecords: totalRecords,
@@ -184,6 +189,7 @@ class SyncState: ObservableObject {
             categories[idx].recordCount = persisted.recordCount
             categories[idx].lastSyncDate = persisted.lastSyncDate
             if persisted.completed { categories[idx].status = .completed }
+            if let message = persisted.failureMessage { categories[idx].status = .failed(message) }
         }
         recalcOverall()
     }

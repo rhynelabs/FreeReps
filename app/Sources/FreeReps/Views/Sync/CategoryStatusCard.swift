@@ -48,6 +48,15 @@ struct CategoryStatusCard: View {
                         .tint(.blue)
                         .frame(maxWidth: 180)
                 }
+                if case .failed(let message) = state.status {
+                    DisclosureGroup("Error details") {
+                        Text(message)
+                            .font(.caption)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .font(.caption)
+                }
             }
 
             Spacer()

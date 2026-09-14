@@ -629,6 +629,8 @@ final class SyncService: ObservableObject {
                     // Generic retry with backoff
                     retries += 1
                     try await Task.sleep(nanoseconds: UInt64(retries) * 500_000_000)
+                } catch {
+                    throw backfillFailure(error, category: catID, start: cursor, end: windowEnd)
                 }
             }
             total += windowTotal
@@ -679,6 +681,8 @@ final class SyncService: ObservableObject {
                     // Generic retry with backoff
                     retries += 1
                     try await Task.sleep(nanoseconds: UInt64(retries) * 500_000_000)
+                } catch {
+                    throw backfillFailure(error, category: catID, start: cursor, end: windowEnd)
                 }
             }
             total += windowTotal
@@ -697,6 +701,15 @@ final class SyncService: ObservableObject {
     }
 
     // MARK: - Incremental sync
+
+    private func backfillFailure(_ error: Error, category: String, start: Date, end: Date) -> NSError {
+        let cause = error as NSError
+        let formatter = ISO8601DateFormatter()
+        return NSError(domain: "FreeReps.Backfill", code: cause.code, userInfo: [
+            NSLocalizedDescriptionKey: "\(category), \(formatter.string(from: start)) to \(formatter.string(from: end)): \(cause.localizedDescription) [\(cause.domain):\(cause.code)]",
+            NSUnderlyingErrorKey: cause,
+        ])
+    }
 
     func runIncrementalSync(config: FreeRepsConfig) async {
         guard !Self.isSyncRunning, !syncState.isAnySyncRunning else { return }
@@ -791,7 +804,8 @@ final class SyncService: ObservableObject {
                         if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
                             throw error
                         } else {
-                            failedTypes.append(typeDesc.displayName)
+                            let cause = error as NSError
+                            failedTypes.append("\(typeDesc.displayName): \(error.localizedDescription) [\(cause.domain):\(cause.code)]")
                         }
                     }
                 }
