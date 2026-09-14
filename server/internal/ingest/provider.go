@@ -14,8 +14,8 @@ type Result struct {
 	SleepStagesInserted   int64 `json:"sleep_stages_inserted,omitempty"`
 
 	// SleepStagesFrom and SleepStagesTo span the sleep stages this ingest
-	// wrote, so the caller can rebuild sessions for those nights alone. Both
-	// are zero while SleepStagesInserted is 0.
+	// received, inserted or not, so the caller can rebuild sessions for
+	// those nights alone. Both are zero while no stage arrived.
 	SleepStagesFrom time.Time `json:"-"`
 	SleepStagesTo   time.Time `json:"-"`
 
@@ -39,13 +39,10 @@ type Result struct {
 }
 
 // AddSleepStages counts inserted stage rows and widens the stage span to
-// cover [from, to]. A batch the database dropped entirely as duplicates
-// (inserted == 0) leaves the span alone, so an all-duplicate upload triggers
-// no session rebuild.
+// cover [from, to]. The span grows for duplicates too: a client that resends
+// a batch after a dropped connection is the only chance to build the night
+// whose first upload was cut off before its session was written.
 func (r *Result) AddSleepStages(inserted int64, from, to time.Time) {
-	if inserted == 0 {
-		return
-	}
 	r.SleepStagesInserted += inserted
 	if r.SleepStagesFrom.IsZero() || from.Before(r.SleepStagesFrom) {
 		r.SleepStagesFrom = from

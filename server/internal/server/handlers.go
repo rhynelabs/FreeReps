@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -47,11 +48,17 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if result.SleepStagesInserted > 0 {
+	if !result.SleepStagesTo.IsZero() {
 		// Only the nights this payload touched. The unscoped backfill reads
 		// every stage of every user, which made a batch with a few sleep rows
 		// cost as much as the whole history.
-		if _, err := s.db.BackfillSleepSessionsFor(r.Context(), s.log, uid, result.SleepStagesFrom, result.SleepStagesTo); err != nil {
+		//
+		// The stages are committed by now. A client that gives up on the
+		// request here must not leave them without a session, so the rebuild
+		// outlives the request context.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
+		defer cancel()
+		if _, err := s.db.BackfillSleepSessionsFor(ctx, s.log, uid, result.SleepStagesFrom, result.SleepStagesTo); err != nil {
 			s.log.Warn("sleep session backfill after REST ingest failed", "error", err)
 		}
 	}
