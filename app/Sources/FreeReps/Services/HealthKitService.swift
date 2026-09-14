@@ -608,7 +608,10 @@ final class HealthKitService {
         // Use cursor-based pagination: fetch a batch, then use the last sample's
         // start date as the lower bound for the next query. This guarantees we get
         // ALL historical data, unlike HKAnchoredObjectQuery.
+        // The next query starts at that same date, because several samples can share
+        // it (one per source); the ones already delivered are skipped by UUID.
         var cursorDate = startDate
+        var delivered = Set<UUID>()
         while true {
             let predicate: NSPredicate?
             if let start = cursorDate, let end = endDate {
@@ -622,7 +625,7 @@ final class HealthKitService {
             }
             let sortDesc = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
 
-            let samples: [HKQuantitySample] = try await withCheckedThrowingContinuation { cont in
+            let fetched: [HKQuantitySample] = try await withCheckedThrowingContinuation { cont in
                 let query = HKSampleQuery(
                     sampleType: type,
                     predicate: predicate,
@@ -638,18 +641,15 @@ final class HealthKitService {
                 store.execute(query)
             }
 
+            let samples = fetched.filter { !delivered.contains($0.uuid) }
             guard !samples.isEmpty else { break }
             try await handler(samples)
 
-            if samples.count < batchSize { break }
+            if fetched.count < batchSize { break }
 
-            // Advance cursor past the last sample to avoid infinite loops.
-            // Add a tiny epsilon to avoid re-fetching the same sample.
-            if let lastDate = samples.last?.startDate {
-                cursorDate = lastDate.addingTimeInterval(0.001)
-            } else {
-                break
-            }
+            guard let lastDate = samples.last?.startDate else { break }
+            cursorDate = lastDate
+            delivered = Set(samples.filter { $0.startDate == lastDate }.map(\.uuid))
         }
     }
 
