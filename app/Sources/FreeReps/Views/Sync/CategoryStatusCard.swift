@@ -102,11 +102,11 @@ struct CategoryStatusCard: View {
             isPresented: $showResetConfirm,
             titleVisibility: .visible
         ) {
-            Button("Delete All Records", role: .destructive) {
+            Button("Reset Local Progress", role: .destructive) {
                 onReset?()
             }
         } message: {
-            Text("This permanently deletes all \(state.displayName) records from the server. This cannot be undone.")
+            Text("This resets the saved sync progress for \(state.displayName) on this iPhone. Records already stored on the server are kept.")
         }
     }
 
