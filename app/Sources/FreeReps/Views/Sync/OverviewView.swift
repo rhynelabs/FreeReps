@@ -153,7 +153,7 @@ struct OverviewView: View {
             if let night = server.lastNight {
                 nightRows(night)
             } else if server.state == .loading {
-                nightRows(.init(hours: 7.5, start: .now, end: .now))
+                nightRows(Self.placeholderNight)
                     .redacted(reason: .placeholder)
             } else {
                 Text("No sleep recorded")
@@ -162,12 +162,44 @@ struct OverviewView: View {
         }
     }
 
-    @ViewBuilder
     private func nightRows(_ night: ServerOverview.Night) -> some View {
         let minutes = Int((night.hours * 60).rounded())
-        LabeledContent("Sleep", value: Duration.seconds(minutes * 60), format: .units(allowed: [.hours, .minutes], width: .abbreviated))
-        LabeledContent("Asleep", value: "\(night.start.formatted(date: .omitted, time: .shortened)) – \(night.end.formatted(date: .omitted, time: .shortened))")
-            .monospacedDigit()
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Sleep")
+                    .font(.headline)
+                Spacer()
+                Text(Duration.seconds(minutes * 60)
+                    .formatted(.units(allowed: [.hours, .minutes], width: .abbreviated)))
+                    .font(.headline)
+                    .monospacedDigit()
+            }
+            Text("\(night.start.formatted(date: .omitted, time: .shortened)) – \(night.end.formatted(date: .omitted, time: .shortened))")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            if !night.stages.isEmpty {
+                SleepStagesChart(start: night.start, end: night.end, stages: night.stages)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// A plausible night to show redacted while the server is being read.
+    private static var placeholderNight: ServerOverview.Night {
+        let pattern: [(ServerOverview.Night.Kind, Double)] = [
+            (.core, 1.2), (.deep, 0.8), (.core, 1.0), (.rem, 0.7), (.awake, 0.2),
+            (.core, 1.4), (.deep, 0.6), (.rem, 0.9), (.core, 0.7),
+        ]
+        let start = Date().addingTimeInterval(-7.5 * 3600)
+        var cursor = start
+        var stages: [ServerOverview.Night.Stage] = []
+        for (kind, hours) in pattern {
+            let next = cursor.addingTimeInterval(hours * 3600)
+            stages.append(.init(start: cursor, end: next, kind: kind))
+            cursor = next
+        }
+        return .init(hours: 7.5, start: start, end: cursor, stages: stages)
     }
 
     private var serverSection: some View {
@@ -239,6 +271,31 @@ final class ServerOverview: ObservableObject {
         let hours: Double
         let start: Date
         let end: Date
+        /// The stages of this night, in order. Empty when the server holds the
+        /// session but no detail.
+        var stages: [Stage] = []
+
+        struct Stage {
+            let start: Date
+            let end: Date
+            let kind: Kind
+        }
+
+        /// What the server calls "Asleep" or "In Bed" — and anything unknown —
+        /// is a night without stage detail.
+        enum Kind: Hashable {
+            case awake, rem, core, deep, asleep
+
+            init(_ name: String) {
+                switch name {
+                case "Awake": self = .awake
+                case "REM": self = .rem
+                case "Core": self = .core
+                case "Deep": self = .deep
+                default: self = .asleep
+                }
+            }
+        }
     }
 
     @Published private(set) var state: State = .loading
@@ -280,33 +337,41 @@ final class ServerOverview: ObservableObject {
     private static func decodeLastNight(_ data: Data) -> Night? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         let recent = { (end: Date) in Date().timeIntervalSince(end) < 24 * 3600 }
-        let sessions = (json["sessions"] as? [[String: Any]] ?? []).compactMap { session -> Night? in
-            guard let hours = session["TotalSleep"] as? Double, hours > 0,
-                  let start = (session["SleepStart"] as? String).flatMap(date),
-                  let end = (session["SleepEnd"] as? String).flatMap(date) else { return nil }
-            return Night(hours: hours, start: start, end: end)
-        }
-        if let night = sessions.filter({ recent($0.end) }).max(by: { $0.end < $1.end }) { return night }
 
         let asleep: Set<String> = ["Core", "Deep", "REM", "Asleep"]
-        let stages = (json["stages"] as? [[String: Any]] ?? []).compactMap { stage -> (start: Date, end: Date, hours: Double)? in
+        let stages = (json["stages"] as? [[String: Any]] ?? []).compactMap { stage -> (start: Date, end: Date, kind: Night.Kind, hours: Double)? in
             guard let start = (stage["StartTime"] as? String).flatMap(date),
                   let end = (stage["EndTime"] as? String).flatMap(date),
                   let name = stage["Stage"] as? String else { return nil }
             let hours = asleep.contains(name) ? (stage["DurationHr"] as? Double ?? 0) : 0
-            return (start, end, hours)
+            return (start, end, Night.Kind(name), hours)
         }
-        .filter { recent($0.end) }
         .sorted { $0.start < $1.start }
+
+        let sessions = (json["sessions"] as? [[String: Any]] ?? []).compactMap { session -> Night? in
+            guard let hours = session["TotalSleep"] as? Double, hours > 0,
+                  let start = (session["SleepStart"] as? String).flatMap(date),
+                  let end = (session["SleepEnd"] as? String).flatMap(date) else { return nil }
+            // Everything that overlaps the session belongs to it; a stage may
+            // start before the first asleep minute or end after the last.
+            let within = stages
+                .filter { $0.end > start && $0.start < end }
+                .map { Night.Stage(start: $0.start, end: $0.end, kind: $0.kind) }
+            return Night(hours: hours, start: start, end: end, stages: within)
+        }
+        if let night = sessions.filter({ recent($0.end) }).max(by: { $0.end < $1.end }) { return night }
+
         // A break of more than three hours separates a nap from the night.
-        var night: [(start: Date, end: Date, hours: Double)] = []
-        for stage in stages {
+        var night: [(start: Date, end: Date, kind: Night.Kind, hours: Double)] = []
+        for stage in stages where recent(stage.end) {
             if let last = night.last, stage.start.timeIntervalSince(last.end) > 3 * 3600 { night = [] }
             night.append(stage)
         }
         guard let first = night.first, let last = night.last else { return nil }
         let hours = night.reduce(0) { $0 + $1.hours }
-        return hours > 0 ? Night(hours: hours, start: first.start, end: last.end) : nil
+        guard hours > 0 else { return nil }
+        return Night(hours: hours, start: first.start, end: last.end,
+                     stages: night.map { Night.Stage(start: $0.start, end: $0.end, kind: $0.kind) })
     }
 
     private static func date(_ text: String) -> Date? {
@@ -315,5 +380,134 @@ final class ServerOverview: ObservableObject {
         if let date = formatter.date(from: text) { return date }
         formatter.formatOptions = [.withInternetDateTime]
         return formatter.date(from: text)
+    }
+}
+
+/// A hypnogram of one night in the style of the Health app's sleep widget: one
+/// lane per stage from Awake down to Deep, every stage a rounded bar placed by
+/// its time within the night, consecutive stages joined by a thin connector.
+///
+/// Drawn in a single `Canvas`, so a night with sixty stages costs one pass and
+/// no view identity churn.
+struct SleepStagesChart: View {
+    let start: Date
+    let end: Date
+    let stages: [ServerOverview.Night.Stage]
+
+    @Environment(\.redactionReasons) private var redaction
+
+    private static let laneHeight: CGFloat = 24
+    private static let barHeight: CGFloat = 9
+    private static let labelWidth: CGFloat = 44
+    private static let labelGap: CGFloat = 6
+    /// A stage of a few minutes still has to be visible.
+    private static let minimumBarWidth: CGFloat = 2.5
+
+    /// A night with stage detail gets the four Health lanes; a night that only
+    /// knows "asleep" gets a single one. Mixed input — an "In Bed" stretch next
+    /// to real stages — draws the detail and leaves the coarse stages out.
+    private var lanes: [ServerOverview.Night.Kind] {
+        let detail: [ServerOverview.Night.Kind] = [.awake, .rem, .core, .deep]
+        return Set(stages.map(\.kind)).isDisjoint(with: detail) ? [.asleep] : detail
+    }
+
+    private var drawn: [ServerOverview.Night.Stage] {
+        let shown = Set(lanes)
+        return stages.filter { shown.contains($0.kind) }.sorted { $0.start < $1.start }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .top, spacing: Self.labelGap) {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(lanes, id: \.self) { lane in
+                        Text(Self.label(lane))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .frame(height: Self.laneHeight, alignment: .leading)
+                    }
+                }
+                .frame(width: Self.labelWidth, alignment: .leading)
+                chart
+            }
+            .frame(height: Self.laneHeight * CGFloat(lanes.count))
+
+            HStack {
+                Text(start.formatted(date: .omitted, time: .shortened))
+                Spacer()
+                Text(end.formatted(date: .omitted, time: .shortened))
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .monospacedDigit()
+            .padding(.leading, Self.labelWidth + Self.labelGap)
+        }
+        .accessibilityElement()
+        .accessibilityLabel("Sleep stages")
+    }
+
+    private var chart: some View {
+        let items = drawn
+        let lanes = self.lanes
+        return Canvas(opaque: false) { context, size in
+            let span = max(end.timeIntervalSince(start), 60)
+            func position(_ date: Date) -> CGFloat {
+                let fraction = date.timeIntervalSince(start) / span
+                return CGFloat(min(max(fraction, 0), 1)) * size.width
+            }
+            func centerY(_ kind: ServerOverview.Night.Kind) -> CGFloat {
+                let lane = lanes.firstIndex(of: kind) ?? 0
+                return (CGFloat(lane) + 0.5) * Self.laneHeight
+            }
+
+            // Connectors first, so the bars cover their ends.
+            let connector = Color.secondary.opacity(0.35)
+            for (previous, next) in zip(items, items.dropFirst()) {
+                let x = (position(previous.end) + position(next.start)) / 2
+                let from = centerY(previous.kind)
+                let to = centerY(next.kind)
+                guard from != to else { continue }
+                let rect = CGRect(x: x - 0.5, y: min(from, to), width: 1, height: abs(to - from))
+                context.fill(Path(rect), with: .color(connector))
+            }
+
+            for stage in items {
+                let left = position(stage.start)
+                let width = min(max(position(stage.end) - left, Self.minimumBarWidth), max(size.width - left, Self.minimumBarWidth))
+                let rect = CGRect(x: left,
+                                  y: centerY(stage.kind) - Self.barHeight / 2,
+                                  width: width,
+                                  height: Self.barHeight)
+                context.fill(Path(roundedRect: rect, cornerRadius: Self.barHeight / 2),
+                             with: .color(color(stage.kind)))
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func color(_ kind: ServerOverview.Night.Kind) -> Color {
+        // The placeholder night is fake data; it must not read as a real one.
+        if redaction.contains(.placeholder) { return Color.secondary.opacity(0.3) }
+        return Self.stageColor(kind)
+    }
+
+    private static func stageColor(_ kind: ServerOverview.Night.Kind) -> Color {
+        switch kind {
+        case .awake: return Color(red: 1.0, green: 0.45, blue: 0.35)
+        case .rem: return Color(red: 0.36, green: 0.80, blue: 1.0)
+        case .core: return Color(red: 0.0, green: 0.48, blue: 1.0)
+        case .deep: return Color(red: 0.22, green: 0.26, blue: 0.68)
+        case .asleep: return Color(red: 0.0, green: 0.48, blue: 1.0)
+        }
+    }
+
+    private static func label(_ kind: ServerOverview.Night.Kind) -> String {
+        switch kind {
+        case .awake: return "Awake"
+        case .rem: return "REM"
+        case .core: return "Core"
+        case .deep: return "Deep"
+        case .asleep: return "Asleep"
+        }
     }
 }
