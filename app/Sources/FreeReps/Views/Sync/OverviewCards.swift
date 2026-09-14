@@ -51,15 +51,20 @@ struct ActivityColumn: View {
     var body: some View {
         let tint = redaction.contains(.placeholder) ? Color.secondary : color
         let progress = goal > 0 ? min(max(value / goal, 0), 1) : 0
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 2) {
-                Text("\(Int(value.rounded()))")
-                    .font(.system(size: 22, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(tint)
-                Text("/\(Int(goal.rounded())) \(unit)")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 0) {
+            // The goal sits beside the value while both fit in a third of the
+            // card; a "8,000 /15,000 KCAL" pair does not, and then the goal
+            // drops under the value instead of shrinking past legibility or
+            // running into the next column.
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    valueText(tint)
+                    goalText
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    valueText(tint)
+                    goalText
+                }
             }
             .lineLimit(1)
             .minimumScaleFactor(0.7)
@@ -67,6 +72,12 @@ struct ActivityColumn: View {
             Text(title)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .padding(.top, 4)
+
+            // Lets a taller column push its bar down to the neighbours' bars,
+            // so the three bars stay on one line whichever layout the columns
+            // ended up with.
+            Spacer(minLength: 6)
 
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
@@ -76,12 +87,29 @@ struct ActivityColumn: View {
                 }
             }
             .frame(height: 4)
-            .padding(.top, 2)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement()
-        .accessibilityLabel("\(title): \(Int(value.rounded())) of \(Int(goal.rounded())) \(unit)")
+        .accessibilityLabel("\(title): \(formattedValue) of \(formattedGoal) \(unit)")
     }
+
+    private func valueText(_ tint: Color) -> some View {
+        Text(formattedValue)
+            .font(.system(size: 22, weight: .semibold, design: .rounded))
+            .monospacedDigit()
+            .foregroundStyle(tint)
+    }
+
+    private var goalText: some View {
+        Text("/\(formattedGoal) \(unit)")
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(.secondary)
+    }
+
+    /// Grouped the way the locale groups ("8,000"), so a big day reads as a
+    /// number and not as a digit run.
+    private var formattedValue: String { Int(value.rounded()).formatted() }
+    private var formattedGoal: String { Int(goal.rounded()).formatted() }
 }
 
 // MARK: - Steps
