@@ -797,7 +797,9 @@ final class SyncService: ObservableObject {
                 for typeDesc in types {
                     try Task.checkCancellation()
                     do {
+                        await SyncTrace.shared.record("quantity.started", ["type": typeDesc.id])
                         catDelta += try await syncQuantityType(typeDesc: typeDesc, since: querySince)
+                        await SyncTrace.shared.record("quantity.finished", ["type": typeDesc.id])
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch {
@@ -805,6 +807,8 @@ final class SyncService: ObservableObject {
                             throw error
                         } else {
                             let cause = error as NSError
+                            await SyncTrace.shared.record("quantity.failed", ["type": typeDesc.id,
+                                "domain": cause.domain, "code": String(cause.code)])
                             failedTypes.append("\(typeDesc.displayName): \(error.localizedDescription) [\(cause.domain):\(cause.code)]")
                         }
                     }
