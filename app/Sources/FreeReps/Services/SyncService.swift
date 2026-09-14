@@ -321,7 +321,6 @@ final class SyncService: ObservableObject {
             }
 
             syncState.updateCategory(categoryID, status: .completed, recordCount: count, lastSyncDate: Date())
-            syncState.lastSyncDate = Date()
             syncState.currentOperation = ""
             // Clear cursor so a future full sync re-visits this category from the beginning
             syncState.backfillCursors.removeValue(forKey: categoryID)
@@ -538,7 +537,7 @@ final class SyncService: ObservableObject {
 
             // Mark complete even if some categories failed — successful ones keep their progress.
             syncState.hasCompletedFullSync = failedCategories.isEmpty
-            syncState.lastSyncDate = Date()
+            if failedCategories.isEmpty { syncState.lastSyncDate = anchor }
             if failedCategories.isEmpty {
                 syncState.currentOperation = "Backfill complete"
             } else {
@@ -711,6 +710,7 @@ final class SyncService: ObservableObject {
             }
             syncState.persist()
         }
+        let syncStartedAt = Date()
         syncState.errorMessage = nil
         startLiveActivity(isFullSync: false)
 
@@ -789,7 +789,7 @@ final class SyncService: ObservableObject {
                         throw CancellationError()
                     } catch {
                         if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                            // Device is locked — silently skip this type, don't mark category as failed
+                            throw error
                         } else {
                             failedTypes.append(typeDesc.displayName)
                         }
@@ -802,7 +802,7 @@ final class SyncService: ObservableObject {
                     failedCategories.append(cat.rawValue)
                     syncState.updateCategory(catID,
                         status: .failed("Failed types: \(failedTypes.joined(separator: ", "))"),
-                        recordCount: existing + catDelta, lastSyncDate: Date())
+                        recordCount: existing + catDelta)
                 }
                 total += catDelta
                 updateLiveActivity(phase: cat.rawValue, operation: "Synced \(cat.rawValue) (\(catDelta) records)", records: total)
@@ -819,9 +819,11 @@ final class SyncService: ObservableObject {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                if !(isBackgroundSync && (error as? HKError)?.code == .errorDatabaseInaccessible) {
+                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                    throw error
+                } else {
                     failedCategories.append("Category Samples")
-                    syncState.updateCategory("cat_category", status: .failed(error.localizedDescription), lastSyncDate: Date())
+                    syncState.updateCategory("cat_category", status: .failed(error.localizedDescription))
                 }
             }
 
@@ -836,9 +838,11 @@ final class SyncService: ObservableObject {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                if !(isBackgroundSync && (error as? HKError)?.code == .errorDatabaseInaccessible) {
+                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                    throw error
+                } else {
                     failedCategories.append("Workouts")
-                    syncState.updateCategory("cat_workouts", status: .failed(error.localizedDescription), lastSyncDate: Date())
+                    syncState.updateCategory("cat_workouts", status: .failed(error.localizedDescription))
                 }
             }
 
@@ -853,9 +857,11 @@ final class SyncService: ObservableObject {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                if !(isBackgroundSync && (error as? HKError)?.code == .errorDatabaseInaccessible) {
+                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                    throw error
+                } else {
                     failedCategories.append("Blood Pressure")
-                    syncState.updateCategory("cat_bp", status: .failed(error.localizedDescription), lastSyncDate: Date())
+                    syncState.updateCategory("cat_bp", status: .failed(error.localizedDescription))
                 }
             }
 
@@ -870,9 +876,11 @@ final class SyncService: ObservableObject {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                if !(isBackgroundSync && (error as? HKError)?.code == .errorDatabaseInaccessible) {
+                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                    throw error
+                } else {
                     failedCategories.append("ECG")
-                    syncState.updateCategory("cat_ecg", status: .failed(error.localizedDescription), lastSyncDate: Date())
+                    syncState.updateCategory("cat_ecg", status: .failed(error.localizedDescription))
                 }
             }
 
@@ -887,9 +895,11 @@ final class SyncService: ObservableObject {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                if !(isBackgroundSync && (error as? HKError)?.code == .errorDatabaseInaccessible) {
+                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                    throw error
+                } else {
                     failedCategories.append("Audiograms")
-                    syncState.updateCategory("cat_audiogram", status: .failed(error.localizedDescription), lastSyncDate: Date())
+                    syncState.updateCategory("cat_audiogram", status: .failed(error.localizedDescription))
                 }
             }
 
@@ -904,9 +914,11 @@ final class SyncService: ObservableObject {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                if !(isBackgroundSync && (error as? HKError)?.code == .errorDatabaseInaccessible) {
+                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                    throw error
+                } else {
                     failedCategories.append("Activity Summaries")
-                    syncState.updateCategory("cat_activity_summaries", status: .failed(error.localizedDescription), lastSyncDate: Date())
+                    syncState.updateCategory("cat_activity_summaries", status: .failed(error.localizedDescription))
                 }
             }
 
@@ -921,9 +933,11 @@ final class SyncService: ObservableObject {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                if !(isBackgroundSync && (error as? HKError)?.code == .errorDatabaseInaccessible) {
+                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                    throw error
+                } else {
                     failedCategories.append("Workout Routes")
-                    syncState.updateCategory("cat_workout_routes", status: .failed(error.localizedDescription), lastSyncDate: Date())
+                    syncState.updateCategory("cat_workout_routes", status: .failed(error.localizedDescription))
                 }
             }
 
@@ -938,9 +952,11 @@ final class SyncService: ObservableObject {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                if !(isBackgroundSync && (error as? HKError)?.code == .errorDatabaseInaccessible) {
+                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                    throw error
+                } else {
                     failedCategories.append("Medications")
-                    syncState.updateCategory("cat_medications", status: .failed(error.localizedDescription), lastSyncDate: Date())
+                    syncState.updateCategory("cat_medications", status: .failed(error.localizedDescription))
                 }
             }
 
@@ -955,9 +971,11 @@ final class SyncService: ObservableObject {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                if !(isBackgroundSync && (error as? HKError)?.code == .errorDatabaseInaccessible) {
+                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                    throw error
+                } else {
                     failedCategories.append("Vision Prescriptions")
-                    syncState.updateCategory("cat_vision", status: .failed(error.localizedDescription), lastSyncDate: Date())
+                    syncState.updateCategory("cat_vision", status: .failed(error.localizedDescription))
                 }
             }
 
@@ -972,9 +990,11 @@ final class SyncService: ObservableObject {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                if !(isBackgroundSync && (error as? HKError)?.code == .errorDatabaseInaccessible) {
+                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                    throw error
+                } else {
                     failedCategories.append("State of Mind")
-                    syncState.updateCategory("cat_state_of_mind", status: .failed(error.localizedDescription), lastSyncDate: Date())
+                    syncState.updateCategory("cat_state_of_mind", status: .failed(error.localizedDescription))
                 }
             }
 
@@ -982,7 +1002,7 @@ final class SyncService: ObservableObject {
                 syncState.errorMessage = "Sync completed with errors in: \(failedCategories.joined(separator: ", "))"
             }
 
-            syncState.lastSyncDate = Date()
+            if failedCategories.isEmpty { syncState.lastSyncDate = syncStartedAt }
             syncState.currentOperation = "Incremental sync done (\(total) records)"
             syncState.persist()
             endLiveActivity(totalRecords: total)
@@ -993,6 +1013,10 @@ final class SyncService: ObservableObject {
             endLiveActivity(totalRecords: 0)
             syncState.currentOperation = "Sync cancelled"
             syncState.persist()
+        } catch let error as HKError where isBackgroundSync && error.code == .errorDatabaseInaccessible {
+            disconnectFreeReps()
+            endLiveActivity(totalRecords: 0)
+            syncState.currentOperation = "Waiting for Health data to become available"
         } catch {
             disconnectFreeReps()
             endLiveActivity(totalRecords: 0)
@@ -1176,33 +1200,27 @@ final class SyncService: ObservableObject {
 
         // Use on-device aggregation for high-frequency discrete types (e.g. heart rate).
         if case .aggregate(let interval) = typeDesc.syncStrategy {
-            do {
-                return try await syncQuantityTypeAggregated(
-                    typeDesc: typeDesc, metricName: metricName, interval: interval,
-                    since: since, until: until, insertBatchSize: insertBatchSize,
-                    onBatchInserted: onBatchInserted
-                )
-            } catch {
-                print("Aggregation failed for \(metricName), falling back to individual samples: \(error.localizedDescription)")
-            }
+            return try await syncQuantityTypeAggregated(
+                typeDesc: typeDesc, metricName: metricName, interval: interval,
+                since: since, until: until, insertBatchSize: insertBatchSize,
+                onBatchInserted: onBatchInserted
+            )
         }
 
         // Use cumulative SUM aggregation for step/energy/distance types.
         if case .aggregateCumulative(let interval) = typeDesc.syncStrategy {
-            do {
-                return try await syncQuantityTypeCumulative(
-                    typeDesc: typeDesc, metricName: metricName, interval: interval,
-                    since: since, until: until, insertBatchSize: insertBatchSize,
-                    onBatchInserted: onBatchInserted
-                )
-            } catch {
-                print("Cumulative agg failed for \(metricName), falling back to individual samples: \(error.localizedDescription)")
-            }
+            // A failed upload must not change the data representation. Re-sending
+            // individual samples after partial bucket uploads can double-count totals.
+            return try await syncQuantityTypeCumulative(
+                typeDesc: typeDesc, metricName: metricName, interval: interval,
+                since: since, until: until, insertBatchSize: insertBatchSize,
+                onBatchInserted: onBatchInserted
+            )
         }
 
         // Individual samples path — skip empty windows to avoid unnecessary streaming.
         if let start = since, let end = until, let hkType = typeDesc.hkType {
-            if !(await healthKit.sampleExists(for: hkType, from: start, to: end)) { return 0 }
+            if !(try await healthKit.sampleExists(for: hkType, from: start, to: end)) { return 0 }
         }
 
         var total = 0

@@ -698,16 +698,21 @@ final class HealthKitService {
     }
 
     /// Lightweight existence check — returns true if at least one sample exists in the date range.
-    func sampleExists(for sampleType: HKSampleType, from startDate: Date, to endDate: Date) async -> Bool {
-        await withCheckedContinuation { continuation in
+    func sampleExists(for sampleType: HKSampleType, from startDate: Date, to endDate: Date) async throws -> Bool {
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation { continuation in
             let predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: .strictStartDate)
             let query = HKSampleQuery(
                 sampleType: sampleType,
                 predicate: predicate,
                 limit: 1,
                 sortDescriptors: nil
-            ) { _, samples, _ in
-                continuation.resume(returning: (samples?.count ?? 0) > 0)
+            ) { _, samples, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: (samples?.count ?? 0) > 0)
+                }
             }
             store.execute(query)
         }
