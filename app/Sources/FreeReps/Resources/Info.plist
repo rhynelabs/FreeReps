@@ -19,10 +19,10 @@
 	</array>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
-		<string>com.meltforce.freereps.sync</string>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER).sync</string>
 	</array>
 	<key>CFBundleDisplayName</key>
-	<string>FreeReps</string>
+	<string>$(FREEREPS_DISPLAY_NAME)</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>

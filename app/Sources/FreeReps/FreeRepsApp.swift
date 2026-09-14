@@ -56,6 +56,10 @@ struct FreeRepsApp: App {
 
 final class AppDelegate: NSObject, UIApplicationDelegate {
 
+    static var syncTaskIdentifier: String {
+        (Bundle.main.bundleIdentifier ?? "com.meltforce.freereps") + ".sync"
+    }
+
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
@@ -80,7 +84,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 
     private func registerBackgroundTasks() {
         BGTaskScheduler.shared.register(
-            forTaskWithIdentifier: "com.meltforce.freereps.sync",
+            forTaskWithIdentifier: Self.syncTaskIdentifier,
             using: nil
         ) { task in
             self.handleBackgroundSync(task: task as! BGProcessingTask)
@@ -133,7 +137,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     }
 
     func scheduleNextBackgroundSync() {
-        let request = BGProcessingTaskRequest(identifier: "com.meltforce.freereps.sync")
+        let request = BGProcessingTaskRequest(identifier: Self.syncTaskIdentifier)
         request.requiresNetworkConnectivity = true
         request.requiresExternalPower = false
         request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60) // 15 min

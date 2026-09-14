@@ -373,7 +373,7 @@ final class SyncService: ObservableObject {
                 self.taskForCancellation?.cancel()
                 self.syncState.persist()
                 UserDefaults.standard.set(true, forKey: "pendingFullSyncResume")
-                let req = BGProcessingTaskRequest(identifier: "com.meltforce.freereps.sync")
+                let req = BGProcessingTaskRequest(identifier: AppDelegate.syncTaskIdentifier)
                 req.requiresNetworkConnectivity = true
                 req.requiresExternalPower = false
                 req.earliestBeginDate = nil
@@ -720,7 +720,7 @@ final class SyncService: ObservableObject {
         if !isBackgroundSync {
             bgTaskID = UIApplication.shared.beginBackgroundTask(withName: "health-incremental-sync") {
                 self.syncState.persist()
-                let req = BGProcessingTaskRequest(identifier: "com.meltforce.freereps.sync")
+                let req = BGProcessingTaskRequest(identifier: AppDelegate.syncTaskIdentifier)
                 req.requiresNetworkConnectivity = true
                 req.earliestBeginDate = nil
                 try? BGTaskScheduler.shared.submit(req)
