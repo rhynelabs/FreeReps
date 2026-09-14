@@ -2191,19 +2191,21 @@ final class SyncService: ObservableObject {
                     // Query per-minute HR aggregates for this workout's time window
                     var hrData: [FreeRepsWorkoutHRPoint]?
                     if w.duration > 0 {
-                        let buckets = try await self.healthKit.queryAggregatedStatistics(
-                            typeID: .heartRate, unit: hrUnit,
-                            from: w.startDate, until: w.endDate,
-                            interval: 60 // 1-minute buckets, matching HAE format
-                        )
-                        if !buckets.isEmpty {
-                            hrData = buckets.map { b in
-                                FreeRepsWorkoutHRPoint(
-                                    date: haeDate(b.startDate),
-                                    Min: b.min, Avg: b.avg, Max: b.max,
-                                    units: "bpm",
-                                    source: w.sourceDisplayName
-                                )
+                        do {
+                            let buckets = try await self.healthKit.queryAggregatedStatistics(
+                                typeID: .heartRate, unit: hrUnit,
+                                from: w.startDate, until: w.endDate,
+                                interval: 60 // 1-minute buckets, matching HAE format
+                            )
+                            if !buckets.isEmpty {
+                                hrData = buckets.map { b in
+                                    FreeRepsWorkoutHRPoint(
+                                        date: haeDate(b.startDate),
+                                        Min: b.min, Avg: b.avg, Max: b.max,
+                                        units: "bpm",
+                                        source: w.sourceDisplayName
+                                    )
+                                }
                             }
                         }
                     }
@@ -2444,6 +2446,13 @@ final class SyncService: ObservableObject {
             }
             try checkSelection()
             let payload = FreeRepsPayload(data: FreeRepsData(vision_prescriptions: items))
+                        } catch let error where HealthKitService.meansNoDataInRange(error) {
+                            // A workout from before the watch: no heart-rate
+                            // source for its minutes, not a failed workout (see
+                            // `statisticsBuckets`).
+                            await SyncTrace.shared.record("workout.hr_empty", [
+                                "workout": w.uuid.uuidString, "code": String((error as NSError).code),
+                            ])
             let result = try await ingest(payload)
             total += result.vision_prescriptions_inserted ?? items.count
         }
