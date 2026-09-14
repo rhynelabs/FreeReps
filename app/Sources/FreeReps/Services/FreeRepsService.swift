@@ -124,7 +124,7 @@ actor FreeRepsService {
         let sessionConfig = configuration.usesEmbeddedTailscale
             ? try await EmbeddedTailscale.shared.sessionConfiguration()
             : URLSessionConfiguration.default
-        sessionConfig.timeoutIntervalForRequest = 120
+        sessionConfig.timeoutIntervalForRequest = Self.ingestTimeout
         sessionConfig.timeoutIntervalForResource = 300
         let session = URLSession(configuration: sessionConfig)
         self.session = session
@@ -148,6 +148,10 @@ actor FreeRepsService {
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        // The session allows 120 s, but a request carries its own default of
+        // 60 s, and which one wins is not documented; set both so a 5,000-row
+        // batch on a loaded server (11 s seen) has the same margin either way.
+        request.timeoutInterval = Self.ingestTimeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // JSON of health samples shrinks about tenfold; the server inflates it back.
         let compressed = serverAcceptsGzip ? body.gzipped() : nil
@@ -159,13 +163,15 @@ actor FreeRepsService {
         }
         let trace = ["rows": String(payload.data.rowCount), "json_bytes": String(body.count)]
 
-        var (data, response) = try await performRequest(request, trace: trace)
+        // Ingest is idempotent — the server drops rows it already has — so a
+        // request that timed out can be sent again.
+        var (data, response) = try await performRequest(request, trace: trace, retryTimeouts: true)
         if compressed != nil, let status = (response as? HTTPURLResponse)?.statusCode, status == 400 || status == 415 {
             serverAcceptsGzip = false
             await SyncTrace.shared.record("http.gzip_unsupported", ["status": String(status)])
             request.httpBody = body
             request.setValue(nil, forHTTPHeaderField: "Content-Encoding")
-            (data, response) = try await performRequest(request, trace: trace)
+            (data, response) = try await performRequest(request, trace: trace, retryTimeouts: true)
         }
 
         guard let http = response as? HTTPURLResponse else {
@@ -260,11 +266,15 @@ actor FreeRepsService {
     /// for the first seconds after the node starts, before the peer path exists,
     /// and connection errors once iOS has reclaimed the proxy in the background.
     private static let proxyErrors: Set<URLError.Code> = [.badURL, .cannotConnectToHost, .networkConnectionLost]
-    /// Pauses before another attempt through the proxy; the last one restarts the node.
-    private static let proxyRetryDelays: [Duration] = [.seconds(1), .seconds(2), .seconds(3)]
+    /// Pauses before another attempt; the last one through the proxy restarts the node.
+    private static let retryDelays: [Duration] = [.seconds(1), .seconds(2), .seconds(3)]
+    /// Idle time allowed on an ingest request, in seconds.
+    private static let ingestTimeout: TimeInterval = 120
 
+    /// - Parameter retryTimeouts: Send the request again after a timeout. Only
+    ///   for requests the server can receive twice without harm.
     private func performRequest(_ request: URLRequest, trace: [String: String] = [:],
-                                attempt: Int = 0) async throws -> (Data, URLResponse) {
+                                retryTimeouts: Bool = false, attempt: Int = 0) async throws -> (Data, URLResponse) {
         try Task.checkCancellation()
         let started = Date()
         let requestID = UUID().uuidString
@@ -289,19 +299,26 @@ actor FreeRepsService {
         } catch {
             let cause = error as NSError
             await SyncTrace.shared.record("http.failed", ["request_id": requestID,
-                "domain": cause.domain, "code": String(cause.code)])
+                "domain": cause.domain, "code": String(cause.code),
+                "elapsed_ms": String(Int(Date().timeIntervalSince(started) * 1000))])
             if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
                 throw CancellationError()
             }
-            if configuration.usesEmbeddedTailscale, attempt < Self.proxyRetryDelays.count,
-               let code = (error as? URLError)?.code, Self.proxyErrors.contains(code) {
-                await SyncTrace.shared.record("http.retry", ["request_id": requestID, "attempt": String(attempt + 1)])
-                try await Task.sleep(for: Self.proxyRetryDelays[attempt])
-                self.session = nil
-                if attempt == Self.proxyRetryDelays.count - 1 {
-                    try await EmbeddedTailscale.shared.restart()
+            let code = (error as? URLError)?.code
+            let proxyFailed = configuration.usesEmbeddedTailscale && code.map(Self.proxyErrors.contains) == true
+            let timedOut = retryTimeouts && code == .timedOut
+            if attempt < Self.retryDelays.count, proxyFailed || timedOut {
+                await SyncTrace.shared.record("http.retry", ["request_id": requestID, "attempt": String(attempt + 1),
+                                                             "reason": timedOut ? "timeout" : "proxy"])
+                try await Task.sleep(for: Self.retryDelays[attempt])
+                if proxyFailed {
+                    // A timeout is the server's: the proxy and its session are fine.
+                    self.session = nil
+                    if attempt == Self.retryDelays.count - 1 {
+                        try await EmbeddedTailscale.shared.restart()
+                    }
                 }
-                return try await performRequest(request, trace: trace, attempt: attempt + 1)
+                return try await performRequest(request, trace: trace, retryTimeouts: retryTimeouts, attempt: attempt + 1)
             }
             throw FreeRepsError.connectionFailed(error.localizedDescription)
         }
