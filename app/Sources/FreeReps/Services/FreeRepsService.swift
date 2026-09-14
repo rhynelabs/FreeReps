@@ -1,4 +1,5 @@
 import Foundation
+import zlib
 
 /// Local troubleshooting events. Never records credentials, response bodies or health values.
 actor SyncTrace {
@@ -114,21 +115,40 @@ actor FreeRepsService {
         return session
     }
 
+    /// Servers before 1.3 reject a compressed body as invalid JSON; remembered per app run.
+    private static var serverAcceptsGzip = true
+
     /// POST a FreeReps payload to FreeReps and return the ingest result.
     func ingest(_ payload: FreeRepsPayload) async throws -> IngestResult {
         let url = try configuration.validatedBaseURL().appendingPathComponent("api/v1/ingest/")
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: Data
         do {
-            request.httpBody = try JSONEncoder().encode(payload)
+            body = try JSONEncoder().encode(payload)
         } catch EncodingError.invalidValue(_, let context) {
             let path = context.codingPath.map(\.stringValue).joined(separator: ".")
             await SyncTrace.shared.record("encode.failed", ["field": path])
             throw FreeRepsError.encodingError(path)
         }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // JSON of health samples shrinks about tenfold; the server inflates it back.
+        let compressed = Self.serverAcceptsGzip ? body.gzipped() : nil
+        if let compressed {
+            request.httpBody = compressed
+            request.setValue("gzip", forHTTPHeaderField: "Content-Encoding")
+        } else {
+            request.httpBody = body
+        }
 
-        let (data, response) = try await performRequest(request)
+        var (data, response) = try await performRequest(request)
+        if compressed != nil, let status = (response as? HTTPURLResponse)?.statusCode, status == 400 || status == 415 {
+            Self.serverAcceptsGzip = false
+            await SyncTrace.shared.record("http.gzip_unsupported", ["status": String(status)])
+            request.httpBody = body
+            request.setValue(nil, forHTTPHeaderField: "Content-Encoding")
+            (data, response) = try await performRequest(request)
+        }
 
         guard let http = response as? HTTPURLResponse else {
             throw FreeRepsError.connectionFailed("Invalid response")
@@ -257,5 +277,33 @@ actor FreeRepsService {
             }
             throw FreeRepsError.connectionFailed(error.localizedDescription)
         }
+    }
+}
+
+extension Data {
+    /// gzip-compresses the data with zlib; nil if zlib refuses (it never does for plain data).
+    func gzipped() -> Data? {
+        var stream = z_stream()
+        // windowBits 15 + 16 selects the gzip wrapper instead of zlib's own.
+        guard deflateInit2_(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY,
+                            ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else { return nil }
+        defer { deflateEnd(&stream) }
+        var output = Data(capacity: count / 8 + 64)
+        var chunk = [Bytef](repeating: 0, count: 64 * 1024)
+        let finished: Bool = withUnsafeBytes { input in
+            stream.next_in = UnsafeMutablePointer(mutating: input.bindMemory(to: Bytef.self).baseAddress)
+            stream.avail_in = uInt(count)
+            while true {
+                let status = chunk.withUnsafeMutableBufferPointer { buffer -> Int32 in
+                    stream.next_out = buffer.baseAddress
+                    stream.avail_out = uInt(buffer.count)
+                    return deflate(&stream, Z_FINISH)
+                }
+                output.append(contentsOf: chunk[0..<(chunk.count - Int(stream.avail_out))])
+                if status == Z_STREAM_END { return true }
+                if status != Z_OK && status != Z_BUF_ERROR { return false }
+            }
+        }
+        return finished ? output : nil
     }
 }
