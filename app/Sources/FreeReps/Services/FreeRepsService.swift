@@ -88,21 +88,30 @@ struct ImportResult: Codable {
 /// Lightweight HTTP client for FreeReps ingest API.
 actor FreeRepsService {
 
-    private let session: URLSession
+    private var session: URLSession?
     private let configuration: FreeRepsConfig
 
     init(config: FreeRepsConfig) {
         self.configuration = config
-        let sessionConfig = URLSessionConfiguration.default
-        sessionConfig.timeoutIntervalForRequest = 120
-        sessionConfig.timeoutIntervalForResource = 300
-        // Trust Tailscale certificates
-        self.session = URLSession(configuration: sessionConfig)
     }
 
     /// Cancels in-flight requests, e.g. when the user pauses Health sync.
     func cancelRequests() {
-        session.invalidateAndCancel()
+        session?.invalidateAndCancel()
+        session = nil
+    }
+
+    /// Created on first use: in Tailscale mode the session needs a running node.
+    private func currentSession() async throws -> URLSession {
+        if let session { return session }
+        let sessionConfig = configuration.usesEmbeddedTailscale
+            ? try await EmbeddedTailscale.shared.sessionConfiguration()
+            : URLSessionConfiguration.default
+        sessionConfig.timeoutIntervalForRequest = 120
+        sessionConfig.timeoutIntervalForResource = 300
+        let session = URLSession(configuration: sessionConfig)
+        self.session = session
+        return session
     }
 
     /// POST a FreeReps payload to FreeReps and return the ingest result.
@@ -209,13 +218,21 @@ actor FreeRepsService {
         return data
     }
 
-    private func performRequest(_ request: URLRequest) async throws -> (Data, URLResponse) {
+    private func performRequest(_ request: URLRequest, retryingStaleTailscale: Bool = true) async throws -> (Data, URLResponse) {
         try Task.checkCancellation()
         let started = Date()
         let requestID = UUID().uuidString
         let fields = ["request_id": requestID, "path": request.url?.path ?? "",
                       "method": request.httpMethod ?? "GET", "bytes": String(request.httpBody?.count ?? 0)]
         await SyncTrace.shared.record("http.started", fields)
+        let session: URLSession
+        do {
+            session = try await currentSession()
+        } catch {
+            await SyncTrace.shared.record("http.no_session", ["request_id": requestID])
+            if error is CancellationError { throw error }
+            throw FreeRepsError.connectionFailed(error.localizedDescription)
+        }
         do {
             let result = try await session.data(for: request)
             await SyncTrace.shared.record("http.finished", [
@@ -229,6 +246,14 @@ actor FreeRepsService {
                 "domain": cause.domain, "code": String(cause.code)])
             if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
                 throw CancellationError()
+            }
+            // The node's local proxy does not survive every suspension; start a fresh node once.
+            let proxyLost: Set<URLError.Code> = [.cannotConnectToHost, .networkConnectionLost]
+            if configuration.usesEmbeddedTailscale, retryingStaleTailscale,
+               let code = (error as? URLError)?.code, proxyLost.contains(code) {
+                self.session = nil
+                try await EmbeddedTailscale.shared.restart()
+                return try await performRequest(request, retryingStaleTailscale: false)
             }
             throw FreeRepsError.connectionFailed(error.localizedDescription)
         }

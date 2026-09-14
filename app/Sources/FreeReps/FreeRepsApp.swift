@@ -7,6 +7,7 @@ struct FreeRepsApp: App {
 
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var importState = ImportState()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
@@ -17,6 +18,10 @@ struct FreeRepsApp: App {
                 }
                 .sheet(isPresented: $importState.showResult) {
                     ImportResultView(state: importState)
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    // A suspended app can lose the Tailscale node's local proxy; start fresh next time.
+                    if phase == .background { Task { await EmbeddedTailscale.shared.stopIfIdle() } }
                 }
         }
     }

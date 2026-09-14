@@ -19,6 +19,34 @@ is as recorded there; where the record named no alternative, none is claimed.
 
 ---
 
+## 2026-09-14 — The iOS app can run its own Tailscale node
+
+**Decided:** 2026-09-14
+
+**Decision.** The iOS app embeds TailscaleKit (libtailscale) and can join the
+tailnet itself after a Tailscale web sign-in. Requests to the server then go
+through the node's local proxy instead of the system VPN. Connecting through an
+address the iPhone reaches on its own stays available as a second mode, and
+configurations saved before the change keep using it.
+
+**Reasoning.** iOS allows one active VPN. Requiring the Tailscale app's VPN
+for a background health sync forces users off other VPNs, and a sync that runs
+while the VPN is off fails with a DNS error. The server needs no change: the
+embedded node belongs to the signed-in Tailscale user, so `WhoIs` resolves it
+like any other device of that user. Servers are found by asking each online
+peer for `/api/v1/version`, not by device name, because the name is the
+user's choice.
+
+**Cost.** The app bundle carries a Go framework, and building the app needs Go
+(`app/scripts/build-tailscalekit.sh`). iOS can reclaim the node's loopback proxy
+while the app is suspended, so the node stops in the background and a request
+that finds the proxy gone restarts it once.
+
+**Trigger to re-open.** Apple allowing more than one active VPN, or
+libtailscale dropping its Swift package.
+
+---
+
 ## 2026-08-10 — The Alpha session timezone is configuration, and the natural key stays at the instant
 
 **Decided:** 2026-08-10

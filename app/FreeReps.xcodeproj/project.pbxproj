@@ -43,6 +43,9 @@
 		AABB00000000000000020042 /* FreeRepsPayload.swift in Sources */ = {isa = PBXBuildFile; fileRef = AABB00000000000000010042 /* FreeRepsPayload.swift */; };
 		AABB00000000000000020043 /* ImportState.swift in Sources */ = {isa = PBXBuildFile; fileRef = AABB00000000000000010043 /* ImportState.swift */; };
 		AABB00000000000000020044 /* ImportResultView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AABB00000000000000010044 /* ImportResultView.swift */; };
+		AABB00000000000000020060 /* TailscaleKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = AABB00000000000000010060 /* TailscaleKit.xcframework */; };
+		AABB00000000000000020061 /* TailscaleKit.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = AABB00000000000000010060 /* TailscaleKit.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		AABB00000000000000020062 /* EmbeddedTailscale.swift in Sources */ = {isa = PBXBuildFile; fileRef = AABB00000000000000010061 /* EmbeddedTailscale.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -65,6 +68,17 @@
 				AABB0000000000000002001F /* FreeRepsWidgets.appex in Embed App Extensions */,
 			);
 			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AABB00000000000000040008 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				AABB00000000000000020061 /* TailscaleKit.xcframework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXCopyFilesBuildPhase section */
@@ -109,6 +123,8 @@
 		AABB00000000000000010042 /* FreeRepsPayload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FreeRepsPayload.swift; sourceTree = "<group>"; };
 		AABB00000000000000010043 /* ImportState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImportState.swift; sourceTree = "<group>"; };
 		AABB00000000000000010044 /* ImportResultView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImportResultView.swift; sourceTree = "<group>"; };
+		AABB00000000000000010060 /* TailscaleKit.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = TailscaleKit.xcframework; path = Vendor/TailscaleKit.xcframework; sourceTree = SOURCE_ROOT; };
+		AABB00000000000000010061 /* EmbeddedTailscale.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmbeddedTailscale.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -119,6 +135,7 @@
 				AABB0000000000000002001A /* HealthKit.framework in Frameworks */,
 				AABB0000000000000002001B /* BackgroundTasks.framework in Frameworks */,
 				AABB0000000000000002001C /* ActivityKit.framework in Frameworks */,
+				AABB00000000000000020060 /* TailscaleKit.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -178,6 +195,7 @@
 			isa = PBXGroup;
 			children = (
 				AABB00000000000000010041 /* FreeRepsService.swift */,
+				AABB00000000000000010061 /* EmbeddedTailscale.swift */,
 				AABB00000000000000010009 /* HealthKitService.swift */,
 				AABB0000000000000001000A /* SyncService.swift */,
 				AABB00000000000000010035 /* BackgroundSyncManager.swift */,
@@ -243,6 +261,7 @@
 				AABB0000000000000001001B /* BackgroundTasks.framework */,
 				AABB0000000000000001001D /* WidgetKit.framework */,
 				AABB0000000000000001001E /* ActivityKit.framework */,
+				AABB00000000000000010060 /* TailscaleKit.xcframework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -288,6 +307,7 @@
 				AABB00000000000000040002 /* Resources */,
 				AABB00000000000000040003 /* Frameworks */,
 				AABB00000000000000040007 /* Embed App Extensions */,
+				AABB00000000000000040008 /* Embed Frameworks */,
 			);
 			buildRules = (
 			);
@@ -382,6 +402,7 @@
 				AABB00000000000000020002 /* ContentView.swift in Sources */,
 				AABB00000000000000020040 /* FreeRepsConfig.swift in Sources */,
 				AABB00000000000000020041 /* FreeRepsService.swift in Sources */,
+				AABB00000000000000020062 /* EmbeddedTailscale.swift in Sources */,
 				AABB00000000000000020042 /* FreeRepsPayload.swift in Sources */,
 				AABB00000000000000020004 /* SyncState.swift in Sources */,
 				AABB00000000000000020005 /* HealthDataType.swift in Sources */,
