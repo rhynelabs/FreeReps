@@ -85,27 +85,48 @@ struct OverviewView: View {
                     .frame(width: 40)
                     .symbolEffect(.pulse, isActive: vm.isAnySyncRunning)
                     .contentTransition(.symbolEffect(.replace))
+                    // The icon is the one thing that animates between states; the
+                    // outer transaction below is nil, so it asks for its own.
+                    .animation(.default, value: statusIcon.name)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(statusTitle)
                         .font(.headline)
+                        .contentTransition(.identity)
                     Text(statusSubtitle)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                        .contentTransition(.identity)
                     if vm.isAnySyncRunning {
                         ProgressView(value: vm.overallProgress)
                             .padding(.top, 4)
+                            .transition(.identity)
                     }
                 }
             }
             .padding(.vertical, 4)
+            // Pull-to-refresh flips `isAnySyncRunning` inside the List's animated
+            // refresh transaction. Left alone, the texts cross-fade (old and new
+            // copy half transparent on top of each other) and the row height
+            // eases; the state should just swap.
+            .transaction { $0.animation = nil }
+            .id("status-row")
 
-            if vm.isAnySyncRunning {
-                Button(vm.isFullSyncRunning ? "Stop" : "Cancel Sync", role: .destructive) { vm.cancelSync() }
-            } else if selection.isEnabled {
-                Button(isFailed ? "Try Again" : "Sync Now") { vm.startRecentSync() }
-                    .accessibilityIdentifier("sync-now")
+            // One row for both states. Two `if` branches give the List two
+            // different rows to delete and insert, which it cross-fades.
+            if vm.isAnySyncRunning || selection.isEnabled {
+                Button(actionTitle, role: vm.isAnySyncRunning ? .destructive : nil) {
+                    if vm.isAnySyncRunning { vm.cancelSync() } else { vm.startRecentSync() }
+                }
+                .accessibilityIdentifier(vm.isAnySyncRunning ? "cancel-sync" : "sync-now")
+                .transaction { $0.animation = nil }
+                .id("status-action")
             }
         }
+    }
+
+    private var actionTitle: String {
+        if vm.isAnySyncRunning { return vm.isFullSyncRunning ? "Stop" : "Cancel Sync" }
+        return isFailed ? "Try Again" : "Sync Now"
     }
 
     private var statusIcon: (name: String, color: Color) {
