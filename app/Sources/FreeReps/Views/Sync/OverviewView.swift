@@ -384,8 +384,10 @@ final class ServerOverview: ObservableObject {
 }
 
 /// A hypnogram of one night in the style of the Health app's sleep widget: one
-/// lane per stage from Awake down to Deep, every stage a rounded bar placed by
-/// its time within the night, consecutive stages joined by a thin connector.
+/// lane per stage from Awake down to Deep, every stage a chunky rounded bar
+/// placed by its time within the night, every transition a soft line fading
+/// from the color it leaves to the color it enters. The colors carry the lanes,
+/// so there are no row labels.
 ///
 /// Drawn in a single `Canvas`, so a night with sixty stages costs one pass and
 /// no view identity churn.
@@ -395,13 +397,14 @@ struct SleepStagesChart: View {
     let stages: [ServerOverview.Night.Stage]
 
     @Environment(\.redactionReasons) private var redaction
+    @Environment(\.colorScheme) private var scheme
 
-    private static let laneHeight: CGFloat = 24
-    private static let barHeight: CGFloat = 9
-    private static let labelWidth: CGFloat = 44
-    private static let labelGap: CGFloat = 6
+    private static let laneHeight: CGFloat = 22
+    private static let barHeight: CGFloat = 15
+    private static let barRadius: CGFloat = 5
     /// A stage of a few minutes still has to be visible.
-    private static let minimumBarWidth: CGFloat = 2.5
+    private static let minimumBarWidth: CGFloat = 3.5
+    private static let connectorWidth: CGFloat = 2
 
     /// A night with stage detail gets the four Health lanes; a night that only
     /// knows "asleep" gets a single one. Mixed input — an "In Bed" stretch next
@@ -418,19 +421,8 @@ struct SleepStagesChart: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .top, spacing: Self.labelGap) {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(lanes, id: \.self) { lane in
-                        Text(Self.label(lane))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .frame(height: Self.laneHeight, alignment: .leading)
-                    }
-                }
-                .frame(width: Self.labelWidth, alignment: .leading)
-                chart
-            }
-            .frame(height: Self.laneHeight * CGFloat(lanes.count))
+            chart
+                .frame(height: Self.laneHeight * CGFloat(lanes.count))
 
             HStack {
                 Text(start.formatted(date: .omitted, time: .shortened))
@@ -440,7 +432,6 @@ struct SleepStagesChart: View {
             .font(.caption2)
             .foregroundStyle(.secondary)
             .monospacedDigit()
-            .padding(.leading, Self.labelWidth + Self.labelGap)
         }
         .accessibilityElement()
         .accessibilityLabel("Sleep stages")
@@ -460,15 +451,24 @@ struct SleepStagesChart: View {
                 return (CGFloat(lane) + 0.5) * Self.laneHeight
             }
 
-            // Connectors first, so the bars cover their ends.
-            let connector = Color.secondary.opacity(0.35)
+            // Transitions first, so the bars cover their ends: a soft line in the
+            // two stage colors, from the bar it leaves to the bar it enters.
             for (previous, next) in zip(items, items.dropFirst()) {
                 let x = (position(previous.end) + position(next.start)) / 2
                 let from = centerY(previous.kind)
                 let to = centerY(next.kind)
                 guard from != to else { continue }
-                let rect = CGRect(x: x - 0.5, y: min(from, to), width: 1, height: abs(to - from))
-                context.fill(Path(rect), with: .color(connector))
+                let edge = Self.barHeight / 2 * (from < to ? 1 : -1)
+                let top = min(from + edge, to - edge)
+                let bottom = max(from + edge, to - edge)
+                guard bottom > top else { continue }
+                let rect = CGRect(x: x - Self.connectorWidth / 2, y: top,
+                                  width: Self.connectorWidth, height: bottom - top)
+                let shading = GraphicsContext.Shading.linearGradient(
+                    Gradient(colors: [color(previous.kind).opacity(0.4), color(next.kind).opacity(0.4)]),
+                    startPoint: CGPoint(x: x, y: from < to ? top : bottom),
+                    endPoint: CGPoint(x: x, y: from < to ? bottom : top))
+                context.fill(Path(roundedRect: rect, cornerRadius: Self.connectorWidth / 2), with: shading)
             }
 
             for stage in items {
@@ -478,7 +478,7 @@ struct SleepStagesChart: View {
                                   y: centerY(stage.kind) - Self.barHeight / 2,
                                   width: width,
                                   height: Self.barHeight)
-                context.fill(Path(roundedRect: rect, cornerRadius: Self.barHeight / 2),
+                context.fill(Path(roundedRect: rect, cornerRadius: Self.barRadius),
                              with: .color(color(stage.kind)))
             }
         }
@@ -488,26 +488,18 @@ struct SleepStagesChart: View {
     private func color(_ kind: ServerOverview.Night.Kind) -> Color {
         // The placeholder night is fake data; it must not read as a real one.
         if redaction.contains(.placeholder) { return Color.secondary.opacity(0.3) }
-        return Self.stageColor(kind)
+        return stageColor(kind)
     }
 
-    private static func stageColor(_ kind: ServerOverview.Night.Kind) -> Color {
+    /// Health's stage colors. Core and Deep are lifted on a dark background,
+    /// where the daylight indigo all but disappears.
+    private func stageColor(_ kind: ServerOverview.Night.Kind) -> Color {
+        let dark = scheme == .dark
         switch kind {
         case .awake: return Color(red: 1.0, green: 0.45, blue: 0.35)
         case .rem: return Color(red: 0.36, green: 0.80, blue: 1.0)
-        case .core: return Color(red: 0.0, green: 0.48, blue: 1.0)
-        case .deep: return Color(red: 0.22, green: 0.26, blue: 0.68)
-        case .asleep: return Color(red: 0.0, green: 0.48, blue: 1.0)
-        }
-    }
-
-    private static func label(_ kind: ServerOverview.Night.Kind) -> String {
-        switch kind {
-        case .awake: return "Awake"
-        case .rem: return "REM"
-        case .core: return "Core"
-        case .deep: return "Deep"
-        case .asleep: return "Asleep"
+        case .core, .asleep: return dark ? Color(red: 0.13, green: 0.55, blue: 1.0) : Color(red: 0.0, green: 0.48, blue: 1.0)
+        case .deep: return dark ? Color(red: 0.42, green: 0.46, blue: 0.92) : Color(red: 0.22, green: 0.26, blue: 0.68)
         }
     }
 }
