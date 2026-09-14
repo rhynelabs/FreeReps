@@ -211,7 +211,7 @@ final class SyncService: ObservableObject {
         let isFullSync = syncState.isFullSyncRunning
         let finalState = SyncActivityAttributes.ContentState(
             phase: "Done",
-            operation: "Synced \(totalRecords.formatted()) records",
+            operation: "Synced \(totalRecords.formatted()) new records",
             recordsInserted: totalRecords,
             isFullSync: isFullSync
         )
@@ -286,6 +286,7 @@ final class SyncService: ObservableObject {
         SyncService.isSyncRunning = true
         defer { SyncService.isSyncRunning = false }
         syncState.errorMessage = nil
+        syncState.newRecordsThisRun = 0
         syncState.currentOperation = "Connecting\u{2026}"
         startLiveActivity(isFullSync: false)
 
@@ -339,17 +340,18 @@ final class SyncService: ObservableObject {
 
             try checkSelection()
 
+            syncState.newRecordsThisRun = count
             syncState.updateCategory(categoryID, status: .completed, recordCount: count, lastSyncDate: Date())
             syncState.currentOperation = ""
             // Clear cursor so a future full sync re-visits this category from the beginning
             syncState.backfillCursors.removeValue(forKey: categoryID)
             syncState.persist()
-            endLiveActivity(totalRecords: syncState.totalRecords)
+            endLiveActivity(totalRecords: syncState.newRecordsThisRun)
             disconnectFreeReps()
 
         } catch is CancellationError {
             disconnectFreeReps()
-            endLiveActivity(totalRecords: syncState.totalRecords)
+            endLiveActivity(totalRecords: syncState.newRecordsThisRun)
             syncState.currentOperation = HealthSyncSelection.shared.isEnabled ? "Sync stopped; progress saved" : "Apple Health sync is paused"
             if case .syncing = syncState.categories.first(where: { $0.id == categoryID })?.status {
                 syncState.updateCategory(categoryID, status: .idle)
@@ -357,7 +359,7 @@ final class SyncService: ObservableObject {
             syncState.persist()
         } catch {
             disconnectFreeReps()
-            endLiveActivity(totalRecords: syncState.totalRecords)
+            endLiveActivity(totalRecords: syncState.newRecordsThisRun)
             syncState.errorMessage = error.localizedDescription
             syncState.currentOperation = ""
             syncState.updateCategory(categoryID, status: .failed(error.localizedDescription))
@@ -375,6 +377,7 @@ final class SyncService: ObservableObject {
         SyncService.isSyncRunning = true
         defer { SyncService.isSyncRunning = false }
         syncState.errorMessage = nil
+        syncState.newRecordsThisRun = 0
         syncState.currentOperation = "Connecting\u{2026}"
         startLiveActivity(isFullSync: true)
 
@@ -451,7 +454,7 @@ final class SyncService: ObservableObject {
                 if syncState.backfillCursors[catID] == anchor { continue }
 
                 syncState.updateCategory(catID, status: .syncing)
-                syncState.currentOperation = "Backfilling \(cat.rawValue)\u{2026}"
+                syncState.currentOperation = "Reading \(cat.rawValue)\u{2026}"
                 do {
                     let count = try await backfillQuantityCategory(
                         catID: catID, cat: cat, types: types,
@@ -459,7 +462,7 @@ final class SyncService: ObservableObject {
                     )
                     try checkSelection()
                     syncState.updateCategory(catID, status: .completed, recordCount: count, lastSyncDate: Date())
-                    updateLiveActivity(phase: cat.rawValue, operation: "Backfilled \(cat.rawValue) (\(count.formatted()) records)", records: count)
+                    updateLiveActivity(phase: cat.rawValue, operation: "Synced older data: \(cat.rawValue)", records: syncState.newRecordsThisRun)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -483,7 +486,7 @@ final class SyncService: ObservableObject {
                 if syncState.backfillCursors[catID] == anchor { continue }
 
                 syncState.updateCategory(catID, status: .syncing)
-                syncState.currentOperation = "Backfilling \(displayName)\u{2026}"
+                syncState.currentOperation = "Reading \(displayName)\u{2026}"
                 do {
                     let count = try await backfillSpecialCategory(
                         catID: catID, from: historicalStart, until: anchor, config: config
@@ -505,7 +508,7 @@ final class SyncService: ObservableObject {
                     }
                     try checkSelection()
                     syncState.updateCategory(catID, status: .completed, recordCount: count, lastSyncDate: Date())
-                    updateLiveActivity(phase: displayName, operation: "Backfilled \(displayName) (\(count.formatted()) records)", records: count)
+                    updateLiveActivity(phase: displayName, operation: "Synced older data: \(displayName)", records: syncState.newRecordsThisRun)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -524,7 +527,7 @@ final class SyncService: ObservableObject {
                 ("cat_state_of_mind", "State of Mind"),
             ]
             try checkSelection()
-            syncState.currentOperation = "Backfilling sparse categories\u{2026}"
+            syncState.currentOperation = "Reading ECG, Audiograms, Medications, Vision, State of Mind\u{2026}"
             do {
                 try await withThrowingTaskGroup(of: (String, String, Int).self) { group in
                     for (catID, displayName) in sparseSpecials {
@@ -549,7 +552,8 @@ final class SyncService: ObservableObject {
                         try checkSelection()
                         syncState.updateCategory(catID, status: .completed, recordCount: count, lastSyncDate: Date())
                         syncState.backfillCursors[catID] = anchor
-                        updateLiveActivity(phase: displayName, operation: "Backfilled \(displayName) (\(count.formatted()) records)", records: count)
+                        syncState.newRecordsThisRun += count
+                        updateLiveActivity(phase: displayName, operation: "Synced older data: \(displayName)", records: syncState.newRecordsThisRun)
                     }
                 }
             } catch is CancellationError {
@@ -565,19 +569,19 @@ final class SyncService: ObservableObject {
             syncState.hasCompletedFullSync = failedCategories.isEmpty && HealthSyncSelection.shared.disabledCategories.isEmpty
             if failedCategories.isEmpty { syncState.lastSyncDate = anchor }
             if failedCategories.isEmpty {
-                syncState.currentOperation = "Backfill complete"
+                syncState.currentOperation = "Older data synced"
             } else {
-                syncState.errorMessage = "\(failedCategories.count) category(ies) failed: \(failedCategories.joined(separator: ", ")). Successfully synced categories are saved."
-                syncState.currentOperation = "Backfill complete with errors"
+                syncState.errorMessage = "Couldn't sync \(failedCategories.joined(separator: ", ")). Everything else is saved."
+                syncState.currentOperation = "Older data synced with errors"
             }
 
             syncState.persist()
-            endLiveActivity(totalRecords: syncState.totalRecords)
+            endLiveActivity(totalRecords: syncState.newRecordsThisRun)
             disconnectFreeReps()
 
         } catch is CancellationError {
             disconnectFreeReps()
-            endLiveActivity(totalRecords: syncState.totalRecords)
+            endLiveActivity(totalRecords: syncState.newRecordsThisRun)
             syncState.currentOperation = HealthSyncSelection.shared.isEnabled ? "Sync stopped; progress saved" : "Apple Health sync is paused"
             for i in syncState.categories.indices {
                 if case .syncing = syncState.categories[i].status {
@@ -587,7 +591,7 @@ final class SyncService: ObservableObject {
             syncState.persist()
         } catch {
             disconnectFreeReps()
-            endLiveActivity(totalRecords: syncState.totalRecords)
+            endLiveActivity(totalRecords: syncState.newRecordsThisRun)
             syncState.errorMessage = error.localizedDescription
             syncState.currentOperation = ""
             for i in syncState.categories.indices {
@@ -625,6 +629,9 @@ final class SyncService: ObservableObject {
             try checkSelection()
 
             let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
+            syncState.updateCategory(catID, status: .syncing, progress: windowIdx, total: totalWindows, period: cursor..<windowEnd)
+            let op = "\(cat.rawValue) · \(syncState.categories.first(where: { $0.id == catID })?.periodLabel ?? "")"
+            syncState.currentOperation = op
             var windowTotal = 0
             var retries = 0
             while true {
@@ -657,15 +664,13 @@ final class SyncService: ObservableObject {
                 }
             }
             total += windowTotal
+            syncState.newRecordsThisRun += windowTotal
 
             cursor = windowEnd
             windowIdx += 1
             syncState.backfillCursors[catID] = cursor
             syncState.persist()
-            syncState.updateCategory(catID, status: .syncing, progress: windowIdx, total: totalWindows)
-            let op = "Backfilling \(cat.rawValue): window \(windowIdx)/\(totalWindows)\u{2026}"
-            syncState.currentOperation = op
-            updateLiveActivity(phase: cat.rawValue, operation: op, records: total)
+            updateLiveActivity(phase: cat.rawValue, operation: op, records: syncState.newRecordsThisRun)
         }
         return total
     }
@@ -690,6 +695,10 @@ final class SyncService: ObservableObject {
             try checkSelection()
 
             let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
+            syncState.updateCategory(catID, status: .syncing, progress: windowIdx, total: totalWindows, period: cursor..<windowEnd)
+            let category = syncState.categories.first(where: { $0.id == catID })
+            let op = "\(category?.displayName ?? catID) · \(category?.periodLabel ?? "")"
+            syncState.currentOperation = op
             var retries = 0
             var windowTotal = 0
             while true {
@@ -707,16 +716,13 @@ final class SyncService: ObservableObject {
                 }
             }
             total += windowTotal
+            syncState.newRecordsThisRun += windowTotal
 
             cursor = windowEnd
             windowIdx += 1
             syncState.backfillCursors[catID] = cursor
             syncState.persist()
-            syncState.updateCategory(catID, status: .syncing, progress: windowIdx, total: totalWindows)
-            let displayName = syncState.categories.first(where: { $0.id == catID })?.displayName ?? catID
-            let op = "Backfilling \(displayName): window \(windowIdx)/\(totalWindows)\u{2026}"
-            syncState.currentOperation = op
-            updateLiveActivity(phase: displayName, operation: op, records: total)
+            updateLiveActivity(phase: category?.displayName ?? catID, operation: op, records: syncState.newRecordsThisRun)
         }
         return total
     }
@@ -746,6 +752,7 @@ final class SyncService: ObservableObject {
         }
         let syncStartedAt = Date()
         syncState.errorMessage = nil
+        syncState.newRecordsThisRun = 0
         startLiveActivity(isFullSync: false)
 
         // Keep screen awake during foreground sync to prevent auto-lock killing HealthKit access
@@ -802,11 +809,15 @@ final class SyncService: ObservableObject {
             // FreeReps uses ON CONFLICT DO NOTHING, making re-syncing the overlap window safe.
 
             let opLabel = syncState.lastSyncDate != nil
-                ? "Incremental sync from \(since.formatted(date: .abbreviated, time: .shortened))\u{2026}"
-                : "Syncing recent data (last 7 days)\u{2026}"
+                ? "Reading changes since \(since.formatted(date: .abbreviated, time: .shortened))\u{2026}"
+                : "Reading the last 7 days\u{2026}"
             syncState.currentOperation = opLabel
 
-            var total = 0
+            // Mirrored into the state so the app shows the same number as the Live Activity.
+            var total: Int {
+                get { syncState.newRecordsThisRun }
+                set { syncState.newRecordsThisRun = newValue }
+            }
             var failedCategories: [String] = []
 
             for (cat, types) in HealthDataTypes.quantityTypesByCategory {
@@ -848,7 +859,7 @@ final class SyncService: ObservableObject {
                         recordCount: existing + catDelta)
                 }
                 total += catDelta
-                updateLiveActivity(phase: cat.rawValue, operation: "Synced \(cat.rawValue) (\(catDelta) records)", records: total)
+                updateLiveActivity(phase: cat.rawValue, operation: "Synced \(cat.rawValue)", records: total)
             }
 
             if HealthSyncSelection.shared.includes("cat_category") {
@@ -861,7 +872,7 @@ final class SyncService: ObservableObject {
                     try checkSelection()
                     syncState.updateCategory("cat_category", status: .completed, recordCount: existingCat + catCount, lastSyncDate: Date())
                     total += catCount
-                    updateLiveActivity(phase: "Health Events", operation: "Synced Health Events (\(catCount) records)", records: total)
+                    updateLiveActivity(phase: "Health Events", operation: "Synced Health Events", records: total)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -884,7 +895,7 @@ final class SyncService: ObservableObject {
                     try checkSelection()
                     syncState.updateCategory("cat_workouts", status: .completed, recordCount: existingWorkouts + workoutCount, lastSyncDate: Date())
                     total += workoutCount
-                    updateLiveActivity(phase: "Workouts", operation: "Synced Workouts (\(workoutCount) records)", records: total)
+                    updateLiveActivity(phase: "Workouts", operation: "Synced Workouts", records: total)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -907,7 +918,7 @@ final class SyncService: ObservableObject {
                     try checkSelection()
                     syncState.updateCategory("cat_bp", status: .completed, recordCount: existingBP + bpCount, lastSyncDate: Date())
                     total += bpCount
-                    updateLiveActivity(phase: "Blood Pressure", operation: "Synced Blood Pressure (\(bpCount) records)", records: total)
+                    updateLiveActivity(phase: "Blood Pressure", operation: "Synced Blood Pressure", records: total)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -930,7 +941,7 @@ final class SyncService: ObservableObject {
                     try checkSelection()
                     syncState.updateCategory("cat_ecg", status: .completed, recordCount: existingECG + ecgCount, lastSyncDate: Date())
                     total += ecgCount
-                    updateLiveActivity(phase: "ECG", operation: "Synced ECG (\(ecgCount) records)", records: total)
+                    updateLiveActivity(phase: "ECG", operation: "Synced ECG", records: total)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -953,7 +964,7 @@ final class SyncService: ObservableObject {
                     try checkSelection()
                     syncState.updateCategory("cat_audiogram", status: .completed, recordCount: existingAudio + audioCount, lastSyncDate: Date())
                     total += audioCount
-                    updateLiveActivity(phase: "Audiograms", operation: "Synced Audiograms (\(audioCount) records)", records: total)
+                    updateLiveActivity(phase: "Audiograms", operation: "Synced Audiograms", records: total)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -976,7 +987,7 @@ final class SyncService: ObservableObject {
                     try checkSelection()
                     syncState.updateCategory("cat_activity_summaries", status: .completed, recordCount: existingActivity + activityCount, lastSyncDate: Date())
                     total += activityCount
-                    updateLiveActivity(phase: "Activity Rings", operation: "Synced Activity Rings (\(activityCount) records)", records: total)
+                    updateLiveActivity(phase: "Activity Rings", operation: "Synced Activity Rings", records: total)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -999,7 +1010,7 @@ final class SyncService: ObservableObject {
                     try checkSelection()
                     syncState.updateCategory("cat_workout_routes", status: .completed, recordCount: existingRoutes + routeCount, lastSyncDate: Date())
                     total += routeCount
-                    updateLiveActivity(phase: "Workout Routes", operation: "Synced Workout Routes (\(routeCount) records)", records: total)
+                    updateLiveActivity(phase: "Workout Routes", operation: "Synced Workout Routes", records: total)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -1022,7 +1033,7 @@ final class SyncService: ObservableObject {
                     try checkSelection()
                     syncState.updateCategory("cat_medications", status: .completed, recordCount: existingMeds + medCount, lastSyncDate: Date())
                     total += medCount
-                    updateLiveActivity(phase: "Medications", operation: "Synced Medications (\(medCount) records)", records: total)
+                    updateLiveActivity(phase: "Medications", operation: "Synced Medications", records: total)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -1045,7 +1056,7 @@ final class SyncService: ObservableObject {
                     try checkSelection()
                     syncState.updateCategory("cat_vision", status: .completed, recordCount: existingVision + visionCount, lastSyncDate: Date())
                     total += visionCount
-                    updateLiveActivity(phase: "Vision", operation: "Synced Vision Prescriptions (\(visionCount) records)", records: total)
+                    updateLiveActivity(phase: "Vision", operation: "Synced Vision Prescriptions", records: total)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -1068,7 +1079,7 @@ final class SyncService: ObservableObject {
                     try checkSelection()
                     syncState.updateCategory("cat_state_of_mind", status: .completed, recordCount: existingSOM + somCount, lastSyncDate: Date())
                     total += somCount
-                    updateLiveActivity(phase: "State of Mind", operation: "Synced State of Mind (\(somCount) records)", records: total)
+                    updateLiveActivity(phase: "State of Mind", operation: "Synced State of Mind", records: total)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -1087,23 +1098,23 @@ final class SyncService: ObservableObject {
             }
 
             if failedCategories.isEmpty { syncState.lastSyncDate = syncStartedAt }
-            syncState.currentOperation = "Incremental sync done (\(total) records)"
+            syncState.currentOperation = "Synced \(total.formatted()) new records"
             syncState.persist()
             endLiveActivity(totalRecords: total)
             disconnectFreeReps()
 
         } catch is CancellationError {
             disconnectFreeReps()
-            endLiveActivity(totalRecords: 0)
+            endLiveActivity(totalRecords: syncState.newRecordsThisRun)
             syncState.currentOperation = HealthSyncSelection.shared.isEnabled ? "Sync stopped; progress saved" : "Apple Health sync is paused"
             syncState.persist()
         } catch let error as HKError where isBackgroundSync && error.code == .errorDatabaseInaccessible {
             disconnectFreeReps()
-            endLiveActivity(totalRecords: 0)
+            endLiveActivity(totalRecords: syncState.newRecordsThisRun)
             syncState.currentOperation = "Waiting for Health data to become available"
         } catch {
             disconnectFreeReps()
-            endLiveActivity(totalRecords: 0)
+            endLiveActivity(totalRecords: syncState.newRecordsThisRun)
             syncState.errorMessage = error.localizedDescription
             syncState.currentOperation = ""
             syncState.persist()

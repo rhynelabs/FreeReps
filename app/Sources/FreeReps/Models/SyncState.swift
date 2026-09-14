@@ -53,10 +53,18 @@ struct CategorySyncState: Identifiable {
     var currentProgress: Int
     var totalEstimated: Int
     var latestHealthKitDate: Date? = nil  // newest HK sample, queried on demand (not persisted)
+    var period: Range<Date>? = nil        // the 90-day window of older data being read (not persisted)
 
     var progressFraction: Double {
         guard totalEstimated > 0 else { return 0 }
         return min(1.0, Double(currentProgress) / Double(totalEstimated))
+    }
+
+    /// "Mar – Jun 2025 · 4 of 9 periods" while a window of older data is being read.
+    var periodLabel: String? {
+        guard let period else { return nil }
+        let months = period.formatted(Date.IntervalFormatStyle().month(.abbreviated).year())
+        return "\(months) · \(currentProgress + 1) of \(totalEstimated) periods"
     }
 
     var daysBehind: Int? {
@@ -88,17 +96,39 @@ class SyncState: ObservableObject {
     @Published var hasCompletedFullSync: Bool = false
     @Published var backfillCursors: [String: Date] = [:]
     @Published var backfillAnchorDate: Date?
+    /// Rows the server reported as newly inserted in the current or last run. Not persisted;
+    /// this is the number the Live Activity shows.
+    @Published var newRecordsThisRun = 0
 
     var isAnySyncRunning: Bool { isFullSyncRunning || isIncrementalSyncRunning }
 
+    enum OlderDataProgress: Equatable {
+        case notStarted
+        case sentUpTo(Date)
+    }
+
+    /// Where an unfinished older-data sync stands for a category; nil when nothing is pending
+    /// for it. Older data is sent forward in time from the configured start until the run's
+    /// anchor, so a cursor at the anchor means the category is done.
+    func olderDataProgress(for id: String) -> OlderDataProgress? {
+        guard let anchor = backfillAnchorDate, !hasCompletedFullSync else { return nil }
+        guard let cursor = backfillCursors[id] else { return .notStarted }
+        return cursor < anchor ? .sentUpTo(cursor) : nil
+    }
+
     func updateCategory(_ id: String, status: SyncStatus? = nil, recordCount: Int? = nil,
-                        lastSyncDate: Date? = nil, progress: Int? = nil, total: Int? = nil) {
+                        lastSyncDate: Date? = nil, progress: Int? = nil, total: Int? = nil,
+                        period: Range<Date>? = nil) {
         guard let idx = categories.firstIndex(where: { $0.id == id }) else { return }
-        if let s = status { categories[idx].status = s }
+        if let s = status {
+            categories[idx].status = s
+            if !s.isActive { categories[idx].period = nil }
+        }
         if let r = recordCount { categories[idx].recordCount = r }
         if let d = lastSyncDate { categories[idx].lastSyncDate = d }
         if let p = progress { categories[idx].currentProgress = p }
         if let t = total { categories[idx].totalEstimated = t }
+        if let period { categories[idx].period = period }
 
         recalcOverall()
     }

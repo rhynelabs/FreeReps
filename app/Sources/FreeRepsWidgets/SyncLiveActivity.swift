@@ -21,7 +21,7 @@ struct SyncLiveActivityWidget: Widget {
                     }
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    Text("\(context.state.recordsInserted.formatted())")
+                    Text("\(context.state.recordsInserted.formatted()) new")
                         .font(.caption.monospacedDigit().weight(.semibold))
                         .foregroundStyle(.primary)
                 }
@@ -80,7 +80,7 @@ private struct SyncLockScreenView: View {
                     Text("FreeReps")
                         .font(.subheadline.weight(.semibold))
                     Spacer()
-                    Text("\(context.state.recordsInserted.formatted()) records")
+                    Text("\(context.state.recordsInserted.formatted()) new")
                         .font(.subheadline.monospacedDigit().weight(.semibold))
                         .foregroundStyle(.red)
                 }
