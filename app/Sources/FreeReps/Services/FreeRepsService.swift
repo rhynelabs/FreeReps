@@ -291,10 +291,16 @@ actor FreeRepsService {
         }
         do {
             let result = try await session.data(for: request)
-            await SyncTrace.shared.record("http.finished", [
-                "request_id": requestID, "status": String((result.1 as? HTTPURLResponse)?.statusCode ?? 0),
+            let status = (result.1 as? HTTPURLResponse)?.statusCode ?? 0
+            var fields = [
+                "request_id": requestID, "status": String(status),
                 "elapsed_ms": String(Int(Date().timeIntervalSince(started) * 1000)),
-            ])
+            ]
+            // The server's own account of a failure, e.g. a 500's {"error": …}.
+            if !(200..<300).contains(status) {
+                fields["body"] = String((String(data: result.0, encoding: .utf8) ?? "").prefix(300))
+            }
+            await SyncTrace.shared.record("http.finished", fields)
             return result
         } catch {
             let cause = error as NSError

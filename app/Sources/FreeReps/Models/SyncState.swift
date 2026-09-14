@@ -20,6 +20,7 @@ struct PersistedSnapshot: Codable {
     let backfillAnchorDate: Date?
     var anchors: [String: Data]? = nil
     var routesPending: [String: Date]? = nil
+    var failedWindows: [String: [Date]]? = nil
 }
 
 // MARK: -
@@ -97,6 +98,11 @@ class SyncState: ObservableObject {
     /// workout. Each is checked again on the next runs until it has one or is
     /// too old to expect one.
     var routesPending: [String: Date] = [:]
+    /// Older-data windows (category id → window start dates) a run gave up on
+    /// after its retries and moved the cursor past. The next older-data run
+    /// tries each again before its own windows; one that goes through leaves
+    /// the list.
+    @Published var failedWindows: [String: [Date]] = [:]
     /// Rows the server reported as newly inserted in the current or last run. Not persisted;
     /// this is the number the Live Activity shows.
     @Published var newRecordsThisRun = 0
@@ -138,6 +144,7 @@ class SyncState: ObservableObject {
         backfillAnchorDate = nil
         anchors = [:]
         routesPending = [:]
+        failedWindows = [:]
         hasCompletedFullSync = false
         lastSyncDate = nil
         totalRecords = 0
@@ -155,6 +162,7 @@ class SyncState: ObservableObject {
 
     func resetCategoryLocalState(_ id: String) {
         backfillCursors.removeValue(forKey: id)
+        failedWindows.removeValue(forKey: id)
         anchors = anchors.filter { !$0.key.hasPrefix("\(id)/") }
         if id == "cat_workout_routes" { routesPending = [:] }
         guard let idx = categories.firstIndex(where: { $0.id == id }) else { return }
@@ -189,7 +197,8 @@ class SyncState: ObservableObject {
             backfillCursors: backfillCursors.isEmpty ? nil : backfillCursors,
             backfillAnchorDate: backfillAnchorDate,
             anchors: anchors.isEmpty ? nil : anchors,
-            routesPending: routesPending.isEmpty ? nil : routesPending
+            routesPending: routesPending.isEmpty ? nil : routesPending,
+            failedWindows: failedWindows.isEmpty ? nil : failedWindows
         )
         if let data = try? JSONEncoder().encode(snap) {
             defaults.set(data, forKey: Self.userDefaultsKey)
@@ -208,6 +217,7 @@ class SyncState: ObservableObject {
         backfillAnchorDate = snap.backfillAnchorDate
         anchors = snap.anchors ?? [:]
         routesPending = snap.routesPending ?? [:]
+        failedWindows = snap.failedWindows ?? [:]
         for persisted in snap.categories {
             guard let idx = categories.firstIndex(where: { $0.id == persisted.id }) else { continue }
             categories[idx].recordCount = persisted.recordCount

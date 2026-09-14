@@ -496,6 +496,19 @@ final class SyncService: ObservableObject {
         rowEstimates[catID] = estimate
     }
 
+    /// Takes a window the run gave up on out of the estimate. The rows the
+    /// server did acknowledge stay counted; the window says nothing about
+    /// the ones to come.
+    private func windowFailed(_ catID: String, key: String) {
+        partialSteps.removeValue(forKey: key)
+        let partial = partialRows.removeValue(forKey: key) ?? 0
+        var estimate = rowEstimates[catID] ?? RowEstimate(windowsLeft: 1)
+        estimate.windowsLeft = max(estimate.windowsLeft - 1, 0)
+        estimate.rowsAcked += partial
+        rowEstimates[catID] = estimate
+        advanceRun()
+    }
+
     /// Rows acknowledged over rows acknowledged plus the estimate of the rest;
     /// nil until some window with rows is acknowledged, when there is nothing
     /// to estimate from. The windows left are the newest of each category,
@@ -514,6 +527,8 @@ final class SyncService: ObservableObject {
 
     /// Never lower than the value shown before, whichever way it is counted;
     /// the rows estimate stops at 0.99 until `completeRun`, because it is one.
+    /// Before it exists the bar stays at 0 rather than racing up the step
+    /// count through the empty early windows, which take seconds.
     private func refreshProgress() {
         let steps = min(1, (Double(runStepsDone) + partialSteps.values.reduce(0, +)) / Double(runStepsTotal))
         let value = weighsRows ? min(rowsWeightedProgress() ?? 0, 0.99) : steps
@@ -524,13 +539,85 @@ final class SyncService: ObservableObject {
     /// category prefix lets a reset drop them together.
     static func anchorKey(category: String, type: String) -> String { "\(category)/\(type)" }
 
-    /// Windows left to read for a category between `start` and `anchor`.
-    private func windowsLeft(for catID: String, from start: Date, until anchor: Date) -> Int {
+    /// Windows left to read for a category between `start` and `anchor`, the
+    /// failed ones of earlier runs it will try again included.
+    private func windowsLeft(for catID: String, from start: Date, until anchor: Date, earliest: Date) -> Int {
+        let retried = failedWindowsToRetry(for: catID, from: earliest, until: anchor).count
         let cursor = max(syncState.backfillCursors[catID] ?? start, start)
-    /// Before it exists the bar stays at 0 rather than racing up the step
-    /// count through the empty early windows, which take seconds.
-        guard cursor < anchor else { return 0 }
-        return Int(ceil(anchor.timeIntervalSince(cursor) / Self.backfillWindow))
+        guard cursor < anchor else { return retried }
+        return retried + Int(ceil(anchor.timeIntervalSince(cursor) / Self.backfillWindow))
+    }
+
+    /// Whether an older-data run still has something to do for a category.
+    private func hasOlderDataLeft(_ catID: String, until anchor: Date) -> Bool {
+        syncState.backfillCursors[catID] != anchor || !(syncState.failedWindows[catID] ?? []).isEmpty
+    }
+
+    /// Windows an earlier run gave up on, oldest first, within the configured
+    /// range: a range shortened since then leaves the ones before it behind.
+    private func failedWindowsToRetry(for catID: String, from earliest: Date, until anchor: Date) -> [Date] {
+        (syncState.failedWindows[catID] ?? []).filter { $0 >= earliest && $0 < anchor }.sorted()
+    }
+
+    /// Keeps only the windows about to be tried again, so the ones a shortened
+    /// range left behind go; each of the rest leaves on its own success
+    /// (`windowRetried`), not before — a run stopped half-way keeps the others.
+    private func beginRetries(of windows: [Date], for catID: String) {
+        syncState.failedWindows[catID] = windows.isEmpty ? nil : windows
+    }
+
+    private func windowRetried(_ catID: String, start: Date) {
+        syncState.failedWindows[catID]?.removeAll { $0 == start }
+        if syncState.failedWindows[catID]?.isEmpty == true { syncState.failedWindows[catID] = nil }
+    }
+
+    /// A window the run gave up on, for the category's status.
+    private struct FailedWindow {
+        let period: Range<Date>
+        let reason: String
+    }
+
+    /// Gives a window up after its retries: the trace and `failedWindows`
+    /// remember it, its step is counted, and the caller moves the cursor past
+    /// it. Other than `backfillFailure`, the window's own period is kept apart
+    /// from the reason, since the status names it.
+    private func giveUpWindow(_ error: Error, catID: String, index: Int, start: Date, end: Date) async -> FailedWindow {
+        let cause = Self.unwrapped(error) as NSError
+        await SyncTrace.shared.record("window.failed", [
+            "category": catID, "index": String(index), "start": ISO8601DateFormatter().string(from: start),
+            "error": String(cause.localizedDescription.prefix(200)),
+        ])
+        if !(syncState.failedWindows[catID] ?? []).contains(start) {
+            syncState.failedWindows[catID, default: []].append(start)
+        }
+        windowFailed(catID, key: "\(catID)/\(index)")
+        return FailedWindow(period: start..<end,
+                            reason: "\(cause.localizedDescription.prefix(200)) [\(cause.domain):\(cause.code)]")
+    }
+
+    /// "2 of 109 windows failed and will be retried next run: Mar–Jun 2022 — HTTP 500: … [FreeReps:500]; …"
+    private static func failedWindowsMessage(_ failed: [FailedWindow], of windows: Int) -> String? {
+        guard !failed.isEmpty else { return nil }
+        let details = failed.map { "\(periodLabel($0.period)) \u{2014} \($0.reason)" }
+        return "\(failed.count) of \(windows) windows failed and will be retried next run: \(details.joined(separator: "; "))"
+    }
+
+    /// "Mar – Jun 2025", as `CategorySyncState.periodLabel` shows it.
+    private static func periodLabel(_ period: Range<Date>) -> String {
+        period.formatted(Date.IntervalFormatStyle().month(.abbreviated).year())
+    }
+
+    /// What a category's backfill came to. The messages are for the
+    /// category's status; nil when nothing failed.
+    private struct BackfillOutcome {
+        var inserted: Int
+        var failedTypes: String? = nil
+        var failedWindows: String? = nil
+
+        var failureMessage: String? {
+            let parts = [failedWindows, failedTypes.map { "Completed with failed types: \($0)" }].compactMap { $0 }
+            return parts.isEmpty ? nil : parts.joined(separator: ". ")
+        }
     }
 
     /// Names the categories being read, e.g. "Nutrition, Vitals, and Activity".
@@ -776,28 +863,26 @@ final class SyncService: ObservableObject {
 
             syncState.updateCategory(categoryID, status: .syncing)
             let isSparse = Self.sparseCategories.contains(categoryID)
-            let windows = isSparse ? 1 : windowsLeft(for: categoryID, from: epoch, until: anchor)
+            let windows = isSparse ? 1 : windowsLeft(for: categoryID, from: epoch, until: anchor, earliest: epoch)
             beginRun(steps: windows, weighRows: !isSparse)
             if !isSparse { expectWindows(windows, for: categoryID) }
             let displayName = syncState.categories.first { $0.id == categoryID }?.displayName ?? categoryID
             categoryStarted(displayName)
 
-            let count: Int
-            var failedTypes: String?
+            let outcome: BackfillOutcome
             if categoryID.hasPrefix("qty_") {
                 let rawCat = String(categoryID.dropFirst(4))
                 guard let cat = HealthCategory(rawValue: rawCat),
                       let types = HealthDataTypes.quantityTypesByCategory.first(where: { $0.0 == cat })?.1 else {
                     throw FreeRepsError.connectionFailed("Unknown category: \(categoryID)")
                 }
-                let backfill = try await backfillQuantityCategory(
+                outcome = try await backfillQuantityCategory(
                     catID: categoryID, cat: cat, types: types,
                     from: epoch, until: anchor, config: config
                 )
-                count = backfill.inserted
-                failedTypes = backfill.failedTypes
             } else if isSparse {
                 // Sparse categories: skip windowing, query full range directly
+                let count: Int
                 switch categoryID {
                 case "cat_ecg":           count = try await syncECG(since: epoch, until: anchor)
                 case "cat_audiogram":     count = try await syncAudiograms(since: epoch, until: anchor)
@@ -806,8 +891,9 @@ final class SyncService: ObservableObject {
                 case "cat_state_of_mind": count = try await syncStateOfMind(since: epoch, until: anchor)
                 default: count = 0
                 }
+                outcome = BackfillOutcome(inserted: count)
             } else {
-                count = try await backfillSpecialCategory(
+                outcome = try await backfillSpecialCategory(
                     catID: categoryID, displayName: displayName, from: epoch, until: anchor, config: config
                 )
             }
@@ -815,11 +901,12 @@ final class SyncService: ObservableObject {
             try checkSelection()
             categoryFinished(displayName)
 
+            let count = outcome.inserted
             syncState.newRecordsThisRun = count
-            if let failedTypes {
-                // The other types are on the server; the row names the ones that are not.
-                syncState.updateCategory(categoryID, status: .failed("Completed with failed types: \(failedTypes)"), recordCount: count)
-                syncState.errorMessage = "Some types of \(displayName) couldn't be read. Everything else is saved."
+            if let message = outcome.failureMessage {
+                // The rest is on the server; the row names what is not.
+                syncState.updateCategory(categoryID, status: .failed(message), recordCount: count)
+                syncState.errorMessage = "Parts of \(displayName) couldn't be synced; the category shows which. Everything else is saved."
             } else {
                 syncState.updateCategory(categoryID, status: .completed, recordCount: count, lastSyncDate: Date())
             }
@@ -928,13 +1015,14 @@ final class SyncService: ObservableObject {
 
             /// Categories that stopped short: windows of theirs are still unsynced.
             var failedCategories: [String] = []
-            /// Categories whose windows all went through, minus the types that
-            /// could not be read in some of them.
+            /// Categories whose windows were all passed, minus the types that
+            /// could not be read in some of them or the windows given up on,
+            /// which the next run tries again.
             var partlyFailedCategories: [String] = []
 
             let pending = HealthDataTypes.quantityTypesByCategory.filter { cat, _ in
                 let catID = "qty_\(cat.rawValue)"
-                return HealthSyncSelection.shared.includes(catID) && syncState.backfillCursors[catID] != anchor
+                return HealthSyncSelection.shared.includes(catID) && hasOlderDataLeft(catID, until: anchor)
             }
             let heavySpecials: [(String, String)] = [
                 ("cat_category", "Health Events"),
@@ -942,7 +1030,7 @@ final class SyncService: ObservableObject {
                 ("cat_bp", "Blood Pressure"),
                 ("cat_activity_summaries", "Activity Rings"),
                 ("cat_workout_routes", "Workout Routes"),
-            ].filter { HealthSyncSelection.shared.includes($0.0) && syncState.backfillCursors[$0.0] != anchor }
+            ].filter { HealthSyncSelection.shared.includes($0.0) && hasOlderDataLeft($0.0, until: anchor) }
             let sparseSpecials: [(String, String)] = [
                 ("cat_ecg", "ECG"),
                 ("cat_audiogram", "Audiograms"),
@@ -952,9 +1040,12 @@ final class SyncService: ObservableObject {
             ].filter { HealthSyncSelection.shared.includes($0.0) && syncState.backfillCursors[$0.0] != anchor }
 
             let windowSteps = pending.map { "qty_\($0.0.rawValue)" } + heavySpecials.map(\.0)
-            beginRun(steps: windowSteps.reduce(0) { $0 + windowsLeft(for: $1, from: historicalStart, until: anchor) } + sparseSpecials.count,
+            beginRun(steps: windowSteps.reduce(0) { $0 + windowsLeft(for: $1, from: historicalStart, until: anchor, earliest: earliest) }
+                         + sparseSpecials.count,
                      weighRows: true)
-            for catID in windowSteps { expectWindows(windowsLeft(for: catID, from: historicalStart, until: anchor), for: catID) }
+            for catID in windowSteps {
+                expectWindows(windowsLeft(for: catID, from: historicalStart, until: anchor, earliest: earliest), for: catID)
+            }
 
             // Quantity categories — 90-day windowed backfill. A few categories run at
             // once so uploads overlap with Health reads; the server handles them in
@@ -977,18 +1068,17 @@ final class SyncService: ObservableObject {
                         categoryStarted(cat.rawValue)
                         defer { categoryFinished(cat.rawValue) }
                         do {
-                            let backfill = try await backfillQuantityCategory(
+                            let outcome = try await backfillQuantityCategory(
                                 catID: catID, cat: cat, types: types,
                                 from: historicalStart, until: anchor, config: config
                             )
                             try checkSelection()
                             updateLiveActivity(phase: cat.rawValue, operation: "Synced older data: \(cat.rawValue)", records: syncState.newRecordsThisRun)
-                            if let failedTypes = backfill.failedTypes {
-                                syncState.updateCategory(catID, status: .failed("Completed with failed types: \(failedTypes)"),
-                                                         recordCount: backfill.inserted)
+                            if let message = outcome.failureMessage {
+                                syncState.updateCategory(catID, status: .failed(message), recordCount: outcome.inserted)
                                 return (cat.rawValue, false)
                             }
-                            syncState.updateCategory(catID, status: .completed, recordCount: backfill.inserted, lastSyncDate: Date())
+                            syncState.updateCategory(catID, status: .completed, recordCount: outcome.inserted, lastSyncDate: Date())
                             return nil
                         } catch is CancellationError {
                             throw CancellationError()
@@ -1008,13 +1098,17 @@ final class SyncService: ObservableObject {
                         categoryStarted(displayName)
                         defer { categoryFinished(displayName) }
                         do {
-                            let count = try await backfillSpecialCategory(
+                            let outcome = try await backfillSpecialCategory(
                                 catID: catID, displayName: displayName,
                                 from: historicalStart, until: anchor, config: config
                             )
                             try checkSelection()
-                            syncState.updateCategory(catID, status: .completed, recordCount: count, lastSyncDate: Date())
                             updateLiveActivity(phase: displayName, operation: "Synced older data: \(displayName)", records: syncState.newRecordsThisRun)
+                            if let message = outcome.failureMessage {
+                                syncState.updateCategory(catID, status: .failed(message), recordCount: outcome.inserted)
+                                return (displayName, false)
+                            }
+                            syncState.updateCategory(catID, status: .completed, recordCount: outcome.inserted, lastSyncDate: Date())
                             return nil
                         } catch is CancellationError {
                             throw CancellationError()
@@ -1071,9 +1165,9 @@ final class SyncService: ObservableObject {
             syncState.persist()
 
             // Mark complete even if some categories failed — successful ones keep their progress.
-            // A category that only lost types has its cursor at the anchor like the
-            // rest: there is no window left to come back for, so it does not hold
-            // the run open.
+            // A category that only lost types or gave windows up has its cursor at
+            // the anchor like the rest, so it does not hold the run open; the
+            // windows given up on wait in `failedWindows` for the next run.
             syncState.hasCompletedFullSync = failedCategories.isEmpty && HealthSyncSelection.shared.disabledCategories.isEmpty
             if failedCategories.isEmpty {
                 syncState.lastSyncDate = anchor
@@ -1087,7 +1181,7 @@ final class SyncService: ObservableObject {
                     problems.append("Couldn't sync \(failedCategories.joined(separator: ", ")).")
                 }
                 if !partlyFailedCategories.isEmpty {
-                    problems.append("Some types of \(partlyFailedCategories.joined(separator: ", ")) couldn't be read; the category shows which.")
+                    problems.append("Parts of \(partlyFailedCategories.joined(separator: ", ")) couldn't be synced; the category shows which.")
                 }
                 syncState.errorMessage = (problems + ["Everything else is saved."]).joined(separator: " ")
                 syncState.currentOperation = "Older data synced with errors"
@@ -1137,6 +1231,9 @@ final class SyncService: ObservableObject {
         /// a retry's uploader may report a window the first attempt had already
         /// acknowledged, which then counts once.
         var uploadedCount: Int
+        /// False for a window of an earlier run tried again: the cursor is
+        /// past it already and must not come back.
+        let movesCursor: Bool
         var inserted = 0
         /// Types whose read failed, by display name, with the windows it
         /// failed in. Keyed by window so a retry that reads a window again
@@ -1148,9 +1245,18 @@ final class SyncService: ObservableObject {
             let reason: String
         }
 
-        init(runID: Int, uploadedCount: Int) {
+        init(runID: Int, uploadedCount: Int, movesCursor: Bool = true) {
             self.runID = runID
             self.uploadedCount = uploadedCount
+            self.movesCursor = movesCursor
+        }
+
+        /// Adds what the ledger of a window tried again collected.
+        func absorb(_ other: WindowLedger) {
+            inserted += other.inserted
+            for (name, failure) in other.failedTypes {
+                failedTypes[name, default: TypeFailure(windows: [], reason: failure.reason)].windows.formUnion(failure.windows)
+            }
         }
 
         func noteFailure(of typeDesc: QuantityTypeDescriptor, in window: Int, error: Error) {
@@ -1176,8 +1282,14 @@ final class SyncService: ObservableObject {
     ///
     /// The windows share one uploader, and the cursor follows the server's
     /// acknowledgements (`windowUploaded`), not the reads. A failed request ends
-    /// the attempt; the next one resumes behind the last acknowledged window,
-    /// and three attempts in a row without progress fail the category.
+    /// the attempt; the next one resumes behind the last acknowledged window.
+    /// Three attempts in a row without progress give the window at the cursor
+    /// up (`giveUpWindow`): the cursor moves past it — the one time it passes
+    /// a window the server has not acknowledged — and the run goes on with
+    /// the next; the next run tries the window again before its own. Windows
+    /// given up on in earlier runs come first, each with the same attempts.
+    /// Only an error every window would repeat (`affectsEveryWindow`) still
+    /// fails the category.
     ///
     /// A type whose read fails does not end the attempt: the window goes on
     /// without that type's rows, the cursor passes it once the other types are
@@ -1191,7 +1303,7 @@ final class SyncService: ObservableObject {
         from historicalStart: Date,
         until anchor: Date,
         config: FreeRepsConfig
-    ) async throws -> (inserted: Int, failedTypes: String?) {
+    ) async throws -> BackfillOutcome {
         let windowSize = Self.backfillWindow
         let totalWindows = Int(ceil(anchor.timeIntervalSince(historicalStart) / windowSize))
         func index(of cursor: Date) -> Int {
@@ -1199,8 +1311,42 @@ final class SyncService: ObservableObject {
         }
         var cursor = syncState.backfillCursors[catID] ?? historicalStart
         let ledger = WindowLedger(runID: runID, uploadedCount: index(of: cursor))
-        var retries = 0
+        var failed: [FailedWindow] = []
+        var consecutiveFailures = 0
 
+        // Windows an earlier run gave up on come first; the cursor is past them.
+        let retried = failedWindowsToRetry(for: catID, from: config.backfillStartDate, until: anchor)
+        let windows = retried.count + (cursor < anchor ? totalWindows - index(of: cursor) : 0)
+        beginRetries(of: retried, for: catID)
+        for start in retried {
+            let end = min(start.addingTimeInterval(windowSize), anchor)
+            let windowIndex = index(of: start)
+            let retryLedger = WindowLedger(runID: runID, uploadedCount: windowIndex, movesCursor: false)
+            var retries = 0
+            while true {
+                do {
+                    try await uploadQuantityWindows(
+                        catID: catID, cat: cat, types: types,
+                        from: start, firstIndex: windowIndex, until: end,
+                        totalWindows: totalWindows, ledger: retryLedger, retry: true
+                    )
+                    windowRetried(catID, start: start)
+                    break
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch where retries < 3 && Self.isRetryable(error) {
+                    retries += 1
+                    try await Task.sleep(for: Self.retryDelays[retries - 1])
+                } catch {
+                    failed.append(await giveUpWindow(error, catID: catID, index: windowIndex, start: start, end: end))
+                    break
+                }
+            }
+            ledger.absorb(retryLedger)
+        }
+        syncState.persist()
+
+        var retries = 0
         while cursor < anchor {
             do {
                 try await uploadQuantityWindows(
@@ -1214,23 +1360,36 @@ final class SyncService: ObservableObject {
             } catch {
                 // Acknowledged windows stay; the next attempt resumes behind them.
                 let resumeAt = syncState.backfillCursors[catID] ?? historicalStart
-                if resumeAt > cursor { retries = 0 }
+                if resumeAt > cursor { retries = 0; consecutiveFailures = 0 }
                 cursor = resumeAt
-                guard retries < 3, Self.isRetryable(error) else {
-                    throw backfillFailure(error, category: catID, start: cursor,
-                                          end: min(cursor.addingTimeInterval(windowSize), anchor))
+                if retries < 3, Self.isRetryable(error) {
+                    retries += 1
+                    try await Task.sleep(for: Self.retryDelays[retries - 1])
+                    continue
                 }
-                retries += 1
-                try await Task.sleep(for: Self.retryDelays[retries - 1])
+                let windowIndex = index(of: cursor)
+                let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
+                consecutiveFailures += 1
+                if Self.affectsEveryWindow(error, after: consecutiveFailures) {
+                    throw backfillFailure(error, category: catID, start: cursor, end: windowEnd)
+                }
+                failed.append(await giveUpWindow(error, catID: catID, index: windowIndex, start: cursor, end: windowEnd))
+                ledger.uploadedCount = windowIndex + 1
+                cursor = windowEnd
+                syncState.backfillCursors[catID] = cursor
+                syncState.persist()
+                retries = 0
             }
         }
-        return (ledger.inserted, ledger.failureSummary)
+        return BackfillOutcome(inserted: ledger.inserted, failedTypes: ledger.failureSummary,
+                               failedWindows: Self.failedWindowsMessage(failed, of: windows))
     }
 
     /// Reads the windows from `cursor` to `anchor` one after another into a
     /// single uploader, so the next window's Health read starts while the last
     /// batches of the previous one are still on their way. The cursor moves
-    /// from the uploader's window callbacks, never from here.
+    /// from the uploader's window callbacks, never from here. A `retry` is
+    /// one window of an earlier run tried again; it shows as such.
     private func uploadQuantityWindows(
         catID: String,
         cat: HealthCategory,
@@ -1239,7 +1398,8 @@ final class SyncService: ObservableObject {
         firstIndex: Int,
         until anchor: Date,
         totalWindows: Int,
-        ledger: WindowLedger
+        ledger: WindowLedger,
+        retry: Bool = false
     ) async throws {
         let name = cat.rawValue
         let uploader = makeMetricUploader(label: catID, onBatch: { @MainActor [self] ack in
@@ -1256,11 +1416,14 @@ final class SyncService: ObservableObject {
                 ledger.ends[index] = windowEnd
                 // The window shows on the category's own row; the headline names the
                 // categories running side by side.
-                syncState.updateCategory(catID, status: .syncing, progress: index, total: totalWindows, period: cursor..<windowEnd)
-                categoryWindow(name, "window \(index + 1) of \(totalWindows)")
-                await SyncTrace.shared.record("window.started", [
-                    "category": catID, "index": String(index), "total": String(totalWindows),
-                ])
+                if retry {
+                    syncState.updateCategory(catID, status: .syncing, period: cursor..<windowEnd)
+                    categoryWindow(name, "retrying \(Self.periodLabel(cursor..<windowEnd))")
+                } else {
+                    syncState.updateCategory(catID, status: .syncing, progress: index, total: totalWindows, period: cursor..<windowEnd)
+                    categoryWindow(name, "window \(index + 1) of \(totalWindows)")
+                }
+                await SyncTrace.shared.record("window.started", Self.windowFields(catID, index: index, total: totalWindows, retry: retry))
                 await uploader.beginWindow(index)
                 let windowStart = cursor
                 let windowIndex = index
@@ -1312,12 +1475,19 @@ final class SyncService: ObservableObject {
         }
         let steps = window.index + 1 - ledger.uploadedCount
         ledger.uploadedCount = window.index + 1
-        if let end = ledger.ends[window.index] {
+        if ledger.movesCursor, let end = ledger.ends[window.index] {
             syncState.backfillCursors[catID] = end
             syncState.persist()
         }
         windowAcknowledged(catID, key: key, rows: window.rows, windows: steps)
         advanceRun(by: steps)
+    }
+
+    /// The fields of a window's trace events; a window tried again says so.
+    private static func windowFields(_ catID: String, index: Int, total: Int, retry: Bool) -> [String: String] {
+        var fields = ["category": catID, "index": String(index), "total": String(total)]
+        if retry { fields["retry"] = "true" }
+        return fields
     }
 
     /// Pauses between attempts at one window. A server restart takes longer than
@@ -1328,41 +1498,65 @@ final class SyncService: ObservableObject {
     /// encoding error is the client's own and repeats on every attempt; three
     /// timed retries of it only cancelled the uploads running alongside.
     private static func isRetryable(_ error: Error) -> Bool {
-        if case FreeRepsError.encodingError = error { return false }
+        if case FreeRepsError.encodingError = unwrapped(error) { return false }
         return true
     }
 
-    /// Backfills a special (non-quantity) category in 90-day windows, resuming from cursor.
+    /// Whether giving the window up and going on to the next would only cost
+    /// another round of retries: the Health store cannot be read at all, or
+    /// this is the third window in a row given up on. Such an error fails
+    /// the category, as any error after its retries did before windows could
+    /// be given up on.
+    private static func affectsEveryWindow(_ error: Error, after consecutiveFailures: Int) -> Bool {
+        HealthKitService.affectsWholeStore(unwrapped(error)) || consecutiveFailures >= 3
+    }
+
+    /// The request's own error, when an uploader wrapped it.
+    private static func unwrapped(_ error: Error) -> Error {
+        if let failed = error as? MetricUploader.UploadFailed { return failed.underlying }
+        if let failed = error as? CategoryUploader.UploadFailed { return failed.underlying }
+        return error
+    }
+
+    /// Backfills a special (non-quantity) category in 90-day windows, resuming
+    /// from the cursor. A window still failing after its retries is given up
+    /// (`giveUpWindow`) and the cursor moves past it; the next run tries it
+    /// again before its own windows. Only an error every window would repeat
+    /// (`affectsEveryWindow`) still fails the category.
     private func backfillSpecialCategory(
         catID: String,
         displayName: String,
         from historicalStart: Date,
         until anchor: Date,
         config: FreeRepsConfig
-    ) async throws -> Int {
+    ) async throws -> BackfillOutcome {
         let windowSize = Self.backfillWindow
         var cursor = syncState.backfillCursors[catID] ?? historicalStart
         var total = 0
+        var failed: [FailedWindow] = []
+        var consecutiveFailures = 0
         let totalWindows = Int(ceil(anchor.timeIntervalSince(historicalStart) / windowSize))
-        var windowIdx = cursor > historicalStart
-            ? Int(ceil(cursor.timeIntervalSince(historicalStart) / windowSize))
-            : 0
+        func index(of cursor: Date) -> Int {
+            cursor > historicalStart ? Int(ceil(cursor.timeIntervalSince(historicalStart) / windowSize)) : 0
+        }
 
-        while cursor < anchor {
+        /// One window with its retries; false once given up on.
+        func syncWindow(index windowIdx: Int, start: Date, end: Date, retry: Bool) async throws -> Bool {
             try checkSelection()
-
-            let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
-            syncState.updateCategory(catID, status: .syncing, progress: windowIdx, total: totalWindows, period: cursor..<windowEnd)
-            categoryWindow(displayName, "window \(windowIdx + 1) of \(totalWindows)")
-            await SyncTrace.shared.record("window.started", [
-                "category": catID, "index": String(windowIdx), "total": String(totalWindows),
-            ])
+            if retry {
+                syncState.updateCategory(catID, status: .syncing, period: start..<end)
+                categoryWindow(displayName, "retrying \(Self.periodLabel(start..<end))")
+            } else {
+                syncState.updateCategory(catID, status: .syncing, progress: windowIdx, total: totalWindows, period: start..<end)
+                categoryWindow(displayName, "window \(windowIdx + 1) of \(totalWindows)")
+            }
+            await SyncTrace.shared.record("window.started", Self.windowFields(catID, index: windowIdx, total: totalWindows, retry: retry))
             var retries = 0
             var window: SpecialWindow = (inserted: 0, rows: 0)
             while true {
                 do {
                     window = try await syncSpecialWindow(catID: catID, displayName: displayName,
-                                                         index: windowIdx, start: cursor, end: windowEnd)
+                                                         index: windowIdx, start: start, end: end)
                     break
                 } catch is CancellationError {
                     throw CancellationError()
@@ -1370,26 +1564,47 @@ final class SyncService: ObservableObject {
                     retries += 1
                     try await Task.sleep(for: Self.retryDelays[retries - 1])
                 } catch {
-                    throw backfillFailure(error, category: catID, start: cursor, end: windowEnd)
+                    if !retry { consecutiveFailures += 1 }
+                    if Self.affectsEveryWindow(error, after: consecutiveFailures) {
+                        throw backfillFailure(error, category: catID, start: start, end: end)
+                    }
+                    failed.append(await giveUpWindow(error, catID: catID, index: windowIdx, start: start, end: end))
+                    return false
                 }
             }
-            await SyncTrace.shared.record("window.finished", [
-                "category": catID, "index": String(windowIdx), "total": String(totalWindows),
-                "inserted": String(window.inserted), "rows": String(window.rows),
-            ])
+            await SyncTrace.shared.record("window.finished", Self.windowFields(catID, index: windowIdx, total: totalWindows, retry: retry)
+                .merging(["inserted": String(window.inserted), "rows": String(window.rows)]) { current, _ in current })
             total += window.inserted
             syncState.newRecordsThisRun += window.inserted
             partialSteps.removeValue(forKey: "\(catID)/\(windowIdx)")
             windowAcknowledged(catID, key: "\(catID)/\(windowIdx)", rows: window.rows)
+            if !retry { consecutiveFailures = 0 }
+            advanceRun()
+            updateLiveActivity(phase: displayName, operation: syncState.currentOperation, records: syncState.newRecordsThisRun)
+            return true
+        }
 
+        // Windows an earlier run gave up on come first; the cursor is past them.
+        let retried = failedWindowsToRetry(for: catID, from: config.backfillStartDate, until: anchor)
+        let windows = retried.count + (cursor < anchor ? totalWindows - index(of: cursor) : 0)
+        beginRetries(of: retried, for: catID)
+        for start in retried {
+            if try await syncWindow(index: index(of: start), start: start, end: min(start.addingTimeInterval(windowSize), anchor), retry: true) {
+                windowRetried(catID, start: start)
+            }
+        }
+        syncState.persist()
+
+        var windowIdx = index(of: cursor)
+        while cursor < anchor {
+            let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
+            _ = try await syncWindow(index: windowIdx, start: cursor, end: windowEnd, retry: false)
             cursor = windowEnd
             windowIdx += 1
             syncState.backfillCursors[catID] = cursor
             syncState.persist()
-            advanceRun()
-            updateLiveActivity(phase: displayName, operation: syncState.currentOperation, records: syncState.newRecordsThisRun)
         }
-        return total
+        return BackfillOutcome(inserted: total, failedWindows: Self.failedWindowsMessage(failed, of: windows))
     }
 
     /// What a window of a special category sent: the records the UI counts,
@@ -2231,6 +2446,13 @@ final class SyncService: ObservableObject {
                                     )
                                 }
                             }
+                        } catch let error where HealthKitService.meansNoDataInRange(error) {
+                            // A workout from before the watch: no heart-rate
+                            // source for its minutes, not a failed workout (see
+                            // `statisticsBuckets`).
+                            await SyncTrace.shared.record("workout.hr_empty", [
+                                "workout": w.uuid.uuidString, "code": String((error as NSError).code),
+                            ])
                         }
                     }
 
@@ -2470,13 +2692,6 @@ final class SyncService: ObservableObject {
             }
             try checkSelection()
             let payload = FreeRepsPayload(data: FreeRepsData(vision_prescriptions: items))
-                        } catch let error where HealthKitService.meansNoDataInRange(error) {
-                            // A workout from before the watch: no heart-rate
-                            // source for its minutes, not a failed workout (see
-                            // `statisticsBuckets`).
-                            await SyncTrace.shared.record("workout.hr_empty", [
-                                "workout": w.uuid.uuidString, "code": String((error as NSError).code),
-                            ])
             let result = try await ingest(payload)
             total += result.vision_prescriptions_inserted ?? items.count
         }

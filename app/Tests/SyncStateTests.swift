@@ -17,6 +17,9 @@ struct SyncStateTests {
         state.updateCategory("test", status: .failed("Network request failed [NSURLErrorDomain:-1009]"),
                              recordCount: 12, lastSyncDate: Date(timeIntervalSince1970: 100))
         state.backfillCursors["test"] = Date(timeIntervalSince1970: 90)
+        // A window the run gave up on is retried by the next run only if it
+        // survives the restart in between.
+        state.failedWindows["test"] = [Date(timeIntervalSince1970: 0), Date(timeIntervalSince1970: 45)]
         state.persist()
         let restored = SyncState(defaults: defaults)
         restored.categories = [category]
@@ -24,6 +27,9 @@ struct SyncStateTests {
         precondition(restored.categories[0].status == state.categories[0].status)
         precondition(restored.categories[0].recordCount == 12)
         precondition(restored.backfillCursors == state.backfillCursors)
+        precondition(restored.failedWindows == state.failedWindows)
+        restored.resetCategoryLocalState("test")
+        precondition(restored.failedWindows.isEmpty && restored.backfillCursors.isEmpty)
 
         // Existing installations have no failureMessage field.
         let legacy = Data("{\"id\":\"test\",\"recordCount\":3,\"completed\":true}".utf8)
@@ -40,12 +46,12 @@ struct SyncStateTests {
         state.categories[0].latestHealthKitDate = Date()
         state.overallProgress = 1
         state.resetAllLocalState()
-        precondition(state.overallProgress == 0 && state.backfillCursors.isEmpty)
+        precondition(state.overallProgress == 0 && state.backfillCursors.isEmpty && state.failedWindows.isEmpty)
         precondition(state.categories[0].latestHealthKitDate == nil)
         precondition(state.categories[0].recordCount == 0 && state.categories[0].lastSyncDate == nil)
         precondition(defaults.string(forKey: "freerepsConfig_v1") == "keep-server-config")
         restored.restore()
         precondition(restored.categories[0].recordCount == 0 && restored.backfillCursors.isEmpty)
-        print("Sync state tests passed: failure persistence, progress, legacy decoding, recovery")
+        print("Sync state tests passed: failure persistence, failed windows, progress, legacy decoding, recovery")
     }
 }
