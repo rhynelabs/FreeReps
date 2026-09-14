@@ -131,8 +131,9 @@ actor FreeRepsService {
         return session
     }
 
-    /// Servers before 1.3 reject a compressed body as invalid JSON; remembered per app run.
-    private static var serverAcceptsGzip = true
+    /// Servers before 1.3 reject a compressed body as invalid JSON. Remembered per
+    /// client, so every sync run tries once more and picks up a server upgrade.
+    private var serverAcceptsGzip = true
 
     /// POST a FreeReps payload to FreeReps and return the ingest result.
     func ingest(_ payload: FreeRepsPayload) async throws -> IngestResult {
@@ -149,21 +150,22 @@ actor FreeRepsService {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // JSON of health samples shrinks about tenfold; the server inflates it back.
-        let compressed = Self.serverAcceptsGzip ? body.gzipped() : nil
+        let compressed = serverAcceptsGzip ? body.gzipped() : nil
         if let compressed {
             request.httpBody = compressed
             request.setValue("gzip", forHTTPHeaderField: "Content-Encoding")
         } else {
             request.httpBody = body
         }
+        let trace = ["rows": String(payload.data.rowCount), "json_bytes": String(body.count)]
 
-        var (data, response) = try await performRequest(request)
+        var (data, response) = try await performRequest(request, trace: trace)
         if compressed != nil, let status = (response as? HTTPURLResponse)?.statusCode, status == 400 || status == 415 {
-            Self.serverAcceptsGzip = false
+            serverAcceptsGzip = false
             await SyncTrace.shared.record("http.gzip_unsupported", ["status": String(status)])
             request.httpBody = body
             request.setValue(nil, forHTTPHeaderField: "Content-Encoding")
-            (data, response) = try await performRequest(request)
+            (data, response) = try await performRequest(request, trace: trace)
         }
 
         guard let http = response as? HTTPURLResponse else {
@@ -268,7 +270,7 @@ actor FreeRepsService {
         let requestID = UUID().uuidString
         let fields = ["request_id": requestID, "path": request.url?.path ?? "",
                       "method": request.httpMethod ?? "GET", "bytes": String(request.httpBody?.count ?? 0)]
-        await SyncTrace.shared.record("http.started", fields)
+        await SyncTrace.shared.record("http.started", fields.merging(trace) { current, _ in current })
         let session: URLSession
         do {
             session = try await currentSession()

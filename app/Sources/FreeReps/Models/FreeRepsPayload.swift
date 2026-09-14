@@ -481,3 +481,12 @@ extension HKWorkoutActivityType {
         }
     }
 }
+
+extension FreeRepsData {
+    /// Rows the server will look at, for the sync trace.
+    var rowCount: Int {
+        metrics.reduce(0) { $0 + $1.data.count }
+            + workouts.count + ecg_recordings.count + audiograms.count + activity_summaries.count
+            + medications.count + vision_prescriptions.count + state_of_mind.count + category_samples.count
+    }
+}
