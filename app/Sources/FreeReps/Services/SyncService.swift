@@ -399,13 +399,46 @@ final class SyncService: ObservableObject {
         var rows = 0
     }
 
-    private func beginRun(steps: Int) {
+    /// Older data weighs its progress by rows instead of steps: a window of
+    /// Vitals holds a hundred times the rows of one of Nutrition, so equal
+    /// steps left the last five per cent taking a third of the run. Each
+    /// category's windows still to come are estimated at its own rows per
+    /// acknowledged window, or at the run's average until it has one.
+    private var weighsRows = false
+    private var rowEstimates: [String: RowEstimate] = [:]
+    /// Rows acknowledged in windows still open, by "category/index".
+    private var partialRows: [String: Int] = [:]
+
+    private struct RowEstimate {
+        var windowsLeft: Int
+        var windowsAcked = 0
+        var rowsAcked = 0
+    }
+
+    /// Requests of a run in flight at once, across every uploader. The server
+    /// is the limit: with 27 in flight it inserted no more rows per second
+    /// than with eight, but a 5,000-row batch took 3 s in the median and 11 s
+    /// at worst, and one request timed out.
+    private static let requestSlotCount = 8
+    private var requestSlots = AsyncSemaphore(value: requestSlotCount)
+
+    private func beginRun(steps: Int, weighRows: Bool = false) {
         runID += 1
         runStepsDone = 0
         runStepsTotal = max(steps, 1)
         partialSteps = [:]
+        weighsRows = weighRows
+        rowEstimates = [:]
+        partialRows = [:]
         activeCategories = []
+        requestSlots = AsyncSemaphore(value: Self.requestSlotCount)
         syncState.overallProgress = 0
+    }
+
+    /// The run is over and nothing of it is left: the bar reaches the end,
+    /// which the rows estimate holds back from until then.
+    private func completeRun() {
+        syncState.overallProgress = 1
     }
 
     private func advanceRun(by steps: Int = 1) {
@@ -420,9 +453,52 @@ final class SyncService: ObservableObject {
         refreshProgress()
     }
 
+    /// Registers the windows a category has left, for the rows estimate.
+    private func expectWindows(_ count: Int, for catID: String) {
+        rowEstimates[catID] = RowEstimate(windowsLeft: count)
+    }
+
+    /// Credits rows the server acknowledged for a window still open.
+    private func windowRows(_ key: String, rows: Int) {
+        partialRows[key, default: 0] += rows
+        refreshProgress()
+    }
+
+    /// Moves a window from the estimate to the rows acknowledged. The rows
+    /// reported for the window win over the partial credit, which a retried
+    /// window may have collected twice.
+    private func windowAcknowledged(_ catID: String, key: String, rows: Int, windows: Int = 1) {
+        let partial = partialRows.removeValue(forKey: key) ?? 0
+        var estimate = rowEstimates[catID] ?? RowEstimate(windowsLeft: windows)
+        estimate.windowsLeft = max(estimate.windowsLeft - windows, 0)
+        estimate.windowsAcked += windows
+        estimate.rowsAcked += max(rows, partial)
+        rowEstimates[catID] = estimate
+    }
+
+    /// Rows acknowledged over rows acknowledged plus the estimate of the rest;
+    /// nil before any window is acknowledged, when there is nothing to
+    /// estimate from.
+    private func rowsWeightedProgress() -> Double? {
+        let windowsAcked = rowEstimates.values.reduce(0) { $0 + $1.windowsAcked }
+        guard windowsAcked > 0 else { return nil }
+        let rowsInWindows = rowEstimates.values.reduce(0) { $0 + $1.rowsAcked }
+        let runAverage = Double(rowsInWindows) / Double(windowsAcked)
+        let remaining = rowEstimates.values.reduce(0.0) { sum, estimate in
+            let average = estimate.windowsAcked > 0 ? Double(estimate.rowsAcked) / Double(estimate.windowsAcked) : runAverage
+            return sum + average * Double(estimate.windowsLeft)
+        }
+        let acked = Double(rowsInWindows + partialRows.values.reduce(0, +))
+        guard acked + remaining > 0 else { return 1 }
+        return acked / (acked + remaining)
+    }
+
+    /// Never lower than the value shown before, whichever way it is counted;
+    /// the rows estimate stops at 0.99 until `completeRun`, because it is one.
     private func refreshProgress() {
-        let done = Double(runStepsDone) + partialSteps.values.reduce(0, +)
-        syncState.overallProgress = max(syncState.overallProgress, min(1, done / Double(runStepsTotal)))
+        let steps = min(1, (Double(runStepsDone) + partialSteps.values.reduce(0, +)) / Double(runStepsTotal))
+        let value = weighsRows ? min(rowsWeightedProgress() ?? steps, 0.99) : steps
+        syncState.overallProgress = max(syncState.overallProgress, value)
     }
 
     /// Where a category's HealthKit anchors live in `SyncState.anchors`; the
@@ -678,22 +754,28 @@ final class SyncService: ObservableObject {
             try checkSelection()
 
             syncState.updateCategory(categoryID, status: .syncing)
-            beginRun(steps: Self.sparseCategories.contains(categoryID) ? 1 : windowsLeft(for: categoryID, from: epoch, until: anchor))
+            let isSparse = Self.sparseCategories.contains(categoryID)
+            let windows = isSparse ? 1 : windowsLeft(for: categoryID, from: epoch, until: anchor)
+            beginRun(steps: windows, weighRows: !isSparse)
+            if !isSparse { expectWindows(windows, for: categoryID) }
             let displayName = syncState.categories.first { $0.id == categoryID }?.displayName ?? categoryID
             categoryStarted(displayName)
 
             let count: Int
+            var failedTypes: String?
             if categoryID.hasPrefix("qty_") {
                 let rawCat = String(categoryID.dropFirst(4))
                 guard let cat = HealthCategory(rawValue: rawCat),
                       let types = HealthDataTypes.quantityTypesByCategory.first(where: { $0.0 == cat })?.1 else {
                     throw FreeRepsError.connectionFailed("Unknown category: \(categoryID)")
                 }
-                count = try await backfillQuantityCategory(
+                let backfill = try await backfillQuantityCategory(
                     catID: categoryID, cat: cat, types: types,
                     from: epoch, until: anchor, config: config
                 )
-            } else if Self.sparseCategories.contains(categoryID) {
+                count = backfill.inserted
+                failedTypes = backfill.failedTypes
+            } else if isSparse {
                 // Sparse categories: skip windowing, query full range directly
                 switch categoryID {
                 case "cat_ecg":           count = try await syncECG(since: epoch, until: anchor)
@@ -713,7 +795,14 @@ final class SyncService: ObservableObject {
             categoryFinished(displayName)
 
             syncState.newRecordsThisRun = count
-            syncState.updateCategory(categoryID, status: .completed, recordCount: count, lastSyncDate: Date())
+            if let failedTypes {
+                // The other types are on the server; the row names the ones that are not.
+                syncState.updateCategory(categoryID, status: .failed("Completed with failed types: \(failedTypes)"), recordCount: count)
+                syncState.errorMessage = "Some types of \(displayName) couldn't be read. Everything else is saved."
+            } else {
+                syncState.updateCategory(categoryID, status: .completed, recordCount: count, lastSyncDate: Date())
+            }
+            completeRun()
             syncState.currentOperation = ""
             // Clear cursor so a future full sync re-visits this category from the beginning
             syncState.backfillCursors.removeValue(forKey: categoryID)
@@ -816,7 +905,11 @@ final class SyncService: ObservableObject {
             _ = try await freereps.ping()
             try checkSelection()
 
+            /// Categories that stopped short: windows of theirs are still unsynced.
             var failedCategories: [String] = []
+            /// Categories whose windows all went through, minus the types that
+            /// could not be read in some of them.
+            var partlyFailedCategories: [String] = []
 
             let pending = HealthDataTypes.quantityTypesByCategory.filter { cat, _ in
                 let catID = "qty_\(cat.rawValue)"
@@ -838,7 +931,9 @@ final class SyncService: ObservableObject {
             ].filter { HealthSyncSelection.shared.includes($0.0) && syncState.backfillCursors[$0.0] != anchor }
 
             let windowSteps = pending.map { "qty_\($0.0.rawValue)" } + heavySpecials.map(\.0)
-            beginRun(steps: windowSteps.reduce(0) { $0 + windowsLeft(for: $1, from: historicalStart, until: anchor) } + sparseSpecials.count)
+            beginRun(steps: windowSteps.reduce(0) { $0 + windowsLeft(for: $1, from: historicalStart, until: anchor) } + sparseSpecials.count,
+                     weighRows: true)
+            for catID in windowSteps { expectWindows(windowsLeft(for: catID, from: historicalStart, until: anchor), for: catID) }
 
             // Quantity categories — 90-day windowed backfill. A few categories run at
             // once so uploads overlap with Health reads; the server handles them in
@@ -848,7 +943,9 @@ final class SyncService: ObservableObject {
             // own cursor, so nothing is shared between the tasks but the main actor.
             let categorySemaphore = AsyncSemaphore(value: 3)
             let specialSemaphore = AsyncSemaphore(value: 3)
-            try await withThrowingTaskGroup(of: String?.self) { group in
+            // A child returns the category's name when something failed, and
+            // whether the category stopped short (true) or only lost some types.
+            try await withThrowingTaskGroup(of: (name: String, sunk: Bool)?.self) { group in
                 for (cat, types) in pending {
                     group.addTask { @MainActor [self] in
                         await categorySemaphore.wait()
@@ -859,20 +956,25 @@ final class SyncService: ObservableObject {
                         categoryStarted(cat.rawValue)
                         defer { categoryFinished(cat.rawValue) }
                         do {
-                            let count = try await backfillQuantityCategory(
+                            let backfill = try await backfillQuantityCategory(
                                 catID: catID, cat: cat, types: types,
                                 from: historicalStart, until: anchor, config: config
                             )
                             try checkSelection()
-                            syncState.updateCategory(catID, status: .completed, recordCount: count, lastSyncDate: Date())
                             updateLiveActivity(phase: cat.rawValue, operation: "Synced older data: \(cat.rawValue)", records: syncState.newRecordsThisRun)
+                            if let failedTypes = backfill.failedTypes {
+                                syncState.updateCategory(catID, status: .failed("Completed with failed types: \(failedTypes)"),
+                                                         recordCount: backfill.inserted)
+                                return (cat.rawValue, false)
+                            }
+                            syncState.updateCategory(catID, status: .completed, recordCount: backfill.inserted, lastSyncDate: Date())
                             return nil
                         } catch is CancellationError {
                             throw CancellationError()
                         } catch {
                             syncState.updateCategory(catID, status: .failed(error.localizedDescription))
                             print("Category \(cat.rawValue) failed: \(error.localizedDescription)")
-                            return cat.rawValue
+                            return (cat.rawValue, true)
                         }
                     }
                 }
@@ -898,12 +1000,13 @@ final class SyncService: ObservableObject {
                         } catch {
                             syncState.updateCategory(catID, status: .failed(error.localizedDescription))
                             print("Category \(displayName) failed: \(error.localizedDescription)")
-                            return displayName
+                            return (displayName, true)
                         }
                     }
                 }
                 for try await failed in group {
-                    if let failed { failedCategories.append(failed) }
+                    guard let failed else { continue }
+                    if failed.sunk { failedCategories.append(failed.name) } else { partlyFailedCategories.append(failed.name) }
                 }
             }
 
@@ -947,12 +1050,25 @@ final class SyncService: ObservableObject {
             syncState.persist()
 
             // Mark complete even if some categories failed — successful ones keep their progress.
+            // A category that only lost types has its cursor at the anchor like the
+            // rest: there is no window left to come back for, so it does not hold
+            // the run open.
             syncState.hasCompletedFullSync = failedCategories.isEmpty && HealthSyncSelection.shared.disabledCategories.isEmpty
-            if failedCategories.isEmpty { syncState.lastSyncDate = anchor }
             if failedCategories.isEmpty {
+                syncState.lastSyncDate = anchor
+                completeRun()
+            }
+            if failedCategories.isEmpty && partlyFailedCategories.isEmpty {
                 syncState.currentOperation = "Older data synced"
             } else {
-                syncState.errorMessage = "Couldn't sync \(failedCategories.joined(separator: ", ")). Everything else is saved."
+                var problems: [String] = []
+                if !failedCategories.isEmpty {
+                    problems.append("Couldn't sync \(failedCategories.joined(separator: ", ")).")
+                }
+                if !partlyFailedCategories.isEmpty {
+                    problems.append("Some types of \(partlyFailedCategories.joined(separator: ", ")) couldn't be read; the category shows which.")
+                }
+                syncState.errorMessage = (problems + ["Everything else is saved."]).joined(separator: " ")
                 syncState.currentOperation = "Older data synced with errors"
             }
 
@@ -1001,10 +1117,36 @@ final class SyncService: ObservableObject {
         /// acknowledged, which then counts once.
         var uploadedCount: Int
         var inserted = 0
+        /// Types whose read failed, by display name, with the windows it
+        /// failed in. Keyed by window so a retry that reads a window again
+        /// counts it once.
+        var failedTypes: [String: TypeFailure] = [:]
+
+        struct TypeFailure {
+            var windows: Set<Int>
+            let reason: String
+        }
 
         init(runID: Int, uploadedCount: Int) {
             self.runID = runID
             self.uploadedCount = uploadedCount
+        }
+
+        func noteFailure(of typeDesc: QuantityTypeDescriptor, in window: Int, error: Error) {
+            let cause = error as NSError
+            var failure = failedTypes[typeDesc.displayName]
+                ?? TypeFailure(windows: [], reason: "\(cause.localizedDescription) [\(cause.domain):\(cause.code)]")
+            failure.windows.insert(window)
+            failedTypes[typeDesc.displayName] = failure
+        }
+
+        /// "Basal Energy Burned in 3 windows (… [com.apple.healthkit:3])", or nil.
+        var failureSummary: String? {
+            guard !failedTypes.isEmpty else { return nil }
+            return failedTypes.sorted { $0.key < $1.key }.map { name, failure in
+                let windows = failure.windows.count == 1 ? "1 window" : "\(failure.windows.count) windows"
+                return "\(name) in \(windows) (\(failure.reason))"
+            }.joined(separator: ", ")
         }
     }
 
@@ -1015,6 +1157,12 @@ final class SyncService: ObservableObject {
     /// acknowledgements (`windowUploaded`), not the reads. A failed request ends
     /// the attempt; the next one resumes behind the last acknowledged window,
     /// and three attempts in a row without progress fail the category.
+    ///
+    /// A type whose read fails does not end the attempt: the window goes on
+    /// without that type's rows, the cursor passes it once the other types are
+    /// acknowledged, and `failedTypes` names the type in the result. Retrying
+    /// would not help — the errors seen so far are HealthKit refusing a range
+    /// it has no data for — and it cost six requests in flight per attempt.
     private func backfillQuantityCategory(
         catID: String,
         cat: HealthCategory,
@@ -1022,7 +1170,7 @@ final class SyncService: ObservableObject {
         from historicalStart: Date,
         until anchor: Date,
         config: FreeRepsConfig
-    ) async throws -> Int {
+    ) async throws -> (inserted: Int, failedTypes: String?) {
         let windowSize = Self.backfillWindow
         let totalWindows = Int(ceil(anchor.timeIntervalSince(historicalStart) / windowSize))
         func index(of cursor: Date) -> Int {
@@ -1055,7 +1203,7 @@ final class SyncService: ObservableObject {
                 try await Task.sleep(for: Self.retryDelays[retries - 1])
             }
         }
-        return ledger.inserted
+        return (ledger.inserted, ledger.failureSummary)
     }
 
     /// Reads the windows from `cursor` to `anchor` one after another into a
@@ -1094,7 +1242,13 @@ final class SyncService: ObservableObject {
                 ])
                 await uploader.beginWindow(index)
                 let windowStart = cursor
-                _ = try await readQuantityTypes(types, since: { _ in windowStart }, until: windowEnd, into: uploader)
+                let windowIndex = index
+                _ = try await readQuantityTypes(types, since: { _ in windowStart }, until: windowEnd, onTypeFailed: { typeDesc, error in
+                    // A store that cannot be read at all is not one type's failure:
+                    // it ends the attempt, and the retry finds the window unacknowledged.
+                    if HealthKitService.affectsWholeStore(error) { throw error }
+                    ledger.noteFailure(of: typeDesc, in: windowIndex, error: error)
+                }, into: uploader)
                 try await uploader.endWindow(index)
                 cursor = windowEnd
                 index += 1
@@ -1113,6 +1267,7 @@ final class SyncService: ObservableObject {
         categoryRows(name, add: ack.rows)
         if ack.window >= ledger.uploadedCount {
             partialStep("\(catID)/\(ack.window)", fraction: Double(ack.windowBatchesAcked) / Double(max(ack.windowBatchesSent, 1)))
+            windowRows("\(catID)/\(ack.window)", rows: ack.rows)
         }
         updateLiveActivity(phase: name, operation: syncState.currentOperation, records: syncState.newRecordsThisRun)
     }
@@ -1127,8 +1282,10 @@ final class SyncService: ObservableObject {
             "rows": String(window.rows), "inserted": String(window.inserted),
         ])
         ledger.inserted += window.inserted
-        partialSteps.removeValue(forKey: "\(catID)/\(window.index)")
+        let key = "\(catID)/\(window.index)"
+        partialSteps.removeValue(forKey: key)
         guard window.index >= ledger.uploadedCount else {
+            partialRows.removeValue(forKey: key)
             refreshProgress()
             return
         }
@@ -1138,6 +1295,7 @@ final class SyncService: ObservableObject {
             syncState.backfillCursors[catID] = end
             syncState.persist()
         }
+        windowAcknowledged(catID, key: key, rows: window.rows, windows: steps)
         advanceRun(by: steps)
     }
 
@@ -1193,6 +1351,8 @@ final class SyncService: ObservableObject {
             total += windowTotal
             syncState.newRecordsThisRun += windowTotal
             partialSteps.removeValue(forKey: "\(catID)/\(windowIdx)")
+            // These categories report rows inserted, not sent; close enough for the estimate.
+            windowAcknowledged(catID, key: "\(catID)/\(windowIdx)", rows: windowTotal)
 
             cursor = windowEnd
             windowIdx += 1
@@ -1216,6 +1376,7 @@ final class SyncService: ObservableObject {
                 guard run == runID else { return }
                 categoryRows(displayName, add: ack.rows)
                 partialStep(key, fraction: Double(ack.windowBatchesAcked) / Double(max(ack.windowBatchesSent, 1)))
+                windowRows(key, rows: ack.rows)
                 updateLiveActivity(phase: displayName, operation: syncState.currentOperation, records: syncState.newRecordsThisRun)
             }
         case "cat_workouts":
@@ -1457,12 +1618,21 @@ final class SyncService: ObservableObject {
 
     // MARK: - Ingest helper
 
-    /// Safely sends a payload to FreeReps, throwing if the service is not initialized.
+    /// Sends a payload to FreeReps, throwing if the service is not initialized.
+    ///
+    /// Every request of a run passes through here, so this is where the run's
+    /// request slots are taken: the uploaders' own caps (six for metrics,
+    /// three for category samples) only keep one category from holding every
+    /// slot, and the workout, route and blood pressure requests count too.
     private func ingest(_ payload: FreeRepsPayload) async throws -> IngestResult {
         try checkSelection()
         guard let freereps else {
             throw FreeRepsError.connectionFailed("FreeReps service not initialized")
         }
+        let slots = requestSlots
+        await slots.wait()
+        defer { Task { await slots.signal() } }
+        try checkSelection()
         return try await freereps.ingest(payload)
     }
 
@@ -1730,16 +1900,20 @@ final class SyncService: ObservableObject {
         switch typeDesc.syncStrategy {
         case .aggregate(let interval):
             // On-device min/avg/max buckets for high-frequency discrete types.
-            let buckets = try await healthKit.queryAggregatedStatistics(
-                typeID: typeDesc.hkIdentifier, unit: typeDesc.unit, from: start, until: end, interval: interval)
+            let buckets = try await statisticsBuckets(typeDesc, from: start, until: end) {
+                try await healthKit.queryAggregatedStatistics(
+                    typeID: typeDesc.hkIdentifier, unit: typeDesc.unit, from: start, until: end, interval: interval)
+            }
             let points = buckets.map { FreeRepsMetricDataPoint(date: haeDate($0.startDate), Min: $0.min, Avg: $0.avg, Max: $0.max) }
             if !points.isEmpty { try await sink(FreeRepsMetric(name: metricName, units: typeDesc.unitString, data: points)) }
             return nil
 
         case .aggregateCumulative(let interval):
             // Hourly sums for steps, energy and distance; individual samples would double-count.
-            let buckets = try await healthKit.queryCumulativeStatistics(
-                typeID: typeDesc.hkIdentifier, unit: typeDesc.unit, from: start, until: end, interval: interval)
+            let buckets = try await statisticsBuckets(typeDesc, from: start, until: end) {
+                try await healthKit.queryCumulativeStatistics(
+                    typeID: typeDesc.hkIdentifier, unit: typeDesc.unit, from: start, until: end, interval: interval)
+            }
             let points = buckets.map { FreeRepsMetricDataPoint(date: haeDate($0.startDate), qty: $0.sum) }
             if !points.isEmpty { try await sink(FreeRepsMetric(name: metricName, units: typeDesc.unitString, data: points)) }
             return nil
@@ -1768,10 +1942,32 @@ final class SyncService: ObservableObject {
         }
     }
 
-    /// Six requests in flight: the pipeline sat at the old cap of three while the
-    /// server's latency stayed flat from one to three, and its pool holds sixteen
-    /// connections. Watch `upload.batch` `elapsed_ms` in the trace — a median
-    /// past a second means the database is the limit, not the client.
+    /// Runs a statistics collection query. Over a range HealthKit has no data
+    /// source for — basal energy from before the watch existed — it answers
+    /// "invalid argument" (3, "Unable to invalidate interval: no data source
+    /// available") or "no data" (11) instead of an empty collection. Both mean
+    /// no rows in this window, not a failed type; a retry gets the same answer.
+    private func statisticsBuckets<Bucket>(
+        _ typeDesc: QuantityTypeDescriptor, from start: Date, until end: Date,
+        query: () async throws -> [Bucket]
+    ) async throws -> [Bucket] {
+        do {
+            return try await query()
+        } catch let error where HealthKitService.meansNoDataInRange(error) {
+            let formatter = ISO8601DateFormatter()
+            await SyncTrace.shared.record("quantity.empty", [
+                "type": typeDesc.id, "from": formatter.string(from: start), "to": formatter.string(from: end),
+                "code": String((error as NSError).code),
+            ])
+            return []
+        }
+    }
+
+    /// Six requests in flight per uploader, within the run's shared cap of
+    /// `requestSlotCount`: the per-uploader cap keeps one category from taking
+    /// every slot; the shared one keeps the server's queue short. Watch
+    /// `upload.batch` `elapsed_ms` in the trace — it includes the wait for a
+    /// slot; `http.finished` `elapsed_ms` is the server alone.
     private func makeMetricUploader(
         label: String,
         onBatch: (@Sendable (UploadAck) async -> Void)? = nil,
@@ -1795,7 +1991,7 @@ final class SyncService: ObservableObject {
         since: @escaping (QuantityTypeDescriptor) -> Date?,
         until: Date? = nil,
         anchorKey: ((QuantityTypeDescriptor) -> String)? = nil,
-        onTypeFailed: ((QuantityTypeDescriptor, Error) -> Void)? = nil
+        onTypeFailed: ((QuantityTypeDescriptor, Error) throws -> Void)? = nil
     ) async throws -> (inserted: Int, anchors: [String: Data]) {
         let uploader = makeMetricUploader(label: label)
         do {
@@ -1810,12 +2006,16 @@ final class SyncService: ObservableObject {
     }
 
     /// Reads the types five at a time into `uploader`. Returns the anchors to keep.
+    ///
+    /// A type whose read fails is handed to `onTypeFailed` and the others go
+    /// on; without the callback, or when it throws, the failure ends the read.
+    /// A failed upload always ends it — the uploader is broken for every type.
     private func readQuantityTypes(
         _ types: [QuantityTypeDescriptor],
         since: @escaping (QuantityTypeDescriptor) -> Date?,
         until: Date? = nil,
         anchorKey: ((QuantityTypeDescriptor) -> String)? = nil,
-        onTypeFailed: ((QuantityTypeDescriptor, Error) -> Void)? = nil,
+        onTypeFailed: ((QuantityTypeDescriptor, Error) throws -> Void)? = nil,
         into uploader: MetricUploader
     ) async throws -> [String: Data] {
         let semaphore = AsyncSemaphore(value: 5)
@@ -1843,7 +2043,7 @@ final class SyncService: ObservableObject {
                         await SyncTrace.shared.record("quantity.failed", ["type": typeDesc.id,
                             "domain": cause.domain, "code": String(cause.code)])
                         guard let onTypeFailed else { throw error }
-                        onTypeFailed(typeDesc, error)
+                        try onTypeFailed(typeDesc, error)
                         return nil
                     }
                 }

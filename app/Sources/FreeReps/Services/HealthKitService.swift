@@ -13,6 +13,29 @@ final class HealthKitService {
 
     var isAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
 
+    // MARK: - Error classification
+
+    /// A statistics collection query over a range with no data source answers
+    /// with one of these instead of an empty collection ("Unable to invalidate
+    /// interval: no data source available" is code 3). Retrying cannot change
+    /// the answer, so the caller treats it as a window without rows.
+    static func meansNoDataInRange(_ error: Error) -> Bool {
+        switch (error as? HKError)?.code {
+        case .errorInvalidArgument, .errorNoData: return true
+        default: return false
+        }
+    }
+
+    /// Errors that mean no read will succeed right now — the store is locked,
+    /// missing or restricted — rather than one type's own failure. A denied
+    /// type is not among them: the user can deny one type and keep the rest.
+    static func affectsWholeStore(_ error: Error) -> Bool {
+        switch (error as? HKError)?.code {
+        case .errorDatabaseInaccessible, .errorHealthDataUnavailable, .errorHealthDataRestricted: return true
+        default: return false
+        }
+    }
+
     enum ReadCheck: Equatable {
         case readable
         /// iOS reports denied read access as an empty store, so this cannot prove a denial.
