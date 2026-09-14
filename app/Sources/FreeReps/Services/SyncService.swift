@@ -5,8 +5,9 @@ import Foundation
 import HealthKit
 import UIKit
 
-// Batch size for HTTP requests
-private let batchSize = 500
+// Rows per upload. The server takes up to 5,000 per statement, and one request
+// costs it far more than the rows do.
+private let batchSize = 5_000
 
 // MARK: - AsyncSemaphore
 
@@ -446,29 +447,41 @@ final class SyncService: ObservableObject {
 
             var failedCategories: [String] = []
 
-            // Quantity categories — 90-day windowed backfill
-            for (cat, types) in HealthDataTypes.quantityTypesByCategory {
+            // Quantity categories — 90-day windowed backfill. A few categories run at
+            // once so uploads overlap with Health reads; the server handles them in parallel.
+            let pending = HealthDataTypes.quantityTypesByCategory.filter { cat, _ in
                 let catID = "qty_\(cat.rawValue)"
-                guard HealthSyncSelection.shared.includes(catID) else { continue }
-                try checkSelection()
-                if syncState.backfillCursors[catID] == anchor { continue }
-
-                syncState.updateCategory(catID, status: .syncing)
-                syncState.currentOperation = "Reading \(cat.rawValue)\u{2026}"
-                do {
-                    let count = try await backfillQuantityCategory(
-                        catID: catID, cat: cat, types: types,
-                        from: historicalStart, until: anchor, config: config
-                    )
-                    try checkSelection()
-                    syncState.updateCategory(catID, status: .completed, recordCount: count, lastSyncDate: Date())
-                    updateLiveActivity(phase: cat.rawValue, operation: "Synced older data: \(cat.rawValue)", records: syncState.newRecordsThisRun)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    syncState.updateCategory(catID, status: .failed(error.localizedDescription))
-                    failedCategories.append(cat.rawValue)
-                    print("Category \(cat.rawValue) failed: \(error.localizedDescription)")
+                return HealthSyncSelection.shared.includes(catID) && syncState.backfillCursors[catID] != anchor
+            }
+            let categorySemaphore = AsyncSemaphore(value: 3)
+            try await withThrowingTaskGroup(of: String?.self) { group in
+                for (cat, types) in pending {
+                    group.addTask { @MainActor [self] in
+                        await categorySemaphore.wait()
+                        defer { Task { await categorySemaphore.signal() } }
+                        try checkSelection()
+                        let catID = "qty_\(cat.rawValue)"
+                        syncState.updateCategory(catID, status: .syncing)
+                        do {
+                            let count = try await backfillQuantityCategory(
+                                catID: catID, cat: cat, types: types,
+                                from: historicalStart, until: anchor, config: config
+                            )
+                            try checkSelection()
+                            syncState.updateCategory(catID, status: .completed, recordCount: count, lastSyncDate: Date())
+                            updateLiveActivity(phase: cat.rawValue, operation: "Synced older data: \(cat.rawValue)", records: syncState.newRecordsThisRun)
+                            return nil
+                        } catch is CancellationError {
+                            throw CancellationError()
+                        } catch {
+                            syncState.updateCategory(catID, status: .failed(error.localizedDescription))
+                            print("Category \(cat.rawValue) failed: \(error.localizedDescription)")
+                            return cat.rawValue
+                        }
+                    }
+                }
+                for try await failed in group {
+                    if let failed { failedCategories.append(failed) }
                 }
             }
 
@@ -808,10 +821,7 @@ final class SyncService: ObservableObject {
             // that backfill historical entries into HealthKit after the fact) are captured.
             // FreeReps uses ON CONFLICT DO NOTHING, making re-syncing the overlap window safe.
 
-            let opLabel = syncState.lastSyncDate != nil
-                ? "Reading changes since \(since.formatted(date: .abbreviated, time: .shortened))\u{2026}"
-                : "Reading the last 7 days\u{2026}"
-            syncState.currentOperation = opLabel
+            syncState.currentOperation = "Checking for new data\u{2026}"
 
             // Mirrored into the state so the app shows the same number as the Live Activity.
             var total: Int {
@@ -829,23 +839,36 @@ final class SyncService: ObservableObject {
                 syncState.updateCategory(catID, status: .syncing)
                 var catDelta = 0
                 var failedTypes: [String] = []
-                for typeDesc in types {
-                    try checkSelection()
-                    do {
-                        await SyncTrace.shared.record("quantity.started", ["type": typeDesc.id])
-                        catDelta += try await syncQuantityType(typeDesc: typeDesc, since: querySince)
-                        await SyncTrace.shared.record("quantity.finished", ["type": typeDesc.id])
-                    } catch is CancellationError {
-                        throw CancellationError()
-                    } catch {
-                        if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                            throw error
-                        } else {
-                            let cause = error as NSError
-                            await SyncTrace.shared.record("quantity.failed", ["type": typeDesc.id,
-                                "domain": cause.domain, "code": String(cause.code)])
-                            failedTypes.append("\(typeDesc.displayName): \(error.localizedDescription) [\(cause.domain):\(cause.code)]")
+                // Each type is one Health read and one upload; a few at a time keeps the
+                // server busy while Health is still reading the next.
+                let semaphore = AsyncSemaphore(value: 5)
+                try await withThrowingTaskGroup(of: (Int, String?).self) { group in
+                    for typeDesc in types {
+                        group.addTask { @MainActor [self] in
+                            await semaphore.wait()
+                            defer { Task { await semaphore.signal() } }
+                            try checkSelection()
+                            do {
+                                await SyncTrace.shared.record("quantity.started", ["type": typeDesc.id])
+                                let count = try await syncQuantityType(typeDesc: typeDesc, since: querySince)
+                                await SyncTrace.shared.record("quantity.finished", ["type": typeDesc.id])
+                                return (count, nil)
+                            } catch is CancellationError {
+                                throw CancellationError()
+                            } catch {
+                                if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
+                                    throw error
+                                }
+                                let cause = error as NSError
+                                await SyncTrace.shared.record("quantity.failed", ["type": typeDesc.id,
+                                    "domain": cause.domain, "code": String(cause.code)])
+                                return (0, "\(typeDesc.displayName): \(error.localizedDescription) [\(cause.domain):\(cause.code)]")
+                            }
                         }
+                    }
+                    for try await (count, failure) in group {
+                        catDelta += count
+                        if let failure { failedTypes.append(failure) }
                     }
                 }
                 let existing = syncState.categories.first(where: { $0.id == catID })?.recordCount ?? 0
