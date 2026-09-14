@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -21,11 +22,58 @@ func (db *DB) IsMetricAllowed(ctx context.Context, metricName string) (bool, err
 	return enabled, nil
 }
 
+// allowedNamesTTL is how long AllowedMetricNames serves the same snapshot.
+// The allowlist changes by migration, so a stale snapshot costs nothing
+// between deployments; the refresh-on-miss covers the moment after one.
+const allowedNamesTTL = 5 * time.Minute
+
+// allowedNamesCache holds one snapshot of the allowlist. The lock is held
+// across the load so that concurrent ingests after an expiry share a single
+// query instead of each running their own.
+type allowedNamesCache struct {
+	mu        sync.Mutex
+	names     map[string]bool
+	fetchedAt time.Time
+}
+
+// get returns the snapshot, loading a new one when there is none, when the
+// held one is older than ttl, or when force is set.
+func (c *allowedNamesCache) get(ctx context.Context, ttl time.Duration, force bool,
+	load func(context.Context) (map[string]bool, error)) (map[string]bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !force && c.names != nil && time.Since(c.fetchedAt) < ttl {
+		return c.names, nil
+	}
+	names, err := load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.names = names
+	c.fetchedAt = time.Now()
+	return names, nil
+}
+
 // AllowedMetricNames returns every allowlist entry keyed by name with its
-// enabled flag, so an ingest can check a whole payload with one query instead
-// of one IsMetricAllowed round trip per metric name. A name missing from the
-// map is not allowed, as in IsMetricAllowed.
+// enabled flag, so an ingest can check a whole payload without one
+// IsMetricAllowed round trip per metric name. A name missing from the map is
+// not allowed, as in IsMetricAllowed.
+//
+// The map is a shared snapshot, cached for allowedNamesTTL: read it, do not
+// modify it. A caller that meets a name the snapshot lacks and wants to be
+// sure asks RefreshAllowedMetricNames.
 func (db *DB) AllowedMetricNames(ctx context.Context) (map[string]bool, error) {
+	return db.allowedNames.get(ctx, allowedNamesTTL, false, db.queryAllowedMetricNames)
+}
+
+// RefreshAllowedMetricNames reloads the snapshot AllowedMetricNames serves and
+// returns it. For the ingest that meets an unknown name: a name allowed by a
+// migration a moment ago must not be rejected until the TTL runs out.
+func (db *DB) RefreshAllowedMetricNames(ctx context.Context) (map[string]bool, error) {
+	return db.allowedNames.get(ctx, allowedNamesTTL, true, db.queryAllowedMetricNames)
+}
+
+func (db *DB) queryAllowedMetricNames(ctx context.Context) (map[string]bool, error) {
 	rows, err := db.Pool.Query(ctx, `SELECT metric_name, enabled FROM metric_allowlist`)
 	if err != nil {
 		return nil, fmt.Errorf("querying metric allowlist: %w", err)

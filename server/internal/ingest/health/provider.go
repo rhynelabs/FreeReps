@@ -107,14 +107,23 @@ func (p *Provider) processMetrics(ctx context.Context, metrics []models.HealthMe
 	var healthRows []models.HealthMetricRow
 	rejectedSet := map[string]bool{}
 
-	// One allowlist query per payload, not one per metric name.
+	// The snapshot is cached across payloads; a name it lacks triggers one
+	// reload per payload, so a name allowed by a fresh migration is accepted
+	// at once and a payload full of unknown names still costs one query.
 	allowedNames, err := p.db.AllowedMetricNames(ctx)
 	if err != nil {
 		return fmt.Errorf("loading allowlist: %w", err)
 	}
+	allowed := allowlist{names: allowedNames, refresh: func() (map[string]bool, error) {
+		fresh, err := p.db.RefreshAllowedMetricNames(ctx)
+		if err != nil {
+			p.log.Warn("reloading allowlist after unknown metric name", "error", err)
+		}
+		return fresh, err
+	}}
 
 	for _, m := range metrics {
-		if !allowedNames[m.Name] {
+		if !allowed.allows(m.Name) {
 			if !rejectedSet[m.Name] {
 				result.RejectedNames = append(result.RejectedNames, m.Name)
 				rejectedSet[m.Name] = true
@@ -158,6 +167,33 @@ func (p *Provider) processMetrics(ctx context.Context, metrics []models.HealthMe
 	}
 
 	return nil
+}
+
+// allowlist answers whether a metric name is accepted, from a snapshot that is
+// reloaded at most once — on the first name it does not hold. Once is enough:
+// a reload either brings the name in or proves it absent, and a second miss
+// after a fresh snapshot is a genuinely unknown name.
+type allowlist struct {
+	names     map[string]bool
+	refresh   func() (map[string]bool, error)
+	refreshed bool
+}
+
+func (a *allowlist) allows(name string) bool {
+	if a.names[name] {
+		return true
+	}
+	if a.refreshed {
+		return false
+	}
+	a.refreshed = true
+	fresh, err := a.refresh()
+	if err != nil {
+		// The old snapshot is the best answer available; the caller logged.
+		return false
+	}
+	a.names = fresh
+	return a.names[name]
 }
 
 // convertMetricDataPoint detects the shape of a metric data point and converts it to a HealthMetricRow.
@@ -738,4 +774,3 @@ func (p *Provider) processCategorySamples(ctx context.Context, samples []models.
 
 	return nil
 }
-

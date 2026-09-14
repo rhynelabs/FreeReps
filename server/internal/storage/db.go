@@ -20,6 +20,11 @@ type DB struct {
 	// Available metrics cache (per user_id, bounded).
 	availMetricsMu    sync.RWMutex
 	availMetricsCache map[int]*availMetricsCacheEntry
+
+	// Allowlist cache: the accepted metric names, shared by every ingest.
+	// Refreshed after allowedNamesTTL, or when an ingest meets a name it
+	// does not hold (RefreshAllowedMetricNames).
+	allowedNames allowedNamesCache
 }
 
 const (

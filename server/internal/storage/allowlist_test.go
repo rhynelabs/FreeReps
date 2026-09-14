@@ -199,3 +199,48 @@ func TestAvailableMetricsCacheBoundedSize(t *testing.T) {
 		t.Fatalf("expected 'new', got %q", got[0].MetricName)
 	}
 }
+
+// TestAllowedNamesCacheReloadsOnlyOnExpiryOrRefresh exists because the
+// allowlist used to be queried on every ingest request. The snapshot must be
+// served without a load while fresh, reloaded on an explicit refresh (the
+// path an unknown metric name takes), and reloaded again once it is older
+// than the TTL.
+func TestAllowedNamesCacheReloadsOnlyOnExpiryOrRefresh(t *testing.T) {
+	loads := 0
+	load := func(context.Context) (map[string]bool, error) {
+		loads++
+		return map[string]bool{"heart_rate": true}, nil
+	}
+	c := &allowedNamesCache{}
+	ctx := context.Background()
+
+	for range 3 {
+		names, err := c.get(ctx, time.Minute, false, load)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !names["heart_rate"] {
+			t.Fatal("expected heart_rate in the snapshot")
+		}
+	}
+	if loads != 1 {
+		t.Fatalf("loads = %d after three fresh reads, want 1", loads)
+	}
+
+	if _, err := c.get(ctx, time.Minute, true, load); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loads != 2 {
+		t.Fatalf("loads = %d after a forced refresh, want 2", loads)
+	}
+
+	c.mu.Lock()
+	c.fetchedAt = time.Now().Add(-2 * time.Minute)
+	c.mu.Unlock()
+	if _, err := c.get(ctx, time.Minute, false, load); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loads != 3 {
+		t.Fatalf("loads = %d after the TTL passed, want 3", loads)
+	}
+}
