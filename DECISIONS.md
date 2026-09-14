@@ -19,6 +19,44 @@ is as recorded there; where the record named no alternative, none is claimed.
 
 ---
 
+## 2026-09-14 — History ingest uses four writers and year-sized Timescale chunks
+
+**Decided:** 2026-09-14
+
+**Decision.** The iOS sync has four shared request slots across all categories.
+The four history hypertables use a 365-day chunk interval. Existing weekly
+chunks on the deployed database were merged along contiguous calendar-year
+boundaries; migration `000029_wider_timescale_chunks` applies the interval to
+new installations and future chunks.
+
+The deployed PostgreSQL instance uses `max_wal_size = 8GB`, `min_wal_size =
+2GB`, `checkpoint_timeout = 30min`, `checkpoint_completion_target = 0.9`,
+`wal_compression = lz4`, and `backend_flush_after = 256kB`. These are instance
+settings, not application defaults. Ingest transactions alone retain the
+local asynchronous-commit policy recorded below.
+
+**Reasoning.** A synthetic 5,000-row hypertable insert on the four-core NAS
+sustained 64,100 rows/s with four writers, 54,800 with six, and 56,200 with
+eight. At eight, a transaction averaged 708 ms versus 311 ms at four and the
+RAID queue repeatedly stopped all writers together. In a 50-second test, the
+old 1 GB WAL limit forced a requested checkpoint and stored 2.58 million rows;
+the wider WAL window forced none and stored 3.09 million, 20% more, with 16%
+lower average transaction latency. A 256 kB backend flush reduced the worst
+short-test pause from about 1.5 seconds to 0.62 seconds at a small throughput
+cost, which matches the preference for steady progress over bursts.
+
+The tables held 1,174 weekly chunks for 1.8 GB. Most chunks were only kilobytes
+or a few megabytes, while a history run created 84 new chunks in three minutes,
+each through TimescaleDB's DDL path. Merging reduced them to 88 without changing
+the row counts. Even the largest resulting yearly chunk is far below the
+working-set target for the server's 4 GB of memory.
+
+**Trigger to re-open.** The database moves to substantially faster storage, its
+memory changes, ingest batches change size, or measurements with the real app
+show that four writers no longer maximize sustained rows per second.
+
+---
+
 ## 2026-09-14 — A request's workouts are written in two transactions, not one per workout
 
 **Decided:** 2026-09-14
@@ -257,6 +295,12 @@ single follow-up run instead of starting its own. The response never reported
 what the backfill built — `sleep_sessions_inserted` counts the aggregated
 sessions the payload itself carried — so nothing the client reads changed.
 
+Sessions derived by either the scoped or full pass are written 1,000 nights at
+a time. One statement inserts the sessions and their `sleep_analysis` metrics
+through data-modifying CTEs in the same asynchronous-commit transaction. A
+direct-source session still wins through `ON CONFLICT DO NOTHING`. The full
+startup pass begins only after the HTTP listener is open.
+
 **Reasoning.** The unscoped backfill reads every stage of every user and
 regroups them into nights, so a 500-row batch that happened to carry sleep
 data paid for the whole history — and did so on every batch of a history
@@ -281,7 +325,10 @@ a client that needs the sessions of the batch it just sent to be queryable
 when the response arrives.
 
 **Revisions.** 2026-09-14: the rebuild moved off the request path, serialized
-per user; the scoping is unchanged.
+per user; the scoping is unchanged. Later that day, its writes changed from two
+transactions per night to one atomic transaction per 1,000 nights, and the
+full startup pass moved behind listener startup after it held a restart offline
+for minutes.
 
 ---
 

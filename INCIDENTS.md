@@ -16,6 +16,50 @@ the fix was verified, this file does not claim it was.
 
 ---
 
+## 2026-09-14 — History sync stopped in periodic bursts and a restart opened no listener
+
+**Symptoms.** An older-data sync on build `fork-7a70516` began quickly but then
+all eight active requests repeatedly stopped for 10–19 seconds and completed
+together. Progress alternated between 15,000–27,000 rows/s and zero. There were
+no HTTP 500 responses. After maintenance, the container restarted and logged
+that the database was connected, but opened neither its HTTP nor Tailscale
+listener for several minutes.
+
+**Root cause.** PostgreSQL was checkpointing a write-heavy history into the
+NAS RAID. One logged checkpoint wrote 37,311 buffers for 150.6 seconds, spent a
+further 49.8 seconds syncing 1,919 files, and took 214.4 seconds in total; its
+1 GB WAL limit immediately requested the next checkpoint. `iostat` showed the
+data volume at 99–100% utilization, with queue depths commonly between 20 and
+50 and spikes above 200. CPU was nearly idle. More request concurrency lengthened
+the queue without increasing throughput.
+
+The four hypertables also held 1,174 default seven-day chunks for only 1.8 GB
+of data. The run created 84 more in three minutes. Each new TimescaleDB chunk
+requires DDL and index or constraint creation inside an ingest transaction, so
+parallel requests periodically met at that serialization point.
+
+The restart exposed an independent multiplier: `BackfillSleepSessions` ran
+synchronously before listener creation and committed one session, then one
+metric, for every night. The same per-night path powered the scoped REST
+backfill and exhausted its 30-second timeout on a coalesced history span.
+
+**Fix.** The deployed database now has a wider WAL and checkpoint window,
+compressed full-page WAL, and paced backend writes. Its existing weekly chunks
+were merged to 88 year-bounded chunks after a verified full backup, and new
+chunks use a 365-day interval. The iOS client uses four global upload slots,
+the measured optimum for this RAID.
+
+The sleep backfill now inserts up to 1,000 sessions and their metrics atomically
+per transaction. The full pass starts after the listener, so maintenance can no
+longer make a running container unavailable. A real-Timescale integration test
+covers batching, idempotence, and preservation of direct-source sessions.
+
+**Lesson.** Size ingest concurrency against sustained storage throughput, not
+the fast beginning of a run, and keep idempotent maintenance behind service
+readiness.
+
+---
+
 ## 2026-09-14 — Route and metric ingest requests failed with "deadlock detected" after the one-transaction change
 
 **Symptoms.** Build `fork-fc64d29`, deployed at 20:34 CEST. Between 20:34 and
