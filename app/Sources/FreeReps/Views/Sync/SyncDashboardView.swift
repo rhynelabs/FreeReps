@@ -40,7 +40,7 @@ struct SyncDashboardView: View {
                                 message: "Apple Health can't be read while iPhone is locked."
                             )
                         }
-                        Button("Cancel Sync", role: .destructive) { vm.cancelSync() }
+                        Button(vm.isFullSyncRunning ? "Stop" : "Cancel Sync", role: .destructive) { vm.cancelSync() }
                     }
                 }
 
@@ -67,6 +67,10 @@ struct SyncDashboardView: View {
                     }
                 }
 
+                if !vm.isFullSyncRunning {
+                    olderDataSection
+                }
+
                 // Category cards
                 Section("Categories") {
                     ForEach(vm.categories) { cat in
@@ -79,13 +83,6 @@ struct SyncDashboardView: View {
                             olderData: cat.id == "cat_strength" ? nil : vm.syncState.olderDataProgress(for: cat.id)
                         )
                     }
-                }
-
-                Section {
-                    Button("Sync Older Data") { vm.startFullSync() }
-                        .disabled(vm.isAnySyncRunning || !selection.isEnabled)
-                } footer: {
-                    Text("Sends all Apple Health data from before your first sync. If it's interrupted, it continues where it stopped.")
                 }
 
                 Section {
@@ -136,11 +133,74 @@ struct SyncDashboardView: View {
 
     private var overallProgress: some View {
         VStack(alignment: .leading, spacing: 6) {
-            LabeledContent("Overall Progress", value: vm.overallProgress, format: .percent.precision(.fractionLength(0)))
+            LabeledContent("Progress", value: vm.overallProgress, format: .percent.precision(.fractionLength(0)))
                 .monospacedDigit()
             ProgressView(value: vm.overallProgress)
         }
         .padding(.vertical, 2)
+    }
+
+    // MARK: - Older data
+
+    /// Categories an older-data sync started but has not finished.
+    private var olderDataPending: [(CategorySyncState, SyncState.OlderDataProgress)] {
+        vm.categories.compactMap { category in
+            guard category.id != "cat_strength", selection.includes(category.id) else { return nil }
+            return vm.syncState.olderDataProgress(for: category.id).map { (category, $0) }
+        }
+    }
+
+    /// Where a stopped older-data sync stands. Categories run a few at a time,
+    /// so this is the furthest one; the rows below show each category.
+    private var olderDataSubtitle: String {
+        let pending = olderDataPending
+        let left = pending.count == 1 ? "1 category left" : "\(pending.count) categories left"
+        let furthest = pending.compactMap { _, progress -> Date? in
+            if case .sentUpTo(let date) = progress { return date }
+            return nil
+        }.max()
+        guard let furthest else { return "Nothing sent yet · \(left)" }
+        return "Sent up to \(furthest.formatted(.dateTime.month(.abbreviated).year())) · \(left)"
+    }
+
+    /// The only place older data is offered: separate from being up to date,
+    /// because new data syncs on its own.
+    private var olderDataSection: some View {
+        Section {
+            if olderDataPending.isEmpty {
+                Button("Sync Older Data") { vm.startFullSync() }
+                    .disabled(vm.isAnySyncRunning || !selection.isEnabled)
+            } else {
+                HStack(spacing: 14) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 30))
+                        .foregroundStyle(.orange)
+                        .frame(width: 40)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Older Data").font(.headline)
+                        Text(olderDataSubtitle)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 4)
+                Button("Continue") { vm.startFullSync() }
+                    .disabled(vm.isAnySyncRunning || !selection.isEnabled)
+            }
+        } footer: {
+            Text(olderDataFooter)
+        }
+    }
+
+    private var olderDataFooter: String {
+        if !olderDataPending.isEmpty {
+            return "Continues where it stopped. New data keeps syncing in the meantime."
+        }
+        if vm.hasCompletedFullSync, let anchor = vm.syncState.backfillAnchorDate {
+            return "Older data is on your server through \(anchor.formatted(date: .abbreviated, time: .omitted))."
+        }
+        let start = FreeRepsConfig.load().backfillStartDate.formatted(.dateTime.month(.abbreviated).year())
+        return "Sends everything in Apple Health since \(start). Keep FreeReps open while it runs; if it stops, it continues where it left off."
     }
 
     /// A notice in the style of a Settings row: symbol, headline, secondary text.

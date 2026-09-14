@@ -51,11 +51,9 @@ struct CategorySyncState: Identifiable {
         return min(1.0, Double(currentProgress) / Double(totalEstimated))
     }
 
-    /// "Mar – Jun 2025 · 4 of 9 periods" while a window of older data is being read.
+    /// "Mar – Jun 2025" while that stretch of older data is being read.
     var periodLabel: String? {
-        guard let period else { return nil }
-        let months = period.formatted(Date.IntervalFormatStyle().month(.abbreviated).year())
-        return "\(months) · \(currentProgress + 1) of \(totalEstimated) periods"
+        period?.formatted(Date.IntervalFormatStyle().month(.abbreviated).year())
     }
 
     var daysBehind: Int? {

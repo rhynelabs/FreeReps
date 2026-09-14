@@ -1,7 +1,8 @@
 import SwiftUI
 
 /// The everyday answer: is the server up to date, what arrived last night,
-/// and how much is stored. Per-category detail lives in the Sync tab.
+/// and how much is stored. Per-category detail and older data live in the
+/// Sync tab.
 ///
 /// A `List` of inset-grouped sections in the density of Settings: a status row
 /// like `HealthPermissionsView`, plain button rows, `LabeledContent` for values.
@@ -14,9 +15,6 @@ struct OverviewView: View {
         NavigationStack {
             List {
                 statusSection
-                if selection.isEnabled && !vm.isAnySyncRunning && !vm.hasCompletedFullSync && olderDataPending.isEmpty {
-                    olderDataSection
-                }
                 if server.stats == nil, case .failed(let message) = server.state {
                     unreachableSection(message)
                 } else {
@@ -38,18 +36,11 @@ struct OverviewView: View {
     // MARK: - Status
 
     private enum Status {
-        case paused, syncing(older: Bool), failed(String), olderDataPaused, behind(Int), neverSynced, upToDate(Date)
+        case paused, syncing(older: Bool), failed(String), behind(Int), neverSynced, upToDate(Date)
     }
 
     private var included: [CategorySyncState] {
         vm.categories.filter { $0.id != "cat_strength" && selection.includes($0.id) }
-    }
-
-    /// Categories an older-data sync started but has not finished.
-    private var olderDataPending: [(CategorySyncState, SyncState.OlderDataProgress)] {
-        included.compactMap { category in
-            vm.syncState.olderDataProgress(for: category.id).map { (category, $0) }
-        }
     }
 
     private var status: Status {
@@ -60,7 +51,6 @@ struct OverviewView: View {
         if !failed.isEmpty {
             return .failed(failed.count == 1 ? "\(failed[0].displayName) couldn't sync." : "\(failed.count) categories couldn't sync.")
         }
-        if !olderDataPending.isEmpty { return .olderDataPaused }
         let behind = included.filter { $0.daysBehind != nil }.count
         if behind > 0 { return .behind(behind) }
         guard let last = vm.lastSyncDate else { return .neverSynced }
@@ -92,17 +82,10 @@ struct OverviewView: View {
             .animation(.default, value: statusTitle)
 
             if vm.isAnySyncRunning {
-                Button("Cancel Sync", role: .destructive) { vm.cancelSync() }
+                Button(vm.isFullSyncRunning ? "Stop" : "Cancel Sync", role: .destructive) { vm.cancelSync() }
             } else if selection.isEnabled {
-                switch status {
-                case .olderDataPaused:
-                    Button("Continue") { vm.startFullSync() }
-                case .failed:
-                    Button("Try Again") { olderDataPending.isEmpty ? vm.startRecentSync() : vm.startFullSync() }
-                default:
-                    Button("Sync Now") { vm.startRecentSync() }
-                        .accessibilityIdentifier("sync-now")
-                }
+                Button(isFailed ? "Try Again" : "Sync Now") { vm.startRecentSync() }
+                    .accessibilityIdentifier("sync-now")
             }
         }
     }
@@ -112,7 +95,6 @@ struct OverviewView: View {
         case .paused: return ("pause.circle.fill", .secondary)
         case .syncing: return ("arrow.triangle.2.circlepath.circle.fill", .blue)
         case .failed: return ("exclamationmark.circle.fill", .red)
-        case .olderDataPaused: return ("pause.circle.fill", .orange)
         case .behind: return ("clock.badge.exclamationmark.fill", .orange)
         case .neverSynced: return ("arrow.up.heart.fill", .blue)
         case .upToDate: return ("checkmark.circle.fill", .green)
@@ -124,7 +106,6 @@ struct OverviewView: View {
         case .paused: return "Sync Paused"
         case .syncing(let older): return older ? "Syncing Older Data" : "Syncing New Data"
         case .failed: return "Sync Failed"
-        case .olderDataPaused: return "Older Data Paused"
         case .behind: return "Not Up to Date"
         case .neverSynced: return "Not Synced Yet"
         case .upToDate: return "Up to Date"
@@ -136,31 +117,14 @@ struct OverviewView: View {
         case .paused: return "Connect Apple Health in Settings to sync."
         case .syncing: return vm.currentOperation.isEmpty ? "Reading Apple Health\u{2026}" : vm.currentOperation
         case .failed(let message): return message
-        case .olderDataPaused: return olderDataPausedSubtitle
         case .behind(let count): return count == 1 ? "1 category has newer data." : "\(count) categories have newer data."
         case .neverSynced: return "Send your Health data to your server."
         case .upToDate(let date): return "Synced \(date.formatted(.relative(presentation: .named)))"
         }
     }
 
-    /// Older data is sent one category at a time, so at most one is partly done.
-    private var olderDataPausedSubtitle: String {
-        let pending = olderDataPending
-        let left = pending.count == 1 ? "1 category left" : "\(pending.count) categories left"
-        for (category, progress) in pending {
-            if case .sentUpTo(let date) = progress {
-                return "\(category.displayName) sent up to \(date.formatted(.dateTime.month(.abbreviated).year())) · \(left)"
-            }
-        }
-        return "Stopped before it finished · \(left)"
-    }
-
-    private var olderDataSection: some View {
-        Section {
-            Button("Sync Older Data") { vm.startFullSync() }
-        } footer: {
-            Text("Older Apple Health data isn't on your server yet. This sends it once. Keep FreeReps open until it finishes.")
-        }
+    private var isFailed: Bool {
+        if case .failed = status { return true } else { return false }
     }
 
     // MARK: - Server
