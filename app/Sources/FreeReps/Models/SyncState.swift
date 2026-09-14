@@ -79,6 +79,7 @@ class SyncState: ObservableObject {
     @Published var categories: [CategorySyncState] = []
     @Published var totalRecords: Int = 0
     @Published var lastSyncDate: Date?
+    /// Share of the current run that is done; `SyncService` counts it up in equal steps.
     @Published var overallProgress: Double = 0.0
     @Published var currentOperation: String = ""
     @Published var errorMessage: String?
@@ -118,8 +119,6 @@ class SyncState: ObservableObject {
         if let p = progress { categories[idx].currentProgress = p }
         if let t = total { categories[idx].totalEstimated = t }
         if let period { categories[idx].period = period }
-
-        recalcOverall()
     }
 
     func resetAllLocalState() {
@@ -149,19 +148,6 @@ class SyncState: ObservableObject {
         categories[idx].lastSyncDate = nil
         categories[idx].currentProgress = 0
         persist()
-    }
-
-    func recalcOverall() {
-        let total = Double(categories.count)
-        guard total > 0 else {
-            overallProgress = 0
-            return
-        }
-        let completedCount = Double(categories.filter { $0.status == .completed }.count)
-        let syncingProgress = categories.filter { $0.status.isActive }.map { $0.progressFraction }.reduce(0, +)
-        overallProgress = (completedCount + syncingProgress) / total
-        // totalRecords is not summed from per-category session counts here —
-        // it is set directly from actual DB COUNT(*) queries in refreshRecordCounts().
     }
 
     // MARK: - Persistence
@@ -210,6 +196,5 @@ class SyncState: ObservableObject {
             if persisted.completed { categories[idx].status = .completed }
             if let message = persisted.failureMessage { categories[idx].status = .failed(message) }
         }
-        recalcOverall()
     }
 }

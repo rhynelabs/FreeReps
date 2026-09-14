@@ -96,6 +96,51 @@ final class SyncService: ObservableObject {
     private var liveActivity: Activity<SyncActivityAttributes>?
     private var lastLiveActivityUpdate: Date = .distantPast
 
+    /// Older data is read in stretches this long, one category at a time per stretch.
+    private static let backfillWindow: TimeInterval = 90 * 24 * 60 * 60
+
+    // MARK: - Run progress
+
+    /// The run's progress in equal steps: one window of one category for older
+    /// data, one Health type or special category for new data. Steps only add up,
+    /// so the bar never moves back while categories run side by side.
+    private var runStepsDone = 0
+    private var runStepsTotal = 1
+    /// Quantity categories being read right now, in the order they started.
+    private var activeCategories: [String] = []
+
+    private func beginRun(steps: Int) {
+        runStepsDone = 0
+        runStepsTotal = max(steps, 1)
+        activeCategories = []
+        syncState.overallProgress = 0
+    }
+
+    private func advanceRun() {
+        runStepsDone += 1
+        syncState.overallProgress = min(1, Double(runStepsDone) / Double(runStepsTotal))
+    }
+
+    /// Windows left to read for a category between `start` and `anchor`.
+    private func windowsLeft(for catID: String, from start: Date, until anchor: Date) -> Int {
+        let cursor = max(syncState.backfillCursors[catID] ?? start, start)
+        guard cursor < anchor else { return 0 }
+        return Int(ceil(anchor.timeIntervalSince(cursor) / Self.backfillWindow))
+    }
+
+    /// Names the categories being read, e.g. "Nutrition, Vitals, and Activity".
+    private func categoryStarted(_ name: String) {
+        activeCategories.append(name)
+        syncState.currentOperation = activeCategories.formatted(.list(type: .and))
+    }
+
+    private func categoryFinished(_ name: String) {
+        activeCategories.removeAll { $0 == name }
+        if !activeCategories.isEmpty {
+            syncState.currentOperation = activeCategories.formatted(.list(type: .and))
+        }
+    }
+
     init(syncState: SyncState) {
         self.syncState = syncState
         if syncState.categories.isEmpty {
@@ -302,6 +347,7 @@ final class SyncService: ObservableObject {
 
             syncState.updateCategory(categoryID, status: .syncing)
             syncState.currentOperation = "Syncing\u{2026}"
+            beginRun(steps: Self.sparseCategories.contains(categoryID) ? 1 : windowsLeft(for: categoryID, from: epoch, until: anchor))
 
             let count: Int
             if categoryID.hasPrefix("qty_") {
@@ -447,12 +493,30 @@ final class SyncService: ObservableObject {
 
             var failedCategories: [String] = []
 
-            // Quantity categories — 90-day windowed backfill. A few categories run at
-            // once so uploads overlap with Health reads; the server handles them in parallel.
             let pending = HealthDataTypes.quantityTypesByCategory.filter { cat, _ in
                 let catID = "qty_\(cat.rawValue)"
                 return HealthSyncSelection.shared.includes(catID) && syncState.backfillCursors[catID] != anchor
             }
+            let heavySpecials: [(String, String)] = [
+                ("cat_category", "Health Events"),
+                ("cat_workouts", "Workouts"),
+                ("cat_bp", "Blood Pressure"),
+                ("cat_activity_summaries", "Activity Rings"),
+                ("cat_workout_routes", "Workout Routes"),
+            ].filter { HealthSyncSelection.shared.includes($0.0) && syncState.backfillCursors[$0.0] != anchor }
+            let sparseSpecials: [(String, String)] = [
+                ("cat_ecg", "ECG"),
+                ("cat_audiogram", "Audiograms"),
+                ("cat_medications", "Medications"),
+                ("cat_vision", "Vision Prescriptions"),
+                ("cat_state_of_mind", "State of Mind"),
+            ].filter { HealthSyncSelection.shared.includes($0.0) && syncState.backfillCursors[$0.0] != anchor }
+
+            let windowSteps = pending.map { "qty_\($0.0.rawValue)" } + heavySpecials.map(\.0)
+            beginRun(steps: windowSteps.reduce(0) { $0 + windowsLeft(for: $1, from: historicalStart, until: anchor) } + sparseSpecials.count)
+
+            // Quantity categories — 90-day windowed backfill. A few categories run at
+            // once so uploads overlap with Health reads; the server handles them in parallel.
             let categorySemaphore = AsyncSemaphore(value: 3)
             try await withThrowingTaskGroup(of: String?.self) { group in
                 for (cat, types) in pending {
@@ -462,6 +526,8 @@ final class SyncService: ObservableObject {
                         try checkSelection()
                         let catID = "qty_\(cat.rawValue)"
                         syncState.updateCategory(catID, status: .syncing)
+                        categoryStarted(cat.rawValue)
+                        defer { categoryFinished(cat.rawValue) }
                         do {
                             let count = try await backfillQuantityCategory(
                                 catID: catID, cat: cat, types: types,
@@ -486,17 +552,8 @@ final class SyncService: ObservableObject {
             }
 
             // Special categories — sequential heavy categories use 90-day windowed backfill
-            let heavySpecials: [(String, String)] = [
-                ("cat_category", "Health Events"),
-                ("cat_workouts", "Workouts"),
-                ("cat_bp", "Blood Pressure"),
-                ("cat_activity_summaries", "Activity Rings"),
-                ("cat_workout_routes", "Workout Routes"),
-            ]
             for (catID, displayName) in heavySpecials {
-                guard HealthSyncSelection.shared.includes(catID) else { continue }
                 try checkSelection()
-                if syncState.backfillCursors[catID] == anchor { continue }
 
                 syncState.updateCategory(catID, status: .syncing)
                 syncState.currentOperation = "Reading \(displayName)\u{2026}"
@@ -532,20 +589,11 @@ final class SyncService: ObservableObject {
             }
 
             // Sparse categories — skip windowing, query full range, run in parallel
-            let sparseSpecials: [(String, String)] = [
-                ("cat_ecg", "ECG"),
-                ("cat_audiogram", "Audiograms"),
-                ("cat_medications", "Medications"),
-                ("cat_vision", "Vision Prescriptions"),
-                ("cat_state_of_mind", "State of Mind"),
-            ]
             try checkSelection()
             syncState.currentOperation = "Reading ECG, Audiograms, Medications, Vision, State of Mind\u{2026}"
             do {
                 try await withThrowingTaskGroup(of: (String, String, Int).self) { group in
                     for (catID, displayName) in sparseSpecials {
-                        guard HealthSyncSelection.shared.includes(catID) else { continue }
-                        if syncState.backfillCursors[catID] == anchor { continue }
                         syncState.updateCategory(catID, status: .syncing)
 
                         group.addTask { [self] in
@@ -566,6 +614,7 @@ final class SyncService: ObservableObject {
                         syncState.updateCategory(catID, status: .completed, recordCount: count, lastSyncDate: Date())
                         syncState.backfillCursors[catID] = anchor
                         syncState.newRecordsThisRun += count
+                        advanceRun()
                         updateLiveActivity(phase: displayName, operation: "Synced older data: \(displayName)", records: syncState.newRecordsThisRun)
                     }
                 }
@@ -630,7 +679,7 @@ final class SyncService: ObservableObject {
         until anchor: Date,
         config: FreeRepsConfig
     ) async throws -> Int {
-        let windowSize: TimeInterval = 90 * 24 * 60 * 60
+        let windowSize = Self.backfillWindow
         var cursor = syncState.backfillCursors[catID] ?? historicalStart
         var total = 0
         let totalWindows = Int(ceil(anchor.timeIntervalSince(historicalStart) / windowSize))
@@ -642,9 +691,9 @@ final class SyncService: ObservableObject {
             try checkSelection()
 
             let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
+            // The window shows on the category's own row; the headline names the
+            // categories running side by side.
             syncState.updateCategory(catID, status: .syncing, progress: windowIdx, total: totalWindows, period: cursor..<windowEnd)
-            let op = "\(cat.rawValue) · \(syncState.categories.first(where: { $0.id == catID })?.periodLabel ?? "")"
-            syncState.currentOperation = op
             var windowTotal = 0
             var retries = 0
             while true {
@@ -683,7 +732,8 @@ final class SyncService: ObservableObject {
             windowIdx += 1
             syncState.backfillCursors[catID] = cursor
             syncState.persist()
-            updateLiveActivity(phase: cat.rawValue, operation: op, records: syncState.newRecordsThisRun)
+            advanceRun()
+            updateLiveActivity(phase: syncState.currentOperation, operation: "Syncing older data", records: syncState.newRecordsThisRun)
         }
         return total
     }
@@ -696,7 +746,7 @@ final class SyncService: ObservableObject {
         config: FreeRepsConfig,
         syncWindow: (Date, Date) async throws -> Int
     ) async throws -> Int {
-        let windowSize: TimeInterval = 90 * 24 * 60 * 60
+        let windowSize = Self.backfillWindow
         var cursor = syncState.backfillCursors[catID] ?? historicalStart
         var total = 0
         let totalWindows = Int(ceil(anchor.timeIntervalSince(historicalStart) / windowSize))
@@ -737,6 +787,7 @@ final class SyncService: ObservableObject {
             syncState.persist()
             updateLiveActivity(phase: category?.displayName ?? catID, operation: op, records: syncState.newRecordsThisRun)
         }
+            advanceRun()
         return total
     }
 
@@ -830,9 +881,15 @@ final class SyncService: ObservableObject {
             }
             var failedCategories: [String] = []
 
-            for (cat, types) in HealthDataTypes.quantityTypesByCategory {
+            let quantityCategories = HealthDataTypes.quantityTypesByCategory
+                .filter { HealthSyncSelection.shared.includes("qty_\($0.0.rawValue)") }
+            let specialIDs = ["cat_category", "cat_workouts", "cat_bp", "cat_ecg", "cat_audiogram", "cat_activity_summaries",
+                              "cat_workout_routes", "cat_medications", "cat_vision", "cat_state_of_mind"]
+            beginRun(steps: quantityCategories.reduce(0) { $0 + $1.1.count }
+                + specialIDs.filter { HealthSyncSelection.shared.includes($0) }.count)
+
+            for (cat, types) in quantityCategories {
                 let catID = "qty_\(cat.rawValue)"
-                guard HealthSyncSelection.shared.includes(catID) else { continue }
                 let querySince = recentQueryStart(categoryID: catID, now: syncStartedAt)
                 try checkSelection()
 
@@ -850,6 +907,7 @@ final class SyncService: ObservableObject {
                             try checkSelection()
                             do {
                                 await SyncTrace.shared.record("quantity.started", ["type": typeDesc.id])
+                            defer { advanceRun() }
                                 let count = try await syncQuantityType(typeDesc: typeDesc, since: querySince)
                                 await SyncTrace.shared.record("quantity.finished", ["type": typeDesc.id])
                                 return (count, nil)
@@ -885,236 +943,42 @@ final class SyncService: ObservableObject {
                 updateLiveActivity(phase: cat.rawValue, operation: "Synced \(cat.rawValue)", records: total)
             }
 
-            if HealthSyncSelection.shared.includes("cat_category") {
-                let querySince = recentQueryStart(categoryID: "cat_category", now: syncStartedAt)
+            // Special categories, one at a time; each is a single Health read.
+            let specials: [(id: String, name: String, sync: (Date) async throws -> Int)] = [
+                ("cat_category", "Health Events", { @MainActor date in try await self.syncCategorySamples(since: date) }),
+                ("cat_workouts", "Workouts", { @MainActor date in try await self.syncWorkouts(since: date) }),
+                ("cat_bp", "Blood Pressure", { @MainActor date in try await self.syncBloodPressure(since: date) }),
+                ("cat_ecg", "ECG", { @MainActor date in try await self.syncECG(since: date) }),
+                ("cat_audiogram", "Audiograms", { @MainActor date in try await self.syncAudiograms(since: date) }),
+                ("cat_activity_summaries", "Activity Rings", { @MainActor date in try await self.syncActivitySummaries(since: date) }),
+                ("cat_workout_routes", "Workout Routes", { @MainActor date in try await self.syncWorkoutRoutes(since: date) }),
+                ("cat_medications", "Medications", { @MainActor date in try await self.syncMedications(since: date) }),
+                ("cat_vision", "Vision Prescriptions", { @MainActor date in try await self.syncVisionPrescriptions(since: date) }),
+                ("cat_state_of_mind", "State of Mind", { @MainActor date in try await self.syncStateOfMind(since: date) }),
+            ]
+            for special in specials where HealthSyncSelection.shared.includes(special.id) {
+                let querySince = recentQueryStart(categoryID: special.id, now: syncStartedAt)
                 try checkSelection()
-                syncState.updateCategory("cat_category", status: .syncing)
+                syncState.updateCategory(special.id, status: .syncing)
                 do {
-                    let catCount = try await syncCategorySamples(since: querySince)
-                    let existingCat = syncState.categories.first(where: { $0.id == "cat_category" })?.recordCount ?? 0
+                    let count = try await special.sync(querySince)
+                    let existing = syncState.categories.first(where: { $0.id == special.id })?.recordCount ?? 0
                     try checkSelection()
-                    syncState.updateCategory("cat_category", status: .completed, recordCount: existingCat + catCount, lastSyncDate: Date())
-                    total += catCount
-                    updateLiveActivity(phase: "Health Events", operation: "Synced Health Events", records: total)
+                    syncState.updateCategory(special.id, status: .completed, recordCount: existing + count, lastSyncDate: Date())
+                    total += count
+                    updateLiveActivity(phase: special.name, operation: "Synced \(special.name)", records: total)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
                     if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
                         throw error
-                    } else {
-                        failedCategories.append("Category Samples")
-                        syncState.updateCategory("cat_category", status: .failed(error.localizedDescription))
                     }
                 }
             }
+                    failedCategories.append(special.name)
+                    syncState.updateCategory(special.id, status: .failed(error.localizedDescription))
 
-            if HealthSyncSelection.shared.includes("cat_workouts") {
-                let querySince = recentQueryStart(categoryID: "cat_workouts", now: syncStartedAt)
-                try checkSelection()
-                syncState.updateCategory("cat_workouts", status: .syncing)
-                do {
-                    let workoutCount = try await syncWorkouts(since: querySince)
-                    let existingWorkouts = syncState.categories.first(where: { $0.id == "cat_workouts" })?.recordCount ?? 0
-                    try checkSelection()
-                    syncState.updateCategory("cat_workouts", status: .completed, recordCount: existingWorkouts + workoutCount, lastSyncDate: Date())
-                    total += workoutCount
-                    updateLiveActivity(phase: "Workouts", operation: "Synced Workouts", records: total)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                        throw error
-                    } else {
-                        failedCategories.append("Workouts")
-                        syncState.updateCategory("cat_workouts", status: .failed(error.localizedDescription))
-                    }
-                }
-            }
-
-            if HealthSyncSelection.shared.includes("cat_bp") {
-                let querySince = recentQueryStart(categoryID: "cat_bp", now: syncStartedAt)
-                try checkSelection()
-                syncState.updateCategory("cat_bp", status: .syncing)
-                do {
-                    let bpCount = try await syncBloodPressure(since: querySince)
-                    let existingBP = syncState.categories.first(where: { $0.id == "cat_bp" })?.recordCount ?? 0
-                    try checkSelection()
-                    syncState.updateCategory("cat_bp", status: .completed, recordCount: existingBP + bpCount, lastSyncDate: Date())
-                    total += bpCount
-                    updateLiveActivity(phase: "Blood Pressure", operation: "Synced Blood Pressure", records: total)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                        throw error
-                    } else {
-                        failedCategories.append("Blood Pressure")
-                        syncState.updateCategory("cat_bp", status: .failed(error.localizedDescription))
-                    }
-                }
-            }
-
-            if HealthSyncSelection.shared.includes("cat_ecg") {
-                let querySince = recentQueryStart(categoryID: "cat_ecg", now: syncStartedAt)
-                try checkSelection()
-                syncState.updateCategory("cat_ecg", status: .syncing)
-                do {
-                    let ecgCount = try await syncECG(since: querySince)
-                    let existingECG = syncState.categories.first(where: { $0.id == "cat_ecg" })?.recordCount ?? 0
-                    try checkSelection()
-                    syncState.updateCategory("cat_ecg", status: .completed, recordCount: existingECG + ecgCount, lastSyncDate: Date())
-                    total += ecgCount
-                    updateLiveActivity(phase: "ECG", operation: "Synced ECG", records: total)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                        throw error
-                    } else {
-                        failedCategories.append("ECG")
-                        syncState.updateCategory("cat_ecg", status: .failed(error.localizedDescription))
-                    }
-                }
-            }
-
-            if HealthSyncSelection.shared.includes("cat_audiogram") {
-                let querySince = recentQueryStart(categoryID: "cat_audiogram", now: syncStartedAt)
-                try checkSelection()
-                syncState.updateCategory("cat_audiogram", status: .syncing)
-                do {
-                    let audioCount = try await syncAudiograms(since: querySince)
-                    let existingAudio = syncState.categories.first(where: { $0.id == "cat_audiogram" })?.recordCount ?? 0
-                    try checkSelection()
-                    syncState.updateCategory("cat_audiogram", status: .completed, recordCount: existingAudio + audioCount, lastSyncDate: Date())
-                    total += audioCount
-                    updateLiveActivity(phase: "Audiograms", operation: "Synced Audiograms", records: total)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                        throw error
-                    } else {
-                        failedCategories.append("Audiograms")
-                        syncState.updateCategory("cat_audiogram", status: .failed(error.localizedDescription))
-                    }
-                }
-            }
-
-            if HealthSyncSelection.shared.includes("cat_activity_summaries") {
-                let querySince = recentQueryStart(categoryID: "cat_activity_summaries", now: syncStartedAt)
-                try checkSelection()
-                syncState.updateCategory("cat_activity_summaries", status: .syncing)
-                do {
-                    let activityCount = try await syncActivitySummaries(since: querySince)
-                    let existingActivity = syncState.categories.first(where: { $0.id == "cat_activity_summaries" })?.recordCount ?? 0
-                    try checkSelection()
-                    syncState.updateCategory("cat_activity_summaries", status: .completed, recordCount: existingActivity + activityCount, lastSyncDate: Date())
-                    total += activityCount
-                    updateLiveActivity(phase: "Activity Rings", operation: "Synced Activity Rings", records: total)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                        throw error
-                    } else {
-                        failedCategories.append("Activity Summaries")
-                        syncState.updateCategory("cat_activity_summaries", status: .failed(error.localizedDescription))
-                    }
-                }
-            }
-
-            if HealthSyncSelection.shared.includes("cat_workout_routes") {
-                let querySince = recentQueryStart(categoryID: "cat_workout_routes", now: syncStartedAt)
-                try checkSelection()
-                syncState.updateCategory("cat_workout_routes", status: .syncing)
-                do {
-                    let routeCount = try await syncWorkoutRoutes(since: querySince)
-                    let existingRoutes = syncState.categories.first(where: { $0.id == "cat_workout_routes" })?.recordCount ?? 0
-                    try checkSelection()
-                    syncState.updateCategory("cat_workout_routes", status: .completed, recordCount: existingRoutes + routeCount, lastSyncDate: Date())
-                    total += routeCount
-                    updateLiveActivity(phase: "Workout Routes", operation: "Synced Workout Routes", records: total)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                        throw error
-                    } else {
-                        failedCategories.append("Workout Routes")
-                        syncState.updateCategory("cat_workout_routes", status: .failed(error.localizedDescription))
-                    }
-                }
-            }
-
-            if HealthSyncSelection.shared.includes("cat_medications") {
-                let querySince = recentQueryStart(categoryID: "cat_medications", now: syncStartedAt)
-                try checkSelection()
-                syncState.updateCategory("cat_medications", status: .syncing)
-                do {
-                    let medCount = try await syncMedications(since: querySince)
-                    let existingMeds = syncState.categories.first(where: { $0.id == "cat_medications" })?.recordCount ?? 0
-                    try checkSelection()
-                    syncState.updateCategory("cat_medications", status: .completed, recordCount: existingMeds + medCount, lastSyncDate: Date())
-                    total += medCount
-                    updateLiveActivity(phase: "Medications", operation: "Synced Medications", records: total)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                        throw error
-                    } else {
-                        failedCategories.append("Medications")
-                        syncState.updateCategory("cat_medications", status: .failed(error.localizedDescription))
-                    }
-                }
-            }
-
-            if HealthSyncSelection.shared.includes("cat_vision") {
-                let querySince = recentQueryStart(categoryID: "cat_vision", now: syncStartedAt)
-                try checkSelection()
-                syncState.updateCategory("cat_vision", status: .syncing)
-                do {
-                    let visionCount = try await syncVisionPrescriptions(since: querySince)
-                    let existingVision = syncState.categories.first(where: { $0.id == "cat_vision" })?.recordCount ?? 0
-                    try checkSelection()
-                    syncState.updateCategory("cat_vision", status: .completed, recordCount: existingVision + visionCount, lastSyncDate: Date())
-                    total += visionCount
-                    updateLiveActivity(phase: "Vision", operation: "Synced Vision Prescriptions", records: total)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                        throw error
-                    } else {
-                        failedCategories.append("Vision Prescriptions")
-                        syncState.updateCategory("cat_vision", status: .failed(error.localizedDescription))
-                    }
-                }
-            }
-
-            if HealthSyncSelection.shared.includes("cat_state_of_mind") {
-                let querySince = recentQueryStart(categoryID: "cat_state_of_mind", now: syncStartedAt)
-                try checkSelection()
-                syncState.updateCategory("cat_state_of_mind", status: .syncing)
-                do {
-                    let somCount = try await syncStateOfMind(since: querySince)
-                    let existingSOM = syncState.categories.first(where: { $0.id == "cat_state_of_mind" })?.recordCount ?? 0
-                    try checkSelection()
-                    syncState.updateCategory("cat_state_of_mind", status: .completed, recordCount: existingSOM + somCount, lastSyncDate: Date())
-                    total += somCount
-                    updateLiveActivity(phase: "State of Mind", operation: "Synced State of Mind", records: total)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
-                        throw error
-                    } else {
-                        failedCategories.append("State of Mind")
-                        syncState.updateCategory("cat_state_of_mind", status: .failed(error.localizedDescription))
-                    }
-                }
-            }
-
+                advanceRun()
             try checkSelection()
             if !failedCategories.isEmpty {
                 syncState.errorMessage = "Sync completed with errors in: \(failedCategories.joined(separator: ", "))"
