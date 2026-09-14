@@ -1,8 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ func (db *DB) InsertStateOfMind(ctx context.Context, rows []models.StateOfMindRo
 	if len(rows) == 0 {
 		return 0, nil
 	}
+	sortStateOfMindRows(rows)
 
 	query := `INSERT INTO state_of_mind (id, user_id, kind, valence, labels, associations, start_date, source) VALUES `
 	args := make([]any, 0, len(rows)*8)
@@ -44,6 +47,15 @@ func (db *DB) InsertStateOfMind(ctx context.Context, rows []models.StateOfMindRo
 		return nil
 	})
 	return inserted, err
+}
+
+// sortStateOfMindRows orders the rows by primary key, in place, so that
+// concurrent statements sharing rows wait on them in the same order; see
+// sortHealthMetricRows.
+func sortStateOfMindRows(rows []models.StateOfMindRow) {
+	slices.SortStableFunc(rows, func(a, b models.StateOfMindRow) int {
+		return bytes.Compare(a.ID[:], b.ID[:])
+	})
 }
 
 // QueryStateOfMind retrieves state of mind records in a time range for a user.

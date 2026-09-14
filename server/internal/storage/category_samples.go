@@ -1,8 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ func (db *DB) InsertCategorySamples(ctx context.Context, rows []models.CategoryS
 	if len(rows) == 0 {
 		return 0, nil
 	}
+	sortCategorySampleRows(rows)
 
 	query := `INSERT INTO category_samples (id, user_id, type, value, value_label, start_date, end_date, source) VALUES `
 	args := make([]any, 0, len(rows)*8)
@@ -44,6 +47,15 @@ func (db *DB) InsertCategorySamples(ctx context.Context, rows []models.CategoryS
 		return nil
 	})
 	return inserted, err
+}
+
+// sortCategorySampleRows orders the rows by primary key, in place, so that
+// concurrent statements sharing rows wait on them in the same order; see
+// sortHealthMetricRows.
+func sortCategorySampleRows(rows []models.CategorySampleRow) {
+	slices.SortStableFunc(rows, func(a, b models.CategorySampleRow) int {
+		return bytes.Compare(a.ID[:], b.ID[:])
+	})
 }
 
 // QueryCategorySamples retrieves category samples in a time range for a user,

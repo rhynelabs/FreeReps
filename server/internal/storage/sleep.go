@@ -1,9 +1,11 @@
 package storage
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -41,6 +43,7 @@ func (db *DB) InsertSleepStages(ctx context.Context, rows []models.SleepStageRow
 	if len(rows) == 0 {
 		return 0, nil
 	}
+	sortSleepStageRows(rows)
 
 	query := `INSERT INTO sleep_stages (start_time, end_time, user_id, stage, duration_hr, source) VALUES `
 	args := make([]any, 0, len(rows)*6)
@@ -68,6 +71,20 @@ func (db *DB) InsertSleepStages(ctx context.Context, rows []models.SleepStageRow
 		return nil
 	})
 	return inserted, err
+}
+
+// sortSleepStageRows puts the rows in the order of idx_sleep_stages_dedup, in
+// place, so that concurrent statements sharing rows wait on them in the same
+// order; see sortHealthMetricRows.
+func sortSleepStageRows(rows []models.SleepStageRow) {
+	slices.SortStableFunc(rows, func(a, b models.SleepStageRow) int {
+		return cmp.Or(
+			a.StartTime.Compare(b.StartTime),
+			a.EndTime.Compare(b.EndTime),
+			cmp.Compare(a.Stage, b.Stage),
+			cmp.Compare(a.UserID, b.UserID),
+		)
+	})
 }
 
 // SleepSessionResult is a sleep session with optional stage data.

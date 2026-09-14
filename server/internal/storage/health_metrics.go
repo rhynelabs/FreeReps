@@ -1,9 +1,11 @@
 package storage
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -171,6 +173,7 @@ func (db *DB) InsertHealthMetrics(ctx context.Context, rows []models.HealthMetri
 	}
 
 	rows = dedupeHealthMetricRows(rows)
+	sortHealthMetricRows(rows)
 
 	for start := 0; start < len(rows); start += maxRowsPerBatch {
 		end := start + maxRowsPerBatch
@@ -222,6 +225,28 @@ func dedupeHealthMetricRows(rows []models.HealthMetricRow) []models.HealthMetric
 		}
 	}
 	return kept
+}
+
+// sortHealthMetricRows puts the rows in the order of idx_health_metrics_dedup,
+// in place, before they are cut into batches.
+//
+// ON CONFLICT DO UPDATE locks each conflicting row as the statement reaches
+// it, and a statement that meets a row another statement is still inserting
+// waits for that one. Two concurrent statements that share rows and meet them
+// in different orders can each hold a row the other waits for — a deadlock,
+// which on 2026-09-14 (INCIDENTS.md) failed a retried window whose cancelled
+// attempt was still running on the server. In key order every statement
+// takes the shared rows in the same sequence, and the one behind only ever
+// waits. The rows arrive nearly in this order already, so the sort is cheap.
+func sortHealthMetricRows(rows []models.HealthMetricRow) {
+	slices.SortStableFunc(rows, func(a, b models.HealthMetricRow) int {
+		return cmp.Or(
+			cmp.Compare(a.MetricName, b.MetricName),
+			cmp.Compare(a.Source, b.Source),
+			a.Time.Compare(b.Time),
+			cmp.Compare(a.UserID, b.UserID),
+		)
+	})
 }
 
 // healthMetricColumns is one batch turned on its side: twelve parallel arrays,
@@ -304,6 +329,8 @@ func (db *DB) insertHealthMetricsBatch(ctx context.Context, rows []models.Health
 	c := healthMetricColumnsFrom(rows)
 
 	err = db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
+		// A rerun after a deadlock starts the count over.
+		inserted, updated = 0, 0
 		result, err := tx.Query(ctx, insertHealthMetricsSQL,
 			c.times, c.userIDs, c.metricNames, c.sources, c.units,
 			c.qty, c.minVal, c.avgVal, c.maxVal,
@@ -329,8 +356,6 @@ func (db *DB) insertHealthMetricsBatch(ctx context.Context, rows []models.Health
 		}
 		return nil
 	})
-		// A rerun after a deadlock starts the count over.
-		inserted, updated = 0, 0
 	if err != nil {
 		return 0, 0, err
 	}
