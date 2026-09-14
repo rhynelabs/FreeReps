@@ -1517,23 +1517,64 @@ final class SyncService: ObservableObject {
             total += try await uploadPendingRoutes()
             let key = Self.anchorKey(category: "cat_workout_routes", type: "workouts")
             let changes = try await healthKit.changedWorkouts(anchor: syncState.anchors[key], fallbackSince: start)
-            for workout in changes.added {
-                if try await uploadRoutes(of: workout) {
+            for outcome in try await uploadRoutes(forEach: changes.added) {
+                if outcome.uploaded {
                     total += 1
-                    syncState.routesPending.removeValue(forKey: workout.uuid.uuidString)
+                    syncState.routesPending.removeValue(forKey: outcome.uuid)
                 } else {
-                    syncState.routesPending[workout.uuid.uuidString] = workout.endDate
+                    syncState.routesPending[outcome.uuid] = outcome.endDate
                 }
             }
             syncState.anchors[key] = changes.anchor
         } else {
             try await healthKit.streamWorkouts(from: since, until: until) { [self] workouts in
-                for workout in workouts {
-                    if try await uploadRoutes(of: workout) { total += 1 }
-                }
+                total += try await uploadRoutes(forEach: workouts).filter(\.uploaded).count
             }
         }
         return total
+    }
+
+    /// What became of one workout's route in `uploadRoutes(forEach:)`.
+    private struct RouteOutcome {
+        let uuid: String
+        let endDate: Date
+        let uploaded: Bool
+    }
+
+    /// How many workouts have their routes read and uploaded at once. Each
+    /// route is one 0.3–0.5 MB request, and HealthKit streams the locations
+    /// in chunks; one at a time, the read sits idle while the upload runs.
+    private static let routeConcurrency = 3
+
+    /// Runs `uploadRoutes(of:)` for the workouts, `routeConcurrency` at a time.
+    /// The outcomes come back in completion order, which the callers do not
+    /// depend on. They apply the outcomes to `syncState` themselves: the child
+    /// tasks only read and upload, so a failure anywhere cancels the rest and
+    /// leaves the pending list untouched — the anchor stays too, and the next
+    /// run reads the same workouts again.
+    private func uploadRoutes(forEach workouts: [HKWorkout]) async throws -> [RouteOutcome] {
+        var outcomes: [RouteOutcome] = []
+        outcomes.reserveCapacity(workouts.count)
+        try await withThrowingTaskGroup(of: RouteOutcome.self) { group in
+            var next = 0
+            var running = 0
+            while next < workouts.count || running > 0 {
+                while running < Self.routeConcurrency, next < workouts.count {
+                    try checkSelection()
+                    let workout = workouts[next]
+                    next += 1
+                    running += 1
+                    group.addTask { @MainActor [self] in
+                        RouteOutcome(uuid: workout.uuid.uuidString, endDate: workout.endDate,
+                                     uploaded: try await uploadRoutes(of: workout))
+                    }
+                }
+                guard let outcome = try await group.next() else { break }
+                running -= 1
+                outcomes.append(outcome)
+            }
+        }
+        return outcomes
     }
 
     /// Retries the workouts still waiting for a route. One that has a route now
@@ -1545,9 +1586,9 @@ final class SyncService: ObservableObject {
         let uuids = syncState.routesPending.keys.compactMap { UUID(uuidString: $0) }
         guard !uuids.isEmpty else { return 0 }
         var total = 0
-        for workout in try await healthKit.workouts(uuids: uuids) {
-            guard try await uploadRoutes(of: workout) else { continue }
-            syncState.routesPending.removeValue(forKey: workout.uuid.uuidString)
+        let workouts = try await healthKit.workouts(uuids: uuids)
+        for outcome in try await uploadRoutes(forEach: workouts) where outcome.uploaded {
+            syncState.routesPending.removeValue(forKey: outcome.uuid)
             total += 1
         }
         return total
