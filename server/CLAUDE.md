@@ -2,6 +2,11 @@
 
 - Build: `cd server && make build` (or `make build` from root)
 - Test: `cd server && go test ./...`
+- Go commands must run with `GOTOOLCHAIN=go1.25.5` (e.g.
+  `GOTOOLCHAIN=go1.25.5 go test ./...`). *Why:* newer Go releases (1.27 on this
+  Mac) fail on the pinned go-json-experiment dependency (`undefined:
+  json.SkipFunc`) — the same pin `app/CLAUDE.md` documents for the
+  TailscaleKit build script.
 - Frontend stub for Go build: `mkdir -p server/web/dist && touch server/web/dist/.gitkeep`
 - Frontend build: `cd server/web && npm ci && npm run build`
 
