@@ -327,7 +327,7 @@ final class SyncService: ObservableObject {
                     catID: categoryID, from: epoch, until: anchor, config: config
                 ) { [self] windowStart, windowEnd in
                     switch categoryID {
-                    case "cat_category":          return try await syncCategorySamples(since: windowStart, until: windowEnd, insertBatchSize: 50)
+                    case "cat_category":          return try await syncCategorySamples(since: windowStart, until: windowEnd)
                     case "cat_workouts":          return try await syncWorkouts(since: windowStart, until: windowEnd)
                     case "cat_bp":                return try await syncBloodPressure(since: windowStart, until: windowEnd)
                     case "cat_activity_summaries": return try await syncActivitySummaries(since: windowStart, until: windowEnd)
@@ -490,7 +490,7 @@ final class SyncService: ObservableObject {
                     ) { [self] windowStart, windowEnd in
                         switch catID {
                         case "cat_category":
-                            return try await syncCategorySamples(since: windowStart, until: windowEnd, insertBatchSize: 50)
+                            return try await syncCategorySamples(since: windowStart, until: windowEnd)
                         case "cat_workouts":
                             return try await syncWorkouts(since: windowStart, until: windowEnd)
                         case "cat_bp":
@@ -623,9 +623,6 @@ final class SyncService: ObservableObject {
 
         while cursor < anchor {
             try checkSelection()
-            guard let freereps else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
-            _ = try await freereps.ping()
-            try checkSelection()
 
             let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
             var windowTotal = 0
@@ -640,8 +637,7 @@ final class SyncService: ObservableObject {
                                 defer { Task { await semaphore.signal() } }
                                 return try await self.syncQuantityType(
                                     typeDesc: typeDesc,
-                                    since: cursor, until: windowEnd,
-                                    insertBatchSize: 50
+                                    since: cursor, until: windowEnd
                                 )
                             }
                         }
@@ -691,9 +687,6 @@ final class SyncService: ObservableObject {
             : 0
 
         while cursor < anchor {
-            try checkSelection()
-            guard let freereps else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
-            _ = try await freereps.ping()
             try checkSelection()
 
             let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
