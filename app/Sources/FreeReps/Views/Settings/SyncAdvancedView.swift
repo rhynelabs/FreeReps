@@ -4,6 +4,9 @@ struct SyncAdvancedView: View {
     @ObservedObject var vm: SettingsViewModel
     let syncViewModel: SyncViewModel
     @State private var showResetSyncConfirmation = false
+    /// True for a few seconds after a reset, so the row itself confirms it:
+    /// the alert closes without a trace otherwise.
+    @State private var didResetSyncState = false
 
     var body: some View {
         List {
@@ -31,13 +34,16 @@ struct SyncAdvancedView: View {
                     // Only the icon carries the destructive tint; the text keeps
                     // the same weight as the other settings rows.
                     SettingsRow(Text("Reset Sync State")) {
-                        Image(systemName: "arrow.counterclockwise")
-                            .foregroundStyle(.red)
+                        Image(systemName: didResetSyncState ? "checkmark.circle.fill" : "arrow.counterclockwise")
+                            .foregroundStyle(didResetSyncState ? .green : .red)
                     } subtitle: {
-                        Text("Clears all sync progress. Next sync will re-send all data.")
+                        Text(didResetSyncState
+                             ? "Sync state cleared. The next Sync Older Data starts from the beginning."
+                             : "Clears all sync progress. Next sync will re-send all data.")
                     }
                 }
-                .disabled(syncViewModel.isAnySyncRunning)
+                .disabled(syncViewModel.isAnySyncRunning || didResetSyncState)
+                .animation(.default, value: didResetSyncState)
             }
         }
         .navigationTitle("Advanced")
@@ -46,6 +52,11 @@ struct SyncAdvancedView: View {
         .alert("Reset Sync State", isPresented: $showResetSyncConfirmation) {
             Button("Reset", role: .destructive) {
                 syncViewModel.resetAllSyncState()
+                didResetSyncState = true
+                Task {
+                    try? await Task.sleep(for: .seconds(3))
+                    didResetSyncState = false
+                }
             }
             Button("Cancel", role: .cancel) { }
         } message: {
