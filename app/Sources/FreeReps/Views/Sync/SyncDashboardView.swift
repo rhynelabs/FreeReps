@@ -4,41 +4,26 @@ import UniformTypeIdentifiers
 
 struct SyncDashboardView: View {
     @ObservedObject var vm: SyncViewModel
-    @ObservedObject private var selection = HealthSyncSelection.shared
     @EnvironmentObject var importState: ImportState
     @State private var navigateToHealthPermissions = false
     @State private var showFilePicker = false
-    @AppStorage("keepScreenOnDuringSync") private var keepScreenOnDuringSync = true
+    @ObservedObject private var selection = HealthSyncSelection.shared
 
     var body: some View {
         NavigationStack {
             List {
-                // Header section
-                Section {
-                    VStack(spacing: 16) {
-                        statusHeader
-                        syncButtons
-                        if !selection.isEnabled {
-                            Text("Apple Health sync is paused. Resume in Settings → Apple Health.")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                        }
-                        if vm.isAnySyncRunning {
+                if vm.isAnySyncRunning {
+                    Section {
+                        VStack(alignment: .leading, spacing: 8) {
+                            if !vm.currentOperation.isEmpty {
+                                Text(vm.currentOperation)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
                             overallProgress
                         }
-                    }
-                    .padding(.vertical, 4)
-                }
-
-                // No-full-sync warning banner
-                if selection.isEnabled && !vm.hasCompletedFullSync && !vm.isAnySyncRunning {
-                    Section {
-                        noticeBanner(
-                            icon: "exclamationmark.triangle.fill",
-                            color: .yellow,
-                            title: "No Complete Baseline",
-                            message: "A full sync has never completed. Historical data may be missing from FreeReps. Run Full Sync to establish a complete baseline."
-                        )
+                        .padding(.vertical, 4)
+                        Button("Cancel Sync", role: .destructive) { vm.cancelSync() }
                     }
                 }
 
@@ -49,7 +34,7 @@ struct SyncDashboardView: View {
                             icon: "lock.open.display",
                             color: .blue,
                             title: "Keep Screen On",
-                            message: "Apple HealthKit is not accessible when the device is locked. Keep the screen on until the full sync completes."
+                            message: "Apple Health can't be read while the iPhone is locked. Keep the screen on until the history import completes."
                         )
                     }
                 }
@@ -99,20 +84,25 @@ struct SyncDashboardView: View {
                             state: cat,
                             onReset: { vm.resetCategory(categoryID: cat.id) },
                             onSync: { vm.startCategorySync(categoryID: cat.id) },
-                            isSyncRunning: vm.isAnySyncRunning
+                            isSyncRunning: vm.isAnySyncRunning,
+                            isIncluded: selection.isEnabled && selection.includes(cat.id)
                         )
-                        .disabled(!selection.isEnabled || !selection.includes(cat.id))
-                        if !selection.includes(cat.id) {
-                            Text("Not selected for sync")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
                     }
                 }
 
-                BrandFooter()
+                Section {
+                    Button("Import History") { vm.startFullSync() }
+                        .disabled(vm.isAnySyncRunning || !selection.isEnabled)
+                    Button("Import File…") { showFilePicker = true }
+                        .disabled(vm.isAnySyncRunning)
+                } header: {
+                    Text("Import")
+                } footer: {
+                    Text("Import History reads all Apple Health data since the backfill start and continues where it stopped. Import File uploads a CSV export, for example from Alpha Progression.")
+                }
+
             }
-            .navigationTitle("FreeReps")
+            .navigationTitle("Data")
             .navigationBarTitleDisplayMode(.large)
             .navigationDestination(isPresented: $navigateToHealthPermissions) {
                 HealthPermissionsView(vm: SettingsViewModel())
@@ -121,12 +111,6 @@ struct SyncDashboardView: View {
                 vm.refreshRecordCounts()
                 vm.checkPrerequisites()
                 vm.refreshLatestHealthKitDates()
-            }
-            .onChange(of: vm.isFullSyncRunning) { _, isRunning in
-                UIApplication.shared.isIdleTimerDisabled = isRunning && keepScreenOnDuringSync
-            }
-            .onDisappear {
-                UIApplication.shared.isIdleTimerDisabled = false
             }
             .fileImporter(
                 isPresented: $showFilePicker,
@@ -153,95 +137,6 @@ struct SyncDashboardView: View {
                     importState.showResult = true
                 }
             }
-            .alert("Sync Prerequisites", isPresented: $vm.showPrerequisiteAlert) {
-                Button("Continue Anyway") { }
-                Button("Cancel Sync", role: .cancel) {
-                    vm.cancelSync()
-                }
-            } message: {
-                let titles = vm.prerequisiteIssues.map { $0.title }
-                Text("Issues found:\n\(titles.joined(separator: "\n"))\n\nThe sync will continue but some data may be missing. Fix these issues in Settings for a complete sync.")
-            }
-        }
-    }
-
-    private var statusHeader: some View {
-        VStack(spacing: 6) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(vm.lastSyncLabel)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    if vm.totalRecords > 0 {
-                        Text("\(vm.totalRecords.formatted()) total records in DB")
-                            .font(.headline)
-                            .foregroundStyle(.primary)
-                    }
-                }
-                Spacer()
-            }
-            if vm.isAnySyncRunning, !vm.currentOperation.isEmpty {
-                Text(vm.currentOperation)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-        }
-    }
-
-    private var syncButtons: some View {
-        VStack(spacing: 12) {
-            HStack(spacing: 12) {
-                Button {
-                    vm.startRecentSync()
-                } label: {
-                    Label("Sync Recent Data", systemImage: "arrow.clockwise.icloud.fill")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(Color.blue, in: RoundedRectangle(cornerRadius: 10))
-                        .foregroundStyle(.white)
-                        .font(.subheadline.weight(.semibold))
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(vm.isAnySyncRunning || !selection.isEnabled)
-                .opacity(vm.isAnySyncRunning || !selection.isEnabled ? 0.5 : 1)
-
-                if vm.isAnySyncRunning {
-                    Button {
-                        vm.cancelSync()
-                    } label: {
-                        Label("Cancel", systemImage: "xmark.circle.fill")
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(Color.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
-                            .foregroundStyle(.red)
-                            .font(.subheadline.weight(.semibold))
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-
-            Button("Import / Resume History") {
-                vm.startFullSync()
-            }
-            .disabled(vm.isAnySyncRunning || !selection.isEnabled)
-
-            Button {
-                showFilePicker = true
-            } label: {
-                Label("Import File", systemImage: "doc.badge.plus")
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .background(Color.green, in: RoundedRectangle(cornerRadius: 10))
-                    .foregroundStyle(.white)
-                    .font(.subheadline.weight(.semibold))
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(vm.isAnySyncRunning)
-            .opacity(vm.isAnySyncRunning ? 0.5 : 1)
         }
     }
 

@@ -5,6 +5,8 @@ struct CategoryStatusCard: View {
     var onReset: (() -> Void)? = nil
     var onSync: (() -> Void)? = nil
     var isSyncRunning: Bool = false
+    /// False when the category is turned off in Settings → Apple Health.
+    var isIncluded: Bool = true
 
     @State private var showResetConfirm = false
 
@@ -78,8 +80,9 @@ struct CategoryStatusCard: View {
             }
         }
         .padding(.vertical, 6)
+        .opacity(isIncluded ? 1 : 0.5)
         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-            if !isSyncRunning {
+            if !isSyncRunning && isIncluded {
                 Button {
                     onSync?()
                 } label: {
@@ -115,13 +118,14 @@ struct CategoryStatusCard: View {
             Circle()
                 .fill(statusColor)
                 .frame(width: 7, height: 7)
-            Text(state.status.label)
+            Text(isIncluded ? state.status.label : "Off")
                 .font(.caption)
                 .foregroundStyle(statusColor)
         }
     }
 
     private var statusColor: Color {
+        guard isIncluded else { return .secondary }
         switch state.status {
         case .idle:       return .secondary
         case .syncing:    return .blue
