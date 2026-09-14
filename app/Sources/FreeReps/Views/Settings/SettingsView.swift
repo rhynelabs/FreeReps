@@ -19,7 +19,7 @@ struct SettingsView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("FreeReps Connection")
                                     .font(.subheadline.weight(.semibold))
-                                Text(verbatim: vm.config.host)
+                                Text(verbatim: connectionSummary)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
@@ -131,6 +131,16 @@ struct SettingsView: View {
             .navigationTitle("Settings")
             .onAppear { vm.refreshPermissionsState() }
             .onChange(of: vm.config) { vm.saveConfig() }
+        }
+    }
+
+    private var connectionSummary: String {
+        switch vm.config.connectionMode {
+        case .tailscale:
+            let server = vm.config.tailnetHost.split(separator: ".").first.map(String.init)
+            return server.map { "Tailscale · \($0)" } ?? "Tailscale · not set up"
+        case .address:
+            return vm.config.host.isEmpty ? "No server address" : vm.config.host
         }
     }
 

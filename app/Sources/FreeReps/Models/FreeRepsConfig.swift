@@ -91,12 +91,12 @@ struct FreeRepsConfig: Codable, Equatable {
         self.backfillMonths = backfillMonths
     }
 
-    static let `default` = FreeRepsConfig(
-        host: "freereps.your-tailnet.ts.net",
-        port: 443,
-        useHTTPS: true,
-        backfillMonths: 24
-    )
+    /// New installations start with the in-app Tailscale connection.
+    static let `default`: FreeRepsConfig = {
+        var config = FreeRepsConfig(host: "", port: 443)
+        config.connectionMode = .tailscale
+        return config
+    }()
 
     var usesEmbeddedTailscale: Bool { connectionMode == .tailscale }
 
