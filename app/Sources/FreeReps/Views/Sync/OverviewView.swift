@@ -725,11 +725,19 @@ final class ServerOverview: ObservableObject {
 
 /// A hypnogram of one night in the style of the Health app's sleep detail: one
 /// lane per stage from Awake down to Deep, every stage a chunky rounded bar
-/// placed by its time within the night, every transition a straight vertical
-/// line fading from the color it leaves to the color it enters. The bars are
-/// the only opaque element; the lines are translucent and sit in a faint wide
-/// glow, which is how Health keeps the stages in front and the path behind.
-/// The colors carry the lanes, so there are no row labels.
+/// placed by its time within the night. The colors carry the lanes, so there
+/// are no row labels.
+///
+/// The construction is Health's, as reverse-engineered by the react-native
+/// sleep-stages hypnogram. Two layers. Underneath, one translucent shape in a
+/// vertical gradient of the lane colors: every bar's *halo*, the bar grown by
+/// one rim on each side; every transition a vertical line exactly one rim wide
+/// standing in the column the two neighbouring halos share, from the middle of
+/// one bar to the middle of the next; and at both ends a small concave fillet
+/// that sweeps the line into the halo edge it meets. On top, the opaque bars.
+/// Because the line lives inside the rims and the fillets flare along the halo
+/// edges, the path reads as flowing out of one stage and into the next rather
+/// than as a stroke laid across them.
 ///
 /// Drawn in a single `Canvas`, so a night with sixty stages costs one pass and
 /// no view identity churn.
@@ -741,14 +749,19 @@ struct SleepStagesChart: View {
     @Environment(\.redactionReasons) private var redaction
     @Environment(\.colorScheme) private var scheme
 
-    private static let laneHeight: CGFloat = 26
-    private static let barHeight: CGFloat = 14
-    private static let barRadius: CGFloat = 5
+    /// Lanes are tight on purpose: the bar takes about seven tenths of its
+    /// lane, leaving four points of air between one halo and the next.
+    private static let laneHeight: CGFloat = 24
+    private static let barHeight: CGFloat = 17
+    private static let barRadius: CGFloat = 4.5
+    /// Width of the halo around a bar; the transition line is the same width,
+    /// so it fits the rim column two halos share without overhang.
+    private static let rim: CGFloat = 1.5
+    /// Radius of the sweep where a line meets a halo edge.
+    private static let filletRadius: CGFloat = 3
     /// A stage of a few minutes still has to be visible.
-    private static let minimumBarWidth: CGFloat = 3.5
-    private static let connectorWidth: CGFloat = 2
-    private static let connectorOpacity: Double = 0.45
-    private static let glowOpacity: Double = 0.12
+    private static let minimumBarWidth: CGFloat = 3
+    private static let haloOpacity: Double = 0.3
 
     /// A night with stage detail gets the four Health lanes; a night that only
     /// knows "asleep" gets a single one. Mixed input — an "In Bed" stretch next
@@ -785,58 +798,134 @@ struct SleepStagesChart: View {
         let items = drawn
         let lanes = self.lanes
         return Canvas(opaque: false) { context, size in
+            let rim = Self.rim
             let span = max(end.timeIntervalSince(start), 60)
+            // The first and last halo need room for their rim inside the canvas.
             func position(_ date: Date) -> CGFloat {
                 let fraction = date.timeIntervalSince(start) / span
-                return CGFloat(min(max(fraction, 0), 1)) * size.width
+                return rim + CGFloat(min(max(fraction, 0), 1)) * (size.width - 2 * rim)
             }
             func centerY(_ kind: ServerOverview.Night.Kind) -> CGFloat {
                 let lane = lanes.firstIndex(of: kind) ?? 0
                 return (CGFloat(lane) + 0.5) * Self.laneHeight
             }
-            // A transition stands on the boundary the two stages share and runs
-            // from the middle of one bar to the middle of the next.
-            let transitions: [(line: Path, shading: GraphicsContext.Shading)] = zip(items, items.dropFirst()).compactMap { previous, next in
-                let from = CGPoint(x: position(previous.end), y: centerY(previous.kind))
-                let to = CGPoint(x: from.x, y: centerY(next.kind))
-                guard from.y != to.y else { return nil }
-                var line = Path()
-                line.move(to: from)
-                line.addLine(to: to)
-                let shading = GraphicsContext.Shading.linearGradient(
-                    Gradient(colors: [color(previous.kind), color(next.kind)]),
-                    startPoint: from, endPoint: to)
-                return (line, shading)
-            }
 
-            // Glow, then line, then bars: each layer is translucent so the one
-            // under it shows through, and the bars cover the line ends.
-            context.drawLayer { layer in
-                layer.opacity = Self.glowOpacity
-                for transition in transitions {
-                    layer.stroke(transition.line, with: transition.shading,
-                                 style: StrokeStyle(lineWidth: 3 * Self.connectorWidth))
-                }
-            }
-            context.drawLayer { layer in
-                layer.opacity = Self.connectorOpacity
-                for transition in transitions {
-                    layer.stroke(transition.line, with: transition.shading,
-                                 style: StrokeStyle(lineWidth: Self.connectorWidth))
-                }
-            }
-
-            for stage in items {
+            // A bar ends one rim short of its stage's end: that column belongs
+            // to the halo, and it is where the line to the next stage stands.
+            let bars: [(rect: CGRect, kind: ServerOverview.Night.Kind)] = items.map { stage in
                 let left = position(stage.start)
-                let width = min(max(position(stage.end) - left, Self.minimumBarWidth),
-                                max(size.width - left, Self.minimumBarWidth))
+                let right = min(max(position(stage.end) - rim, left + Self.minimumBarWidth), size.width - rim)
                 let rect = CGRect(x: left, y: centerY(stage.kind) - Self.barHeight / 2,
-                                  width: width, height: Self.barHeight)
-                context.fill(Path(roundedRect: rect, cornerRadius: Self.barRadius),
-                             with: .color(color(stage.kind)))
+                                  width: max(right - left, Self.minimumBarWidth), height: Self.barHeight)
+                return (rect, stage.kind)
+            }
+
+            // One vertical gradient of the lane colors under the whole chart, so
+            // a line takes the color of the lane it passes and a halo the color
+            // of its own bar; the shapes are filled opaque inside one layer and
+            // the layer is what is translucent, so overlaps do not double up.
+            let shading: GraphicsContext.Shading
+            if lanes.count == 1 {
+                shading = .color(color(lanes[0]))
+            } else {
+                let stops = lanes.enumerated().map { index, kind in
+                    Gradient.Stop(color: color(kind), location: centerY(kind) / size.height)
+                }
+                shading = .linearGradient(Gradient(stops: stops),
+                                          startPoint: .zero, endPoint: CGPoint(x: 0, y: size.height))
+            }
+
+            // The opacity has to sit on the context that composites the layer:
+            // set on the layer itself it applies per fill, and the line would
+            // show through the rim it stands in.
+            var underlay = context
+            underlay.opacity = Self.haloOpacity
+            underlay.drawLayer { layer in
+                for bar in bars {
+                    let halo = bar.rect.insetBy(dx: -rim, dy: -rim)
+                    layer.fill(Self.roundedRect(halo, radius: Self.barRadius + rim), with: shading)
+                }
+                for (previous, next) in zip(bars, bars.dropFirst()) where previous.rect.midY != next.rect.midY {
+                    // The line's left edge is the previous bar's end, its right
+                    // edge the next bar's start: the column both halos claim.
+                    let x = previous.rect.maxX
+                    let line = CGRect(x: x, y: min(previous.rect.midY, next.rect.midY),
+                                      width: rim, height: abs(next.rect.midY - previous.rect.midY))
+                    layer.fill(Path(line), with: shading)
+
+                    // The sweeps: one flares left along the edge of the halo the
+                    // line leaves, one flares right along the edge of the halo it
+                    // enters. Health hides them on bars too thin to carry them.
+                    let down = next.rect.midY > previous.rect.midY
+                    let previousHalo = previous.rect.insetBy(dx: -rim, dy: -rim)
+                    let nextHalo = next.rect.insetBy(dx: -rim, dy: -rim)
+                    let gap = down ? nextHalo.minY - previousHalo.maxY : previousHalo.minY - nextHalo.maxY
+                    // The halo corner the line runs through is haloRadius wide;
+                    // the line covers its rim, the patch the rest. A bar too
+                    // thin for a sweep still gets the patch, or the rounding
+                    // would leave a notch beside the line.
+                    let haloRadius = Self.barRadius + rim
+                    func radius(for bar: CGRect) -> CGFloat {
+                        bar.width > 2 * Self.filletRadius ? min(Self.filletRadius, gap) : 0
+                    }
+                    func patch(for bar: CGRect) -> CGSize {
+                        CGSize(width: min(haloRadius - rim, bar.width), height: haloRadius)
+                    }
+                    let leaving = CGPoint(x: x, y: down ? previousHalo.maxY : previousHalo.minY)
+                    layer.fill(Self.fillet(at: leaving, alongX: -1, alongY: down ? 1 : -1,
+                                           radius: radius(for: previous.rect), patch: patch(for: previous.rect)),
+                               with: shading)
+                    if abs(nextHalo.minX - x) < 0.5 {
+                        let entering = CGPoint(x: x + rim, y: down ? nextHalo.minY : nextHalo.maxY)
+                        layer.fill(Self.fillet(at: entering, alongX: 1, alongY: down ? -1 : 1,
+                                               radius: radius(for: next.rect), patch: patch(for: next.rect)),
+                                   with: shading)
+                    }
+                }
+            }
+
+            for bar in bars {
+                context.fill(Self.roundedRect(bar.rect, radius: Self.barRadius), with: .color(color(bar.kind)))
             }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    /// A continuous-corner rounded rect whose radius never exceeds what the
+    /// rect can carry — a one-minute stage is narrower than two corners.
+    private static func roundedRect(_ rect: CGRect, radius: CGFloat) -> Path {
+        let r = min(radius, rect.width / 2, rect.height / 2)
+        return Path(roundedRect: rect, cornerSize: CGSize(width: r, height: r), style: .continuous)
+    }
+
+    /// The concave wedge in the inside corner where a vertical line meets a
+    /// horizontal halo edge: bounded by the line (running `alongY` from the
+    /// corner), the edge (running `alongX` from the corner) and a quarter circle
+    /// tangent to both. Behind the wedge sits a square patch `patch` deep into
+    /// the halo: the halo's own corner is rounded, and without the patch a
+    /// notch stays open between that rounding and the line. The patch is under
+    /// the opaque bar except for the rim, where it squares the halo off the way
+    /// Health does where a line joins. Half a point of overlap into the line
+    /// keeps antialiasing from leaving a hairline seam along the join.
+    private static func fillet(at corner: CGPoint, alongX: CGFloat, alongY: CGFloat,
+                               radius: CGFloat, patch: CGSize) -> Path {
+        let overlap: CGFloat = 0.5
+        let reach = max(radius, patch.width)
+        var path = Path()
+        if radius > 0.5 {
+            let onLine = CGPoint(x: corner.x, y: corner.y + alongY * radius)
+            let onEdge = CGPoint(x: corner.x + alongX * radius, y: corner.y)
+            path.move(to: CGPoint(x: corner.x - alongX * overlap, y: onLine.y))
+            path.addLine(to: onLine)
+            path.addArc(tangent1End: corner, tangent2End: onEdge, radius: radius)
+        } else {
+            path.move(to: CGPoint(x: corner.x - alongX * overlap, y: corner.y))
+        }
+        path.addLine(to: CGPoint(x: corner.x + alongX * reach, y: corner.y))
+        path.addLine(to: CGPoint(x: corner.x + alongX * reach, y: corner.y - alongY * patch.height))
+        path.addLine(to: CGPoint(x: corner.x - alongX * overlap, y: corner.y - alongY * patch.height))
+        path.closeSubpath()
+        return path
     }
 
     private func color(_ kind: ServerOverview.Night.Kind) -> Color {
