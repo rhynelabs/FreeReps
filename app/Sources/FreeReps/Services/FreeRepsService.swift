@@ -122,6 +122,7 @@ actor FreeRepsService {
         let url = try configuration.validatedBaseURL().appendingPathComponent("api/v1/me")
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        request.timeoutInterval = 15
 
         let (data, response) = try await performRequest(request)
 
@@ -165,9 +166,13 @@ actor FreeRepsService {
     }
 
     private func performRequest(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        try Task.checkCancellation()
         do {
             return try await session.data(for: request)
         } catch {
+            if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
+                throw CancellationError()
+            }
             throw FreeRepsError.connectionFailed(error.localizedDescription)
         }
     }

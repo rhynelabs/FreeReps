@@ -276,7 +276,8 @@ final class SyncService: ObservableObject {
 
         do {
             connectFreeReps(config: config)
-            guard freereps != nil else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
+            guard let freereps else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
+            _ = try await freereps.ping()
 
             syncState.updateCategory(categoryID, status: .syncing)
             syncState.currentOperation = "Syncing\u{2026}"
@@ -416,7 +417,8 @@ final class SyncService: ObservableObject {
 
         do {
             connectFreeReps(config: config)
-            guard freereps != nil else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
+            guard let freereps else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
+            _ = try await freereps.ping()
 
             var failedCategories: [String] = []
 
@@ -594,7 +596,8 @@ final class SyncService: ObservableObject {
 
         while cursor < anchor {
             try Task.checkCancellation()
-            guard freereps != nil else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
+            guard let freereps else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
+            _ = try await freereps.ping()
 
             let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
             var windowTotal = 0
@@ -659,7 +662,8 @@ final class SyncService: ObservableObject {
 
         while cursor < anchor {
             try Task.checkCancellation()
-            guard freereps != nil else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
+            guard let freereps else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
+            _ = try await freereps.ping()
 
             let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
             var retries = 0
@@ -742,7 +746,8 @@ final class SyncService: ObservableObject {
             }
 
             connectFreeReps(config: config)
-            guard freereps != nil else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
+            guard let freereps else { throw FreeRepsError.connectionFailed("FreeReps not initialized") }
+            _ = try await freereps.ping()
 
             // Find last sync date from UserDefaults-backed syncState.
             let distantPast = Calendar.current.date(from: DateComponents(year: 2000, month: 1, day: 1))!
