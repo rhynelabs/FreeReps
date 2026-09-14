@@ -997,8 +997,8 @@ final class SyncService: ObservableObject {
 
             // Special categories, one at a time; each is a single Health read.
             let specials: [(id: String, name: String, sync: (Date) async throws -> Int)] = [
-                ("cat_category", "Health Events", { @MainActor date in try await self.syncCategorySamples(since: date) }),
-                ("cat_workouts", "Workouts", { @MainActor date in try await self.syncWorkouts(since: date) }),
+                ("cat_category", "Health Events", { @MainActor date in try await self.syncCategorySamples(since: date, anchored: true) }),
+                ("cat_workouts", "Workouts", { @MainActor date in try await self.syncWorkouts(since: date, anchored: true) }),
                 ("cat_bp", "Blood Pressure", { @MainActor date in try await self.syncBloodPressure(since: date) }),
                 ("cat_ecg", "ECG", { @MainActor date in try await self.syncECG(since: date) }),
                 ("cat_audiogram", "Audiograms", { @MainActor date in try await self.syncAudiograms(since: date) }),
@@ -1353,17 +1353,21 @@ final class SyncService: ObservableObject {
             await uploader.cancel()
             throw error
         }
-        return total
     }
 
     // MARK: - Category sync
 
-    private func syncCategorySamples(since: Date?, until: Date? = nil, insertBatchSize: Int = batchSize) async throws -> Int {
+    /// Uploads category samples such as sleep stages. With `anchored`, each type
+    /// is read through its HealthKit anchor, so only additions since the last
+    /// run come back; the anchors are kept once every type is on the server.
+    private func syncCategorySamples(since: Date?, until: Date? = nil, anchored: Bool = false,
+                                     insertBatchSize: Int = batchSize) async throws -> Int {
         try checkSelection()
         var total = 0
+        var newAnchors: [String: Data] = [:]
         for typeDesc in HealthDataTypes.allCategoryTypes {
             try checkSelection()
-            try await healthKit.streamCategorySamples(typeID: typeDesc.hkIdentifier, from: since, until: until) { hkBatch in
+            func upload(_ hkBatch: [HKCategorySample]) async throws {
                 for batch in hkBatch.chunked(into: insertBatchSize) {
                     let samples = batch.map { s in
                         FreeRepsCategorySample(
@@ -1382,16 +1386,27 @@ final class SyncService: ObservableObject {
                     total += result.category_samples_inserted ?? batch.count
                 }
             }
+            if anchored, let start = since {
+                let key = Self.anchorKey(category: "cat_category", type: typeDesc.id)
+                let changes = try await healthKit.changedCategorySamples(
+                    typeID: typeDesc.hkIdentifier, anchor: syncState.anchors[key], fallbackSince: start)
+                try await upload(changes.added)
+                newAnchors[key] = changes.anchor
+            } else {
+                try await healthKit.streamCategorySamples(typeID: typeDesc.hkIdentifier, from: since, until: until, handler: upload)
+            }
         }
+        syncState.anchors.merge(newAnchors) { _, new in new }
+        return total
     }
 
     // MARK: - Workout sync
 
-    private func syncWorkouts(since: Date?, until: Date? = nil) async throws -> Int {
+    private func syncWorkouts(since: Date?, until: Date? = nil, anchored: Bool = false) async throws -> Int {
         try checkSelection()
         var total = 0
         let hrUnit = HKUnit(from: "count/min")
-        try await healthKit.streamWorkouts(from: since, until: until) { workouts in
+        func upload(_ workouts: [HKWorkout]) async throws {
             for batch in workouts.chunked(into: batchSize) {
                 var hbWorkouts: [FreeRepsWorkout] = []
                 for w in batch {
@@ -1464,6 +1479,14 @@ final class SyncService: ObservableObject {
                 let result = try await ingest(payload)
                 total += result.workouts_inserted ?? batch.count
             }
+        }
+        if anchored, let start = since {
+            let key = Self.anchorKey(category: "cat_workouts", type: "workouts")
+            let changes = try await healthKit.changedWorkouts(anchor: syncState.anchors[key], fallbackSince: start)
+            try await upload(changes.added)
+            syncState.anchors[key] = changes.anchor
+        } else {
+            try await healthKit.streamWorkouts(from: since, until: until, handler: upload)
         }
         return total
     }
