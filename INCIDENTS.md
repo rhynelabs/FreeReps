@@ -54,6 +54,12 @@ per transaction. The full pass starts after the listener, so maintenance can no
 longer make a running container unavailable. A real-Timescale integration test
 covers batching, idempotence, and preservation of direct-source sessions.
 
+After deployment, the server opened its Tailscale listener 2.45 seconds after
+process start and completed the full backfill 155 ms later. A resumed iPhone
+history run then sent 1,571,807 rows in 61.7 seconds through 378 successful
+requests. Median request latency was 241 ms, p90 was 1.03 seconds, there was no
+HTTP 500 or warning, and no requested checkpoint occurred.
+
 **Lesson.** Size ingest concurrency against sustained storage throughput, not
 the fast beginning of a run, and keep idempotent maintenance behind service
 readiness.

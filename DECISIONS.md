@@ -54,6 +54,13 @@ latest-value lookup left on the roadmap: after the merge, a real app launch
 served the first timeseries request in 103 ms and warm requests in 2–4 ms,
 instead of spending about 0.65 seconds in that lookup alone.
 
+A real iPhone continuation after deployment confirmed the combined limit on
+the route-heavy tail of the history: 1,571,807 rows and 121 MB of compressed
+request bodies completed in 61.7 seconds. All 378 requests returned 200, with
+241 ms median and 1.03 seconds p90 latency. Concurrency peaked at four, the
+longest gap between completions was 4.23 seconds, and PostgreSQL requested no
+checkpoint during the run.
+
 **Trigger to re-open.** The database moves to substantially faster storage, its
 memory changes, ingest batches change size, or measurements with the real app
 show that four writers no longer maximize sustained rows per second.
