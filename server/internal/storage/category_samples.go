@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/claude/freereps/internal/models"
+	"github.com/jackc/pgx/v5"
 )
 
 // InsertCategorySamples batch-inserts category sample rows. Returns count inserted.
@@ -32,11 +33,17 @@ func (db *DB) InsertCategorySamples(ctx context.Context, rows []models.CategoryS
 
 	query += strings.Join(valueStrings, ",") + " ON CONFLICT DO NOTHING"
 
-	tag, err := db.Pool.Exec(ctx, query, args...)
-	if err != nil {
-		return 0, fmt.Errorf("inserting category samples: %w", err)
-	}
-	return tag.RowsAffected(), nil
+	// An ingest write: the app re-sends what a lost commit would drop.
+	var inserted int64
+	err := db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("inserting category samples: %w", err)
+		}
+		inserted = tag.RowsAffected()
+		return nil
+	})
+	return inserted, err
 }
 
 // QueryCategorySamples retrieves category samples in a time range for a user,

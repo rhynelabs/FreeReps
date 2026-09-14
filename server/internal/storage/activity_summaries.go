@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/claude/freereps/internal/models"
+	"github.com/jackc/pgx/v5"
 )
 
 // activitySummaryConflictSQL resolves a conflict on the (user_id, date) primary
@@ -69,25 +70,32 @@ func (db *DB) InsertActivitySummaries(ctx context.Context, rows []models.Activit
 
 	query += strings.Join(valueStrings, ",") + activitySummaryConflictSQL
 
-	result, err := db.Pool.Query(ctx, query, args...)
-	if err != nil {
-		return 0, 0, fmt.Errorf("inserting activity summaries: %w", err)
-	}
-	defer result.Close()
+	// An ingest write: the app re-sends what a lost commit would drop.
+	err = db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
+		result, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("inserting activity summaries: %w", err)
+		}
+		defer result.Close()
 
-	for result.Next() {
-		var isInsert bool
-		if err := result.Scan(&isInsert); err != nil {
-			return 0, 0, fmt.Errorf("scanning activity summary insert result: %w", err)
+		for result.Next() {
+			var isInsert bool
+			if err := result.Scan(&isInsert); err != nil {
+				return fmt.Errorf("scanning activity summary insert result: %w", err)
+			}
+			if isInsert {
+				inserted++
+			} else {
+				updated++
+			}
 		}
-		if isInsert {
-			inserted++
-		} else {
-			updated++
+		if err := result.Err(); err != nil {
+			return fmt.Errorf("inserting activity summaries: %w", err)
 		}
-	}
-	if err := result.Err(); err != nil {
-		return 0, 0, fmt.Errorf("inserting activity summaries: %w", err)
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
 	}
 	return inserted, updated, nil
 }

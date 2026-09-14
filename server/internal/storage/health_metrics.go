@@ -297,31 +297,40 @@ func nullableUUID(v *uuid.UUID) pgtype.UUID {
 	return pgtype.UUID{Bytes: *v, Valid: true}
 }
 
+// insertHealthMetricsBatch writes one batch in its own transaction with the
+// commit made asynchronous (withAsyncCommit): one statement, one commit, no
+// wait for the disk.
 func (db *DB) insertHealthMetricsBatch(ctx context.Context, rows []models.HealthMetricRow) (inserted, updated int64, err error) {
 	c := healthMetricColumnsFrom(rows)
 
-	result, err := db.Pool.Query(ctx, insertHealthMetricsSQL,
-		c.times, c.userIDs, c.metricNames, c.sources, c.units,
-		c.qty, c.minVal, c.avgVal, c.maxVal,
-		c.systolic, c.diastolic, c.sourceUUIDs)
-	if err != nil {
-		return 0, 0, fmt.Errorf("inserting health metrics: %w", err)
-	}
-	defer result.Close()
+	err = db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
+		result, err := tx.Query(ctx, insertHealthMetricsSQL,
+			c.times, c.userIDs, c.metricNames, c.sources, c.units,
+			c.qty, c.minVal, c.avgVal, c.maxVal,
+			c.systolic, c.diastolic, c.sourceUUIDs)
+		if err != nil {
+			return fmt.Errorf("inserting health metrics: %w", err)
+		}
+		defer result.Close()
 
-	for result.Next() {
-		var isInsert bool
-		if err := result.Scan(&isInsert); err != nil {
-			return 0, 0, fmt.Errorf("scanning health metric insert result: %w", err)
+		for result.Next() {
+			var isInsert bool
+			if err := result.Scan(&isInsert); err != nil {
+				return fmt.Errorf("scanning health metric insert result: %w", err)
+			}
+			if isInsert {
+				inserted++
+			} else {
+				updated++
+			}
 		}
-		if isInsert {
-			inserted++
-		} else {
-			updated++
+		if err := result.Err(); err != nil {
+			return fmt.Errorf("inserting health metrics: %w", err)
 		}
-	}
-	if err := result.Err(); err != nil {
-		return 0, 0, fmt.Errorf("inserting health metrics: %w", err)
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
 	}
 	return inserted, updated, nil
 }

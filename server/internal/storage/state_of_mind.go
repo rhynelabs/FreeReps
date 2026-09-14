@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/claude/freereps/internal/models"
+	"github.com/jackc/pgx/v5"
 )
 
 // InsertStateOfMind batch-inserts state of mind rows. Returns count inserted.
@@ -32,11 +33,17 @@ func (db *DB) InsertStateOfMind(ctx context.Context, rows []models.StateOfMindRo
 
 	query += strings.Join(valueStrings, ",") + " ON CONFLICT DO NOTHING"
 
-	tag, err := db.Pool.Exec(ctx, query, args...)
-	if err != nil {
-		return 0, fmt.Errorf("inserting state of mind: %w", err)
-	}
-	return tag.RowsAffected(), nil
+	// An ingest write: the app re-sends what a lost commit would drop.
+	var inserted int64
+	err := db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("inserting state of mind: %w", err)
+		}
+		inserted = tag.RowsAffected()
+		return nil
+	})
+	return inserted, err
 }
 
 // QueryStateOfMind retrieves state of mind records in a time range for a user.

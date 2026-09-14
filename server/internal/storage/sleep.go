@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/claude/freereps/internal/models"
+	"github.com/jackc/pgx/v5"
 )
 
 // InsertSleepSession upserts a sleep session (one per date per user).
@@ -56,11 +57,17 @@ func (db *DB) InsertSleepStages(ctx context.Context, rows []models.SleepStageRow
 
 	query += strings.Join(valueStrings, ",") + " ON CONFLICT DO NOTHING"
 
-	tag, err := db.Pool.Exec(ctx, query, args...)
-	if err != nil {
-		return 0, fmt.Errorf("inserting sleep stages: %w", err)
-	}
-	return tag.RowsAffected(), nil
+	// An ingest write: the app re-sends what a lost commit would drop.
+	var inserted int64
+	err := db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("inserting sleep stages: %w", err)
+		}
+		inserted = tag.RowsAffected()
+		return nil
+	})
+	return inserted, err
 }
 
 // SleepSessionResult is a sleep session with optional stage data.

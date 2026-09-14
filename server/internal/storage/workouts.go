@@ -10,6 +10,7 @@ import (
 
 	"github.com/claude/freereps/internal/models"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // alphaWorkoutNamespace is the UUID namespace for deterministic synthetic Alpha workout IDs.
@@ -84,11 +85,17 @@ func (db *DB) InsertWorkoutHeartRate(ctx context.Context, rows []models.WorkoutH
 
 	query += strings.Join(valueStrings, ",") + " ON CONFLICT DO NOTHING"
 
-	tag, err := db.Pool.Exec(ctx, query, args...)
-	if err != nil {
-		return 0, fmt.Errorf("inserting workout heart rate: %w", err)
-	}
-	return tag.RowsAffected(), nil
+	// An ingest write: the app re-sends what a lost commit would drop.
+	var inserted int64
+	err := db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("inserting workout heart rate: %w", err)
+		}
+		inserted = tag.RowsAffected()
+		return nil
+	})
+	return inserted, err
 }
 
 // InsertWorkoutRoutes batch-inserts workout route points. Returns count inserted.
@@ -124,11 +131,18 @@ func (db *DB) InsertWorkoutRoutes(ctx context.Context, rows []models.WorkoutRout
 
 		query += strings.Join(valueStrings, ",") + " ON CONFLICT DO NOTHING"
 
-		tag, err := db.Pool.Exec(ctx, query, args...)
+		// An ingest write: the app re-sends what a lost commit would drop.
+		err := db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, query, args...)
+			if err != nil {
+				return fmt.Errorf("inserting workout routes: %w", err)
+			}
+			total += tag.RowsAffected()
+			return nil
+		})
 		if err != nil {
-			return total, fmt.Errorf("inserting workout routes: %w", err)
+			return total, err
 		}
-		total += tag.RowsAffected()
 	}
 	return total, nil
 }

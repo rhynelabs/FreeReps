@@ -19,6 +19,43 @@ is as recorded there; where the record named no alternative, none is claimed.
 
 ---
 
+## 2026-09-14 — Ingest batches commit without waiting for the disk
+
+**Decided:** 2026-09-14
+
+**Decision.** Every batch insert on the health ingest path — `health_metrics`,
+`activity_summaries`, `sleep_stages`, `category_samples`, `state_of_mind`,
+`workout_heart_rate`, `workout_routes` — runs inside its own transaction that
+issues `SET LOCAL synchronous_commit = off` before the statement
+(`withAsyncCommit`, `server/internal/storage/async_commit.go`). The setting
+ends with the transaction; every other write, and every read, stays
+synchronous. User, settings and credential writes are not touched.
+
+**Reasoning.** Measured on the deployed server (PostgreSQL/TimescaleDB in
+Docker on a NAS): a 5,000-row `health_metrics` batch took 654 ms median with
+three requests in flight and 3,006 ms median (p90 8.7 s) with twenty-odd,
+while total throughput stayed at 15,000–17,000 rows/s. The database was the
+bottleneck and it did not scale with concurrency — the shape of a disk
+serialising commits, not of CPU work. The Go side of a batch — gunzip, decode,
+conversion, dedupe, transpose — benchmarks at about 10 ms
+(`BenchmarkIngestGoSide`), so there was nothing to win there.
+
+Losing a commit is harmless here because every row the app sends can be sent
+again: the app keeps an anchor or cursor per category and only advances it on
+a 200, and the server dedupes on the unique index, so a crash that loses the
+last few hundred milliseconds of commits costs nothing the next sync does not
+restore. That property is what makes the trade safe, and it is specific to
+these tables — it does not hold for a user record or an OAuth token, which is
+why the setting is local to the ingest transactions rather than a server-wide
+`synchronous_commit = off`.
+
+**Trigger to re-open.** A source that cannot re-send — a webhook that delivers
+once, a push from a device that discards after acknowledgement — writing
+through one of these paths. That source needs a synchronous commit, which
+means either a separate insert path or a flag on `withAsyncCommit`.
+
+---
+
 ## 2026-09-14 — `/api/v1/stats` estimates the metric row count and is not cached
 
 **Decided:** 2026-09-14
