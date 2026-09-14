@@ -686,9 +686,10 @@ final class ServerOverview: ObservableObject {
                      latest: (json["latest_data"] as? String).flatMap(date))
     }
 
-    /// The newest session the server holds. Falls back to the newest stretch of
-    /// sleep stages: the server builds the session from them after an upload,
-    /// and until it has, the stages are what it holds.
+    /// The newest night the server holds, whether as a session or only as
+    /// sleep stages: the server builds the session from the stages after an
+    /// upload, and until it has, the stages are what it holds — so the stages
+    /// can reach a night newer than any session.
     private static func decodeLastNight(_ data: Data) -> Night? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
 
@@ -713,7 +714,6 @@ final class ServerOverview: ObservableObject {
                 .map { Night.Stage(start: $0.start, end: $0.end, kind: $0.kind) }
             return Night(hours: hours, start: start, end: end, stages: within)
         }
-        if let night = sessions.max(by: { $0.end < $1.end }) { return night }
 
         // A break of more than three hours separates a nap from the night.
         var night: [(start: Date, end: Date, kind: Night.Kind, hours: Double)] = []
@@ -721,11 +721,27 @@ final class ServerOverview: ObservableObject {
             if let last = night.last, stage.start.timeIntervalSince(last.end) > 3 * 3600 { night = [] }
             night.append(stage)
         }
-        guard let first = night.first, let last = night.last else { return nil }
-        let hours = night.reduce(0) { $0 + $1.hours }
-        guard hours > 0 else { return nil }
-        return Night(hours: hours, start: first.start, end: last.end,
-                     stages: night.map { Night.Stage(start: $0.start, end: $0.end, kind: $0.kind) })
+        var stageNight: Night?
+        if let first = night.first, let last = night.last {
+            let hours = night.reduce(0) { $0 + $1.hours }
+            if hours > 0 {
+                stageNight = Night(hours: hours, start: first.start, end: last.end,
+                                   stages: night.map { Night.Stage(start: $0.start, end: $0.end, kind: $0.kind) })
+            }
+        }
+        return newestNight(sessions: sessions, stageNight: stageNight)
+    }
+
+    /// The newest session, unless the stages hold a night newer than every
+    /// session. A stage night that overlaps the newest session is that
+    /// session's own detail, not a newer night — its last stage may end a
+    /// little after the session does — so the session's numbers stay.
+    static func newestNight(sessions: [Night], stageNight: Night?) -> Night? {
+        let session = sessions.max(by: { $0.end < $1.end })
+        guard let stageNight else { return session }
+        guard let session else { return stageNight }
+        let sameNight = stageNight.start < session.end && stageNight.end > session.start
+        return !sameNight && stageNight.end > session.end ? stageNight : session
     }
 
     private static func date(_ text: String) -> Date? {
