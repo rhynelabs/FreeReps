@@ -19,82 +19,40 @@ is as recorded there; where the record named no alternative, none is claimed.
 
 ---
 
-## 2026-09-14 — A re-uploaded aggregate is refreshed, a sample never
+## 2026-09-14 — `/api/v1/stats` estimates the metric row count and is not cached
 
 **Decided:** 2026-09-14
 
-**Decision.** `InsertHealthMetrics`
-(`server/internal/storage/health_metrics.go`) inserts through
-`unnest()` of twelve arrays and resolves a conflict on
-`idx_health_metrics_dedup` with `DO UPDATE`, guarded by
-`health_metrics.source_uuid IS NULL AND EXCLUDED.source_uuid IS NULL` and by
-an `IS DISTINCT FROM` comparison of the four value columns. A row that carries
-a HealthKit sample UUID on either side of the conflict is left untouched, as is
-an aggregate whose values did not change. The call returns inserted and updated
-counts separately, and `metrics_inserted` in the ingest result keeps meaning
-"rows that did not exist before".
+**Decision.** `GetDataStats` (`server/internal/storage/stats.go`) takes
+`total_metric_rows` from the planner — `EXPLAIN (FORMAT JSON) SELECT 1 FROM
+health_metrics WHERE user_id = $1`, top node's `Plan Rows` — and runs the
+exact `COUNT(*)` only when that estimate is under 200,000. The counts of
+workouts, sleep nights and sets, the earliest/latest timestamps and the
+per-type workout summary stay exact. The response is not cached on the
+server.
 
-**Reasoning.** The iOS app computes hourly buckets for steps, energy and
-distance with `HKStatisticsCollectionQuery` and gives them no source UUID. The
-bucket for the running hour is uploaded before the hour is over, and the watch
-delivers its samples late, so the same bucket legitimately arrives again with
-a larger sum. Under `ON CONFLICT DO NOTHING` the second version was dropped
-without a trace and today's totals froze at whatever the first upload of each
-hour had seen. Rows that came from individual samples are a different kind of
-data — HealthKit does not revise a sample, so a second copy is a duplicate, not
-an update, and overwriting one would rewrite history that was correct. The UUID
-is what distinguishes the two, which is why the guard tests it on both sides
-rather than inferring from the metric name.
+**Reasoning.** The endpoint was the slowest one the iPhone trace showed —
+507 ms median, 4.6 s worst — and the app's Overview calls it after every
+sync, 120 times an hour. All of that was the exact count over
+`health_metrics`, the one table that grows without bound; every other query
+in the handler is an index probe or a scan of a small table. The estimate
+reads no table data and is per user, which TimescaleDB's
+`approximate_row_count` is not: that sums chunk statistics for the whole
+table, and the figure is shown per user. The exact count stays for small
+tables because that is where the statistics are least trustworthy (a chunk
+that has not been analysed since its first rows) and where the count is
+cheap anyway. A display of "217,226 metric rows" tolerates the lag of
+autovacuum's statistics; nothing computes with the number.
 
-`DO NOTHING` stays the rule for sleep sessions (`sleep_sessions`), where the
-2026-03-26 incident had a cross-source backfill overwrite sessions a direct
-source had produced. That is a different table and a different failure: there,
-a derived value was overwriting a measured one; here, an aggregate is replacing
-its own earlier, incomplete self.
+A per-user cache was considered and dropped: the caller that dominates the
+traffic reloads right after its own ingest, so a cache invalidated on ingest
+would never serve it, and one not invalidated would show the user a count
+that ignores the sync they just watched finish.
 
-The rewrite to `unnest()` is the same change: a 5,000-row batch used to be a
-statement with 60,000 parameters that Postgres parsed and planned afresh every
-time, and such a batch took about a second on the deployed server. The arrays make the statement
-text and the parameter count constant. Rows are deduplicated by conflict key in
-Go before the insert, because `DO UPDATE` aborts a statement that would touch
-one row twice where `DO NOTHING` quietly dropped the repeat.
-
-The same rule applies to `activity_summaries` (`InsertActivitySummaries`,
-`server/internal/storage/activity_summaries.go`). A day's rings are an
-aggregate that grows until midnight, and the app sends the current day with
-every sync; under `DO NOTHING` the first upload of the day won and the server
-showed the morning's near-zero values all day. That table holds no samples, so
-there is no UUID to guard on: every row that conflicts on `(user_id, date)` is
-refreshed when its six values differ, and left alone when they do not. The
-result reports refreshed days as `activity_summaries_updated`.
-
-**Trigger to re-open.** A source that revises individual samples, an aggregated
-metric that arrives with a source UUID, or a per-metric rule about which
-columns a refresh may overwrite.
-
----
-
-## 2026-09-14 — Identity is cached per login for one minute
-
-**Decided:** 2026-09-14
-
-**Decision.** The Tailscale identity middleware keeps `login → user ID` in
-memory (`server/internal/server/middleware.go`, `cachedUserStore`) and runs
-the `users` upsert only for a login it has not seen, or not touched, within
-the last minute. `WhoIs` still runs on every request.
-
-**Reasoning.** The upsert is `INSERT … ON CONFLICT DO UPDATE SET last_seen =
-NOW()` on one row, one transaction per request. Every request of the same
-user queues on that row lock, so the identity check serialized the parallel
-history uploads it authenticated: five in flight raised throughput 1.8× and
-latency 2.5×. Nothing reads `users.last_seen` at request time; a value up to a
-minute old changes no behaviour. `WhoIs` is not cached because it is an
-in-process lookup in the tsnet node's netmap, not a network call, and caching
-it would keep a revoked device authenticated for the cache lifetime.
-
-**Trigger to re-open.** A consumer of `last_seen` that needs request
-resolution, or a per-request check on the user row (a disabled flag, a quota)
-that the cache would bypass.
+**Trigger to re-open.** A consumer that computes with `total_metric_rows`
+rather than displays it, or a hypertable with enough chunks that the planning
+pass itself becomes the cost — at which point `approximate_row_count` plus a
+per-user share from `pg_stats` is the next cheaper step.
 
 ---
 
