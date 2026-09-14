@@ -23,9 +23,10 @@ struct SyncDashboardView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(vm.isFullSyncRunning ? "Syncing Older Data" : "Syncing New Data")
                                     .font(.headline)
-                                Text(vm.currentOperation.isEmpty ? "Reading Apple Health\u{2026}" : vm.currentOperation)
+                                Text(runningSubtitle)
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
+                                    .lineLimit(1)
                             }
                         }
                         .padding(.vertical, 4)
@@ -72,7 +73,7 @@ struct SyncDashboardView: View {
                 }
 
                 // Category cards
-                Section("Categories") {
+                Section {
                     ForEach(vm.categories) { cat in
                         CategoryStatusCard(
                             state: cat,
@@ -82,6 +83,15 @@ struct SyncDashboardView: View {
                             isIncluded: selection.isEnabled && selection.includes(cat.id),
                             olderData: cat.id == "cat_strength" ? nil : vm.syncState.olderDataProgress(for: cat.id)
                         )
+                    }
+                } header: {
+                    Text("Categories")
+                } footer: {
+                    // The full account of the run, with the rows the server has
+                    // acknowledged per category, lives here rather than in the
+                    // header: it grows to six lines while categories run side by side.
+                    if vm.isAnySyncRunning && !vm.currentOperation.isEmpty {
+                        Text(vm.currentOperation)
                     }
                 }
 
@@ -128,6 +138,16 @@ struct SyncDashboardView: View {
                     importState.showResult = true
                 }
             }
+        }
+    }
+
+    /// One line under the title; the category rows carry the detail.
+    private var runningSubtitle: String {
+        let running = vm.categories.filter { $0.status.isActive }.count
+        switch running {
+        case 0: return "Reading Apple Health\u{2026}"
+        case 1: return "1 category running"
+        default: return "\(running) categories running"
         }
     }
 
