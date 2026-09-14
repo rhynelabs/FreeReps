@@ -209,7 +209,7 @@ func (s *Syncer) insertMetrics(ctx context.Context, rows []models.HealthMetricRo
 	if len(rows) == 0 {
 		return nil
 	}
-	inserted, err := s.db.InsertHealthMetrics(ctx, rows)
+	inserted, _, err := s.db.InsertHealthMetrics(ctx, rows)
 	if err != nil {
 		return err
 	}

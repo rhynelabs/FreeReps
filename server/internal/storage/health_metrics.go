@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/claude/freereps/internal/models"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // sourcePriorityCaseSQL generates a SQL CASE expression that maps source values
@@ -108,55 +110,220 @@ var cumulativeMetrics = map[string]bool{
 	TrainingTonnageMetric: true,
 }
 
-// maxParamsPerBatch is the PostgreSQL extended protocol parameter limit (65535)
-// divided by 12 parameters per row, with headroom.
+// maxRowsPerBatch bounds one INSERT.
+//
+// It no longer has anything to do with the 65535-parameter limit of the
+// extended protocol: the rows travel as twelve arrays, so a statement costs
+// twelve parameters whatever its length. What the bound still does is cap the
+// memory one statement holds at once — the twelve arrays plus the RETURNING
+// result — so a client that uploads its whole history in one request does not
+// materialize it all in the server.
 const maxRowsPerBatch = 5000
 
-// InsertHealthMetrics batch-inserts health metric rows. Returns the number actually inserted
-// (skipped duplicates via ON CONFLICT DO NOTHING).
-func (db *DB) InsertHealthMetrics(ctx context.Context, rows []models.HealthMetricRow) (int64, error) {
+// insertHealthMetricsSQL inserts a batch given as twelve arrays and refreshes
+// aggregated rows that changed.
+//
+// unnest() expands the arrays back into rows, which keeps the statement text
+// and the parameter count constant: 5,000 rows used to mean 60,000 parameters
+// and a statement Postgres had to parse and plan from scratch every time.
+//
+// The conflict target names the columns of idx_health_metrics_dedup
+// (migrations/000001_init.up.sql), in its order. TimescaleDB accepts
+// ON CONFLICT ... DO UPDATE on a hypertable when the arbiter index contains the
+// partitioning column, which `time` is; it also refuses to create a unique
+// index on a hypertable without that column, so the two constraints agree and
+// the target stays valid as long as the index exists.
+//
+// The guard is what separates the two kinds of row that share this table.
+// Hourly buckets the app computes itself (steps, energy, distance) carry no
+// source UUID and are re-sent with a larger sum as the hour fills, so they have
+// to be refreshed; a row that came from an individual HealthKit sample is
+// immutable and is never touched, whichever side of the conflict it sits on.
+// The IS DISTINCT FROM clause keeps an unchanged re-upload from writing a new
+// row version, which would be dead weight in a compressed chunk.
+//
+// RETURNING (xmax = 0) reports per row whether it was inserted rather than
+// updated, so the caller can keep counting new rows separately from refreshed
+// ones. A conflicting row the guard rejects is not returned at all — it is
+// neither inserted nor updated.
+const insertHealthMetricsSQL = `INSERT INTO health_metrics (time, user_id, metric_name, source, units, qty, min_val, avg_val, max_val, systolic, diastolic, source_uuid)
+SELECT * FROM unnest($1::timestamptz[], $2::int[], $3::text[], $4::text[], $5::text[], $6::float8[], $7::float8[], $8::float8[], $9::float8[], $10::float8[], $11::float8[], $12::uuid[])
+ON CONFLICT (metric_name, source, time, user_id) DO UPDATE SET
+	qty = EXCLUDED.qty,
+	min_val = EXCLUDED.min_val,
+	avg_val = EXCLUDED.avg_val,
+	max_val = EXCLUDED.max_val,
+	units = EXCLUDED.units
+WHERE health_metrics.source_uuid IS NULL
+  AND EXCLUDED.source_uuid IS NULL
+  AND (health_metrics.qty IS DISTINCT FROM EXCLUDED.qty
+    OR health_metrics.min_val IS DISTINCT FROM EXCLUDED.min_val
+    OR health_metrics.avg_val IS DISTINCT FROM EXCLUDED.avg_val
+    OR health_metrics.max_val IS DISTINCT FROM EXCLUDED.max_val)
+RETURNING (xmax = 0)`
+
+// InsertHealthMetrics batch-inserts health metric rows. It returns how many rows
+// were new and how many existing aggregated rows it refreshed; rows that
+// conflicted without being refreshed are counted in neither.
+func (db *DB) InsertHealthMetrics(ctx context.Context, rows []models.HealthMetricRow) (inserted, updated int64, err error) {
 	if len(rows) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 
-	var totalInserted int64
+	rows = dedupeHealthMetricRows(rows)
+
 	for start := 0; start < len(rows); start += maxRowsPerBatch {
 		end := start + maxRowsPerBatch
 		if end > len(rows) {
 			end = len(rows)
 		}
-		inserted, err := db.insertHealthMetricsBatch(ctx, rows[start:end])
+		batchInserted, batchUpdated, err := db.insertHealthMetricsBatch(ctx, rows[start:end])
+		inserted += batchInserted
+		updated += batchUpdated
 		if err != nil {
-			return totalInserted, err
+			return inserted, updated, err
 		}
-		totalInserted += inserted
 	}
-	return totalInserted, nil
+	return inserted, updated, nil
 }
 
-func (db *DB) insertHealthMetricsBatch(ctx context.Context, rows []models.HealthMetricRow) (int64, error) {
-	query := `INSERT INTO health_metrics (time, user_id, metric_name, source, units, qty, min_val, avg_val, max_val, systolic, diastolic, source_uuid)
-VALUES `
-	args := make([]any, 0, len(rows)*12)
-	valueStrings := make([]string, 0, len(rows))
+// dedupeHealthMetricRows keeps the last row per conflict key.
+//
+// ON CONFLICT DO UPDATE refuses to touch the same row twice in one statement
+// and aborts the whole INSERT when it would ("cannot affect row a second
+// time"), where DO NOTHING silently dropped the repeat. A payload that carries
+// the same bucket twice — the app retrying a partial upload inside one request
+// — must not turn into a failed batch, and the later copy is the one that
+// should win.
+//
+// The key is the unique index, with the timestamp in microseconds because that
+// is the resolution timestamptz stores: two times that differ by less
+// than that are one row to Postgres.
+func dedupeHealthMetricRows(rows []models.HealthMetricRow) []models.HealthMetricRow {
+	type conflictKey struct {
+		metricName string
+		source     string
+		micros     int64
+		userID     int
+	}
 
+	lastAt := make(map[conflictKey]int, len(rows))
 	for i, r := range rows {
-		base := i * 12
-		valueStrings = append(valueStrings, fmt.Sprintf(
-			"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10, base+11, base+12,
-		))
-		args = append(args, r.Time, r.UserID, r.MetricName, r.Source, r.Units,
-			r.Qty, r.MinVal, r.AvgVal, r.MaxVal, r.Systolic, r.Diastolic, r.SourceUUID)
+		lastAt[conflictKey{r.MetricName, r.Source, r.Time.UnixMicro(), r.UserID}] = i
+	}
+	if len(lastAt) == len(rows) {
+		return rows
 	}
 
-	query += strings.Join(valueStrings, ",") + " ON CONFLICT DO NOTHING"
+	kept := make([]models.HealthMetricRow, 0, len(lastAt))
+	for i, r := range rows {
+		if lastAt[conflictKey{r.MetricName, r.Source, r.Time.UnixMicro(), r.UserID}] == i {
+			kept = append(kept, r)
+		}
+	}
+	return kept
+}
 
-	tag, err := db.Pool.Exec(ctx, query, args...)
+// healthMetricColumns is one batch turned on its side: twelve parallel arrays,
+// the shape unnest() expands back into rows.
+type healthMetricColumns struct {
+	times       []time.Time
+	userIDs     []int32
+	metricNames []string
+	sources     []string
+	units       []string
+	qty         []pgtype.Float8
+	minVal      []pgtype.Float8
+	avgVal      []pgtype.Float8
+	maxVal      []pgtype.Float8
+	systolic    []pgtype.Float8
+	diastolic   []pgtype.Float8
+	sourceUUIDs []pgtype.UUID
+}
+
+// healthMetricColumnsFrom transposes rows into the arrays the insert binds.
+//
+// The nullable columns use pgtype rather than *float64 and *uuid.UUID because a
+// Go slice of pointers encodes as an array of that element type only if every
+// element is addressable the same way; the pgtype values carry their own Valid
+// flag, so a nil pointer becomes SQL NULL instead of a zero.
+func healthMetricColumnsFrom(rows []models.HealthMetricRow) healthMetricColumns {
+	c := healthMetricColumns{
+		times:       make([]time.Time, len(rows)),
+		userIDs:     make([]int32, len(rows)),
+		metricNames: make([]string, len(rows)),
+		sources:     make([]string, len(rows)),
+		units:       make([]string, len(rows)),
+		qty:         make([]pgtype.Float8, len(rows)),
+		minVal:      make([]pgtype.Float8, len(rows)),
+		avgVal:      make([]pgtype.Float8, len(rows)),
+		maxVal:      make([]pgtype.Float8, len(rows)),
+		systolic:    make([]pgtype.Float8, len(rows)),
+		diastolic:   make([]pgtype.Float8, len(rows)),
+		sourceUUIDs: make([]pgtype.UUID, len(rows)),
+	}
+	for i, r := range rows {
+		c.times[i] = r.Time
+		c.userIDs[i] = int32(r.UserID)
+		c.metricNames[i] = r.MetricName
+		c.sources[i] = r.Source
+		c.units[i] = r.Units
+		c.qty[i] = nullableFloat8(r.Qty)
+		c.minVal[i] = nullableFloat8(r.MinVal)
+		c.avgVal[i] = nullableFloat8(r.AvgVal)
+		c.maxVal[i] = nullableFloat8(r.MaxVal)
+		c.systolic[i] = nullableFloat8(r.Systolic)
+		c.diastolic[i] = nullableFloat8(r.Diastolic)
+		c.sourceUUIDs[i] = nullableUUID(r.SourceUUID)
+	}
+	return c
+}
+
+// nullableFloat8 maps a nil pointer to SQL NULL rather than to 0.0, which for
+// qty would read as a measured zero.
+func nullableFloat8(v *float64) pgtype.Float8 {
+	if v == nil {
+		return pgtype.Float8{}
+	}
+	return pgtype.Float8{Float64: *v, Valid: true}
+}
+
+// nullableUUID maps a nil pointer to SQL NULL, which is also what marks a row
+// as aggregated rather than a single sample.
+func nullableUUID(v *uuid.UUID) pgtype.UUID {
+	if v == nil {
+		return pgtype.UUID{}
+	}
+	return pgtype.UUID{Bytes: *v, Valid: true}
+}
+
+func (db *DB) insertHealthMetricsBatch(ctx context.Context, rows []models.HealthMetricRow) (inserted, updated int64, err error) {
+	c := healthMetricColumnsFrom(rows)
+
+	result, err := db.Pool.Query(ctx, insertHealthMetricsSQL,
+		c.times, c.userIDs, c.metricNames, c.sources, c.units,
+		c.qty, c.minVal, c.avgVal, c.maxVal,
+		c.systolic, c.diastolic, c.sourceUUIDs)
 	if err != nil {
-		return 0, fmt.Errorf("inserting health metrics: %w", err)
+		return 0, 0, fmt.Errorf("inserting health metrics: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	defer result.Close()
+
+	for result.Next() {
+		var isInsert bool
+		if err := result.Scan(&isInsert); err != nil {
+			return 0, 0, fmt.Errorf("scanning health metric insert result: %w", err)
+		}
+		if isInsert {
+			inserted++
+		} else {
+			updated++
+		}
+	}
+	if err := result.Err(); err != nil {
+		return 0, 0, fmt.Errorf("inserting health metrics: %w", err)
+	}
+	return inserted, updated, nil
 }
 
 // QueryHealthMetrics retrieves health metrics by name and time range.

@@ -146,12 +146,15 @@ func (p *Provider) processMetrics(ctx context.Context, metrics []models.HealthMe
 
 	// Batch insert health metrics
 	if len(healthRows) > 0 {
-		inserted, err := p.db.InsertHealthMetrics(ctx, healthRows)
+		inserted, updated, err := p.db.InsertHealthMetrics(ctx, healthRows)
 		if err != nil {
 			return fmt.Errorf("inserting health metrics: %w", err)
 		}
 		result.MetricsInserted = inserted
-		result.MetricsSkipped = int64(len(healthRows)) - inserted
+		result.MetricsUpdated = updated
+		// Skipped means "the store already had this and kept it": a refreshed
+		// aggregate belongs to neither count.
+		result.MetricsSkipped = int64(len(healthRows)) - inserted - updated
 	}
 
 	return nil
@@ -275,7 +278,7 @@ func (p *Provider) processSleep(ctx context.Context, m models.HealthMetric, user
 				Units:      "hr",
 				Qty:        &qty,
 			}
-			if _, err := p.db.InsertHealthMetrics(ctx, []models.HealthMetricRow{sleepMetric}); err != nil {
+			if _, _, err := p.db.InsertHealthMetrics(ctx, []models.HealthMetricRow{sleepMetric}); err != nil {
 				p.log.Warn("failed to insert sleep_analysis metric", "error", err)
 			}
 

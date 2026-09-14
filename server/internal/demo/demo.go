@@ -30,7 +30,8 @@ func Seed(ctx context.Context, db *storage.DB, log *slog.Logger) error {
 
 	log.Info("demo: seeding database", "days", daysBack, "start", start.Format("2006-01-02"))
 
-	// Health metrics (batch to stay under PostgreSQL 65535 param limit; 12 params/row → 5000 rows/batch)
+	// Health metrics, in batches so the log reports progress on a seed that
+	// generates years of data; the store chunks them again for the wire.
 	metrics := generateHealthMetrics(rng, start, now)
 	var totalInserted int64
 	const metricBatchSize = 5000
@@ -39,7 +40,7 @@ func Seed(ctx context.Context, db *storage.DB, log *slog.Logger) error {
 		if end > len(metrics) {
 			end = len(metrics)
 		}
-		n, err := db.InsertHealthMetrics(ctx, metrics[i:end])
+		n, _, err := db.InsertHealthMetrics(ctx, metrics[i:end])
 		if err != nil {
 			return fmt.Errorf("demo: insert health metrics batch %d: %w", i/metricBatchSize, err)
 		}

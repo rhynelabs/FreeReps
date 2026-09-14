@@ -4,6 +4,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/claude/freereps/internal/models"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // TestSourcePriorityCaseSQL verifies that the SQL CASE expression correctly
@@ -190,5 +194,144 @@ func TestDedupCTEMultiMetric(t *testing.T) {
 		if !strings.Contains(cte, check) {
 			t.Errorf("dedupCTEMultiMetric missing %q in:\n%s", check, cte)
 		}
+	}
+}
+
+// TestInsertHealthMetricsSQLRefreshesOnlyAggregates exists because the guard on
+// the ON CONFLICT clause is the only thing standing between a re-uploaded batch
+// and overwritten sample data. Nothing about a dropped guard fails loudly: the
+// insert still succeeds, and the damage shows up as history that quietly
+// changed. The statement text is asserted so an edit has to be deliberate.
+func TestInsertHealthMetricsSQLRefreshesOnlyAggregates(t *testing.T) {
+	checks := []string{
+		// One statement, twelve parameters, whatever the row count.
+		"SELECT * FROM unnest($1::timestamptz[]",
+		"$12::uuid[])",
+		// The columns of idx_health_metrics_dedup, time included, which is what
+		// lets TimescaleDB accept the clause on a hypertable at all.
+		"ON CONFLICT (metric_name, source, time, user_id) DO UPDATE SET",
+		// Both sides have to be aggregates for the refresh to happen.
+		"WHERE health_metrics.source_uuid IS NULL",
+		"AND EXCLUDED.source_uuid IS NULL",
+		// An unchanged re-upload writes no new row version.
+		"health_metrics.qty IS DISTINCT FROM EXCLUDED.qty",
+		// Inserted rows stay countable apart from refreshed ones.
+		"RETURNING (xmax = 0)",
+	}
+
+	for _, check := range checks {
+		if !strings.Contains(insertHealthMetricsSQL, check) {
+			t.Errorf("insertHealthMetricsSQL missing %q in:\n%s", check, insertHealthMetricsSQL)
+		}
+	}
+
+	// DO NOTHING is the behaviour this replaced; it would freeze today's
+	// hourly totals again without changing anything a test could observe.
+	if strings.Contains(insertHealthMetricsSQL, "DO NOTHING") {
+		t.Errorf("the conflict clause is back to DO NOTHING:\n%s", insertHealthMetricsSQL)
+	}
+}
+
+// TestHealthMetricColumnsFromEncodesNulls covers the reason the arrays hold
+// pgtype values rather than pointers: a nil pointer has to reach Postgres as
+// NULL. A qty of 0.0 where NULL was meant reads as a measured zero, and a
+// zeroed source_uuid would make a sample row look like an aggregate — which is
+// exactly the row the conflict guard then refreshes.
+func TestHealthMetricColumnsFromEncodesNulls(t *testing.T) {
+	qty := 1234.5
+	sampleID := uuid.MustParse("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	ts := time.Date(2026, 9, 14, 8, 0, 0, 0, time.UTC)
+
+	c := healthMetricColumnsFrom([]models.HealthMetricRow{
+		{
+			Time:       ts,
+			UserID:     7,
+			MetricName: "step_count",
+			Source:     "",
+			Units:      "count",
+			Qty:        &qty,
+		},
+		{
+			Time:       ts,
+			UserID:     7,
+			MetricName: "heart_rate",
+			Source:     "Apple Watch",
+			Units:      "count/min",
+			AvgVal:     &qty,
+			SourceUUID: &sampleID,
+		},
+	})
+
+	if len(c.times) != 2 || c.times[0] != ts {
+		t.Fatalf("unexpected time column: %v", c.times)
+	}
+	if c.userIDs[0] != 7 || c.metricNames[1] != "heart_rate" || c.sources[1] != "Apple Watch" {
+		t.Errorf("unexpected scalar columns: %v %v %v", c.userIDs, c.metricNames, c.sources)
+	}
+
+	if !c.qty[0].Valid || c.qty[0].Float64 != qty {
+		t.Errorf("qty with a value did not survive: %+v", c.qty[0])
+	}
+	if c.qty[1].Valid {
+		t.Errorf("a nil qty has to be NULL, not %v", c.qty[1].Float64)
+	}
+	if !c.avgVal[1].Valid || c.avgVal[1].Float64 != qty {
+		t.Errorf("avg_val with a value did not survive: %+v", c.avgVal[1])
+	}
+	for name, col := range map[string]pgtype.Float8{
+		"min_val":   c.minVal[0],
+		"max_val":   c.maxVal[0],
+		"systolic":  c.systolic[0],
+		"diastolic": c.diastolic[0],
+	} {
+		if col.Valid {
+			t.Errorf("%s should be NULL, got %v", name, col.Float64)
+		}
+	}
+
+	// The aggregated row carries no UUID; the sample row carries its own.
+	if c.sourceUUIDs[0].Valid {
+		t.Errorf("an aggregated row must have a NULL source_uuid, got %x", c.sourceUUIDs[0].Bytes)
+	}
+	if !c.sourceUUIDs[1].Valid || c.sourceUUIDs[1].Bytes != sampleID {
+		t.Errorf("sample UUID did not survive: %+v", c.sourceUUIDs[1])
+	}
+}
+
+// TestDedupeHealthMetricRowsKeepsTheLast exists because ON CONFLICT DO UPDATE
+// aborts the whole statement when one row would be touched twice, where the old
+// DO NOTHING dropped the repeat silently. A payload that repeats a bucket must
+// still be accepted, with the later value winning.
+func TestDedupeHealthMetricRowsKeepsTheLast(t *testing.T) {
+	ts := time.Date(2026, 9, 14, 8, 0, 0, 0, time.UTC)
+	early, late, other := 100.0, 250.0, 42.0
+
+	rows := []models.HealthMetricRow{
+		{Time: ts, UserID: 1, MetricName: "step_count", Qty: &early},
+		{Time: ts, UserID: 1, MetricName: "active_energy", Qty: &other},
+		// Same conflict key as the first row, sent again with a larger sum.
+		{Time: ts, UserID: 1, MetricName: "step_count", Qty: &late},
+	}
+
+	got := dedupeHealthMetricRows(rows)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 rows after dedupe, got %d", len(got))
+	}
+	if got[0].MetricName != "active_energy" || got[1].MetricName != "step_count" {
+		t.Fatalf("unexpected rows kept: %v", got)
+	}
+	if *got[1].Qty != late {
+		t.Errorf("the later value has to win, got %v", *got[1].Qty)
+	}
+
+	// A different user, source or timestamp is a different row and stays.
+	distinct := []models.HealthMetricRow{
+		{Time: ts, UserID: 1, MetricName: "step_count", Source: "Apple Watch"},
+		{Time: ts, UserID: 1, MetricName: "step_count", Source: "iPhone"},
+		{Time: ts, UserID: 2, MetricName: "step_count", Source: "iPhone"},
+		{Time: ts.Add(time.Hour), UserID: 2, MetricName: "step_count", Source: "iPhone"},
+	}
+	if got := dedupeHealthMetricRows(distinct); len(got) != len(distinct) {
+		t.Errorf("distinct conflict keys were collapsed: %v", got)
 	}
 }

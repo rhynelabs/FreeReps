@@ -6,6 +6,7 @@ import "time"
 type Result struct {
 	MetricsReceived int      `json:"metrics_received"`
 	MetricsInserted int64    `json:"metrics_inserted"`
+	MetricsUpdated  int64    `json:"metrics_updated,omitempty"`
 	MetricsSkipped  int64    `json:"metrics_skipped"`
 	MetricsRejected int      `json:"metrics_rejected"`
 	RejectedNames   []string `json:"rejected_names,omitempty"`

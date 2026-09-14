@@ -341,7 +341,7 @@ func (db *DB) insertBackfillSession(ctx context.Context, userID int, night []mod
 		Units:      "hr",
 		Qty:        &qty,
 	}
-	if _, err := db.InsertHealthMetrics(ctx, []models.HealthMetricRow{sleepMetric}); err != nil {
+	if _, _, err := db.InsertHealthMetrics(ctx, []models.HealthMetricRow{sleepMetric}); err != nil {
 		return 1, fmt.Errorf("inserting backfill sleep_analysis metric: %w", err)
 	}
 	return 1, nil

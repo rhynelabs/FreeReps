@@ -134,7 +134,7 @@ func (s *Syncer) syncMeasures(ctx context.Context, userID int, token string, sta
 	rows := MapMeasureGroups(groups, userID)
 	stats.metricsReceived = len(rows)
 	if len(rows) > 0 {
-		inserted, err := s.db.InsertHealthMetrics(ctx, rows)
+		inserted, _, err := s.db.InsertHealthMetrics(ctx, rows)
 		if err != nil {
 			return fmt.Errorf("inserting measures: %w", err)
 		}

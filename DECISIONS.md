@@ -19,6 +19,52 @@ is as recorded there; where the record named no alternative, none is claimed.
 
 ---
 
+## 2026-09-14 — A re-uploaded health metric refreshes an aggregate, never a sample
+
+**Decided:** 2026-09-14
+
+**Decision.** `InsertHealthMetrics`
+(`server/internal/storage/health_metrics.go`) inserts through
+`unnest()` of twelve arrays and resolves a conflict on
+`idx_health_metrics_dedup` with `DO UPDATE`, guarded by
+`health_metrics.source_uuid IS NULL AND EXCLUDED.source_uuid IS NULL` and by
+an `IS DISTINCT FROM` comparison of the four value columns. A row that carries
+a HealthKit sample UUID on either side of the conflict is left untouched, as is
+an aggregate whose values did not change. The call returns inserted and updated
+counts separately, and `metrics_inserted` in the ingest result keeps meaning
+"rows that did not exist before".
+
+**Reasoning.** The iOS app computes hourly buckets for steps, energy and
+distance with `HKStatisticsCollectionQuery` and gives them no source UUID. The
+bucket for the running hour is uploaded before the hour is over, and the watch
+delivers its samples late, so the same bucket legitimately arrives again with
+a larger sum. Under `ON CONFLICT DO NOTHING` the second version was dropped
+without a trace and today's totals froze at whatever the first upload of each
+hour had seen. Rows that came from individual samples are a different kind of
+data — HealthKit does not revise a sample, so a second copy is a duplicate, not
+an update, and overwriting one would rewrite history that was correct. The UUID
+is what distinguishes the two, which is why the guard tests it on both sides
+rather than inferring from the metric name.
+
+`DO NOTHING` stays the rule for sleep sessions (`sleep_sessions`), where the
+2026-03-26 incident had a cross-source backfill overwrite sessions a direct
+source had produced. That is a different table and a different failure: there,
+a derived value was overwriting a measured one; here, an aggregate is replacing
+its own earlier, incomplete self.
+
+The rewrite to `unnest()` is the same change: a 5,000-row batch used to be a
+statement with 60,000 parameters that Postgres parsed and planned afresh every
+time, and such a batch took about a second on the deployed server. The arrays make the statement
+text and the parameter count constant. Rows are deduplicated by conflict key in
+Go before the insert, because `DO UPDATE` aborts a statement that would touch
+one row twice where `DO NOTHING` quietly dropped the repeat.
+
+**Trigger to re-open.** A source that revises individual samples, an aggregated
+metric that arrives with a source UUID, or a per-metric rule about which
+columns a refresh may overwrite.
+
+---
+
 ## 2026-09-14 — Identity is cached per login for one minute
 
 **Decided:** 2026-09-14
