@@ -35,7 +35,7 @@ struct OverviewView: View {
             .refreshable {
                 // Pulling down means "get the newest data", not just re-read the server.
                 if !vm.isAnySyncRunning, selection.isEnabled { vm.startRecentSync() }
-                await server.load()
+                await server.load(force: true)
             }
             .task { await server.load() }
             .onAppear {
@@ -396,7 +396,7 @@ struct OverviewView: View {
                 }
             }
             .padding(.vertical, 4)
-            Button("Try Again") { Task { await server.load() } }
+            Button("Try Again") { Task { await server.load(force: true) } }
         }
     }
 }
@@ -486,10 +486,20 @@ final class ServerOverview: ObservableObject {
     /// refresh each ask for a load and tend to arrive within the same second;
     /// one set of requests serves them all.
     private var inFlight: Task<Void, Never>?
+    /// When the last load ended, loaded or failed. Appearance and the end of a
+    /// sync also arrive a second *apart* — too late to join the load in flight,
+    /// too soon for the server to hold anything new.
+    private var lastFinished: Date?
+    private static let reloadInterval: TimeInterval = 2
 
-    func load() async {
+    /// `force` is for the user's own hand — pull to refresh, Try Again — which
+    /// always loads. Everything else is a no-op right after a finished load.
+    func load(force: Bool = false) async {
         if let inFlight {
             await inFlight.value
+            return
+        }
+        if !force, let lastFinished, Date().timeIntervalSince(lastFinished) < Self.reloadInterval {
             return
         }
         let task = Task { await fetch() }
@@ -568,10 +578,13 @@ final class ServerOverview: ObservableObject {
                 steps = nil
             }
             state = .loaded
+            lastFinished = Date()
         } catch is CancellationError {
+            // A cancelled load showed nothing; the next request must run.
             return
         } catch {
             state = .failed(error.localizedDescription)
+            lastFinished = Date()
         }
     }
 
