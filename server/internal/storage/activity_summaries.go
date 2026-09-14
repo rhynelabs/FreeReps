@@ -72,6 +72,8 @@ func (db *DB) InsertActivitySummaries(ctx context.Context, rows []models.Activit
 
 	// An ingest write: the app re-sends what a lost commit would drop.
 	err = db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
+		// A rerun after a deadlock starts the count over.
+		inserted, updated = 0, 0
 		result, err := tx.Query(ctx, query, args...)
 		if err != nil {
 			return fmt.Errorf("inserting activity summaries: %w", err)

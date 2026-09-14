@@ -329,6 +329,8 @@ func (db *DB) insertHealthMetricsBatch(ctx context.Context, rows []models.Health
 		}
 		return nil
 	})
+		// A rerun after a deadlock starts the count over.
+		inserted, updated = 0, 0
 	if err != nil {
 		return 0, 0, err
 	}

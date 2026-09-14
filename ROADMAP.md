@@ -39,3 +39,4 @@ each becomes its own `[open]` row before the entry is moved out.
 | Status | Item | Where | Trigger | Notes |
 |---|---|---|---|---|
 | `[open]` | Tear down the App Store review test server | `https://freereps-test.meltforce.net/` | App Store approval received | Public-facing instance without Tailscale, deployed for review only. It carries demo data, not real health data, but it is the one FreeReps endpoint reachable outside the tailnet. |
+| `[open]` | Integration test for concurrent ingest requests that create chunks | `server/internal/storage/` (integration tag) | | Two concurrent route requests whose points land in weeks without chunks, run against the scratch container the way `server/CLAUDE.md` describes; would have caught INCIDENTS.md 2026-09-14 before deploy. |

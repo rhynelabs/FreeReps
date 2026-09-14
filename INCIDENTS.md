@@ -16,6 +16,90 @@ the fix was verified, this file does not claim it was.
 
 ---
 
+## 2026-09-14 — Route and metric ingest requests failed with "deadlock detected" after the one-transaction change
+
+**Symptoms.** Build `fork-fc64d29`, deployed at 20:34 CEST. Between 20:34 and
+20:44 the server log showed, four times in a row,
+
+    processing workouts: inserting workouts: inserting workout routes: ERROR: deadlock detected (SQLSTATE 40P01)
+
+each time on three concurrent workout-route requests of an older-data run — one
+workout per request, 140–3,600 GPS points, different workouts in different
+weeks of 2022 — and once
+
+    processing metrics: inserting health metrics: ERROR: deadlock detected (SQLSTATE 40P01)
+
+on one 5,000-row `health_metrics` batch while six batches of the same category
+were in flight. The `context canceled` errors that followed were the app
+cancelling the sibling requests of a failed window. The run's 2022 route
+windows failed; the app gives such a window up after its retries and carries on
+with the next (commit `39618b0`), so the data was left for a later pass rather
+than lost.
+
+**Root cause.** Commit `fc64d29`, deployed as that build, had put a request's
+workouts insert and its point inserts into one transaction, where before each
+workout had been committed on its own before its points. The transaction holds
+`RowExclusiveLock` on `workouts` from its first statement until commit.
+`workout_routes` and `workout_heart_rate` are TimescaleDB hypertables whose
+`workout_id` references `workouts(id)`; when an insert lands in a week with no
+chunk yet, TimescaleDB creates the chunk inside the inserting transaction and
+copies the hypertable's constraints onto it, the foreign key included, and
+adding a foreign key takes `ShareRowExclusiveLock` on the referenced table —
+which conflicts with a `RowExclusiveLock` held by anyone else. The 2022 routes
+were new territory, so every request needed a chunk.
+
+The Postgres log at 18:44:23 UTC (20:44:23 CEST) shows the cycle. Three
+backends, each running the multi-row `INSERT INTO workout_routes` of a
+different request:
+
+- process A `waits for ShareUpdateExclusiveLock on relation <workout_routes>`
+  — the hypertable, to create its chunk — `blocked by process` B;
+- B `waits for ShareRowExclusiveLock on relation <workouts>` — copying the
+  foreign key onto its new chunk — blocked by C, which holds
+  `RowExclusiveLock` on `workouts` from the workouts insert of the same
+  transaction;
+- C `waits for ShareUpdateExclusiveLock on relation <workout_routes>`, blocked
+  by A.
+
+The `health_metrics` case has no foreign key. Its insert is `ON CONFLICT DO
+UPDATE`, which locks each conflicting row as the statement reaches it, and the
+rows were bound in arrival order — five type streams interleaved as the app
+produced them. A retried window is cut into 5,000-row batches at different
+boundaries than the cancelled attempt's, whose statements may still be running
+on the server, so two statements can hold overlapping rows in different orders.
+That reading fits the one occurrence; it was not confirmed from the Postgres
+log the way the route cycle was.
+
+**Fix.** Three changes in `server/internal/storage`:
+
+- `InsertWorkoutBatch` commits the workouts in their own transaction before the
+  points. The points transaction then holds only the foreign key's `KEY SHARE`
+  on the workout rows, which `ShareRowExclusiveLock` does not conflict with,
+  and the workouts transaction never creates a chunk because `workouts` is a
+  plain table. A request that fails between the two commits leaves workouts
+  without points until the app re-sends them, which it does.
+- Every ingest bulk insert sorts its rows by the table's unique key before the
+  statement — `health_metrics` in the order of `idx_health_metrics_dedup`, the
+  two point tables by `(workout_id, time)`, `sleep_stages`, `category_samples`
+  and `state_of_mind` likewise — so that two statements sharing rows wait on
+  them in the same order.
+- `withAsyncCommit` reruns the transaction on SQLSTATE `40P01` and `40001`, up
+  to three attempts with a jittered pause of 50–200 ms that doubles, as long as
+  the request is still alive. Every caller is an idempotent ingest write, which
+  is what the helper exists for; the two that count rows inside the transaction
+  reset their counts per attempt.
+
+What would have caught it before deploy: an integration test that sends two
+concurrent requests whose points land in weeks without chunks. Not written yet;
+it is the follow-up to this entry.
+
+**Lesson.** A hypertable with a foreign key creates that foreign key again on
+every new chunk, inside the inserting transaction and with the DDL lock that
+implies — the transaction that writes the referenced table must not be the one
+that creates chunks.
+
+---
+
 ## 2026-08-10 — The Alpha Progression history was stored twice, offset by the Berlin UTC offset
 
 **Symptoms.** `get_strength_summary` reported 378 working sets and 171,869 kg of

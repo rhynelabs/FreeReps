@@ -1,8 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -101,28 +103,50 @@ type WorkoutBatchCounts struct {
 	RoutePoints int64
 }
 
-// InsertWorkoutBatch inserts the workouts of one request, then their heart-rate
-// points, then their route points, in one transaction. Rows that already exist
-// are skipped and not counted.
+// InsertWorkoutBatch inserts the workouts of one request in one transaction,
+// then their heart-rate points and route points in a second. Rows that already
+// exist are skipped and not counted.
 //
-// One transaction rather than one per workout: a request with 151 workouts
+// Two transactions rather than one per workout: a request with 151 workouts
 // took 44 s on the deployed server, because each workout was its own
 // synchronous commit — one fsync on the NAS's disk — followed by a second
-// transaction for its heart-rate points. The points reference the workouts by
-// foreign key, so the workouts go first inside the same transaction.
+// transaction for its heart-rate points.
+//
+// Two rather than one: the point tables are hypertables, and a new chunk gets
+// a copy of the foreign key to workouts, which takes ShareRowExclusiveLock on
+// workouts — a lock the RowExclusiveLock of an uncommitted workouts insert
+// conflicts with. Three concurrent requests that each held that lock and each
+// needed a chunk deadlocked on 2026-09-14 (INCIDENTS.md). With the workouts
+// committed first, the points transaction holds only the foreign key's
+// KEY SHARE on their rows, which chunk creation does not conflict with, and
+// the workouts transaction never creates a chunk because workouts is a plain
+// table. A request that fails between the two commits leaves its workouts
+// without points until the app re-sends them, which it does; ON CONFLICT
+// DO NOTHING makes the re-send cheap.
 func (db *DB) InsertWorkoutBatch(ctx context.Context, b WorkoutBatch) (WorkoutBatchCounts, error) {
 	var counts WorkoutBatchCounts
 	if len(b.Workouts) == 0 && len(b.HeartRate) == 0 && len(b.Routes) == 0 {
 		return counts, nil
 	}
 	b.Workouts = dedupeWorkoutRows(b.Workouts)
+	sortWorkoutPoints(b.HeartRate, b.Routes)
 
 	// An ingest write: the app re-sends what a lost commit would drop.
+	if len(b.Workouts) > 0 {
+		err := db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
+			var err error
+			counts.Workouts, err = insertWorkouts(ctx, tx, b.Workouts)
+			return err
+		})
+		if err != nil {
+			return counts, err
+		}
+	}
+	if len(b.HeartRate) == 0 && len(b.Routes) == 0 {
+		return counts, nil
+	}
 	err := db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
 		var err error
-		if counts.Workouts, err = insertWorkouts(ctx, tx, b.Workouts); err != nil {
-			return err
-		}
 		if counts.HRPoints, err = insertWorkoutHeartRate(ctx, tx, b.HeartRate); err != nil {
 			return err
 		}
@@ -130,6 +154,26 @@ func (db *DB) InsertWorkoutBatch(ctx context.Context, b WorkoutBatch) (WorkoutBa
 		return err
 	})
 	return counts, err
+}
+
+// sortWorkoutPoints orders both point tables by (workout_id, time), in place,
+// so that concurrent statements sharing rows wait on them in the same order;
+// see sortHealthMetricRows. Points arrive per workout in time order, so the
+// sort has little to do.
+func sortWorkoutPoints(hr []models.WorkoutHRRow, routes []models.WorkoutRouteRow) {
+	slices.SortStableFunc(hr, func(a, b models.WorkoutHRRow) int {
+		return compareWorkoutPoint(a.WorkoutID, b.WorkoutID, a.Time, b.Time)
+	})
+	slices.SortStableFunc(routes, func(a, b models.WorkoutRouteRow) int {
+		return compareWorkoutPoint(a.WorkoutID, b.WorkoutID, a.Time, b.Time)
+	})
+}
+
+func compareWorkoutPoint(aID, bID uuid.UUID, aTime, bTime time.Time) int {
+	if c := bytes.Compare(aID[:], bID[:]); c != 0 {
+		return c
+	}
+	return aTime.Compare(bTime)
 }
 
 // dedupeWorkoutRows keeps the last row per id. The primary key would skip the

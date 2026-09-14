@@ -19,13 +19,13 @@ is as recorded there; where the record named no alternative, none is claimed.
 
 ---
 
-## 2026-09-14 — A request's workouts are written in one transaction, not one per workout
+## 2026-09-14 — A request's workouts are written in two transactions, not one per workout
 
 **Decided:** 2026-09-14
 
 **Decision.** The health ingest path inserts all workouts of a request in one
-multi-row statement, then all their heart-rate points, then all their route
-points, inside a single `withAsyncCommit` transaction
+multi-row statement and commits, then all their heart-rate points and all
+their route points in a second `withAsyncCommit` transaction
 (`InsertWorkoutBatch`, `server/internal/storage/workouts.go`). Duplicate ids
 within a payload are collapsed first; a workout whose id is not a UUID is
 still counted as received and skipped with the same log line. The single
@@ -39,11 +39,28 @@ routes) took 44 s, while 5,000-row metric batches in the same run took
 NAS's disk — followed by a second transaction for its heart-rate points, so
 the request paid ~300 statements and 151 fsyncs for 151 rows. The workouts
 table is the foreign-key target of both point tables, which is why the
-workouts go first and all three go in the same transaction.
+workouts go first.
+
+Two transactions rather than one because the point tables are hypertables: a
+new chunk gets a copy of the foreign key to `workouts`, and adding a foreign
+key takes `ShareRowExclusiveLock` on the referenced table, which conflicts with
+the `RowExclusiveLock` an uncommitted workouts insert holds. Three concurrent
+route requests that each held the one and needed the other deadlocked within
+minutes of the single-transaction version being deployed
+([`INCIDENTS.md`](INCIDENTS.md), 2026-09-14). With the workouts committed
+first, the points transaction holds only the foreign key's `KEY SHARE` on
+their rows, which chunk creation does not conflict with, and the workouts
+transaction never creates a chunk because `workouts` is a plain table. The
+cost is a request that fails between the two commits: its workouts are stored
+without points until the app re-sends the window, which it does, and
+`ON CONFLICT DO NOTHING` makes the re-send cheap.
 
 **Trigger to re-open.** A request whose workouts do not fit one statement in
 memory — the chunking keeps each statement under the 65,535-parameter limit,
-but the transaction holds the whole request.
+but each transaction holds its part of the whole request.
+
+**Revisions.** 2026-09-14: first decided as one transaction for workouts and
+points together; split into two the same evening after the deadlock above.
 
 ---
 
