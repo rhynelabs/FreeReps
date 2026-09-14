@@ -540,11 +540,12 @@ func (p *Provider) processActivitySummaries(ctx context.Context, summaries []mod
 	}
 
 	if len(rows) > 0 {
-		inserted, err := p.db.InsertActivitySummaries(ctx, rows)
+		inserted, updated, err := p.db.InsertActivitySummaries(ctx, rows)
 		if err != nil {
 			return fmt.Errorf("inserting activity summaries: %w", err)
 		}
 		result.ActivitySummariesInserted = inserted
+		result.ActivitySummariesUpdated = updated
 	}
 	return nil
 }

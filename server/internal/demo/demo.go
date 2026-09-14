@@ -85,7 +85,7 @@ func Seed(ctx context.Context, db *storage.DB, log *slog.Logger) error {
 
 	// Activity summaries
 	activities := generateActivitySummaries(rng, start, now)
-	actInserted, err := db.InsertActivitySummaries(ctx, activities)
+	actInserted, _, err := db.InsertActivitySummaries(ctx, activities)
 	if err != nil {
 		return fmt.Errorf("demo: insert activity summaries: %w", err)
 	}

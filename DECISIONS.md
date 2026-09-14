@@ -19,7 +19,7 @@ is as recorded there; where the record named no alternative, none is claimed.
 
 ---
 
-## 2026-09-14 — A re-uploaded health metric refreshes an aggregate, never a sample
+## 2026-09-14 — A re-uploaded aggregate is refreshed, a sample never
 
 **Decided:** 2026-09-14
 
@@ -58,6 +58,15 @@ time, and such a batch took about a second on the deployed server. The arrays ma
 text and the parameter count constant. Rows are deduplicated by conflict key in
 Go before the insert, because `DO UPDATE` aborts a statement that would touch
 one row twice where `DO NOTHING` quietly dropped the repeat.
+
+The same rule applies to `activity_summaries` (`InsertActivitySummaries`,
+`server/internal/storage/activity_summaries.go`). A day's rings are an
+aggregate that grows until midnight, and the app sends the current day with
+every sync; under `DO NOTHING` the first upload of the day won and the server
+showed the morning's near-zero values all day. That table holds no samples, so
+there is no UUID to guard on: every row that conflicts on `(user_id, date)` is
+refreshed when its six values differ, and left alone when they do not. The
+result reports refreshed days as `activity_summaries_updated`.
 
 **Trigger to re-open.** A source that revises individual samples, an aggregated
 metric that arrives with a source UUID, or a per-metric rule about which

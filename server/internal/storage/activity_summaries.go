@@ -9,12 +9,49 @@ import (
 	"github.com/claude/freereps/internal/models"
 )
 
-// InsertActivitySummaries batch-inserts activity summary rows. Returns count inserted.
-// Uses ON CONFLICT DO NOTHING on (user_id, date) composite PK.
-func (db *DB) InsertActivitySummaries(ctx context.Context, rows []models.ActivitySummaryRow) (int64, error) {
+// activitySummaryConflictSQL resolves a conflict on the (user_id, date) primary
+// key by refreshing the row when its values changed.
+//
+// A day's rings are one aggregate that grows until midnight, and the app sends
+// the current day with every sync. Under DO NOTHING the first upload of a day
+// won and every later one was dropped, so today read as the near-zero values
+// the morning sync had seen. There is no sample-vs-aggregate distinction in
+// this table — every row is a day total — so the only guard is IS DISTINCT FROM
+// over the six value columns, which keeps an unchanged re-upload from writing
+// a new row version.
+//
+// RETURNING (xmax = 0) reports per row whether it was inserted rather than
+// updated, so new rows stay countable apart from refreshed ones. A conflicting
+// row whose values did not change is not returned at all.
+const activitySummaryConflictSQL = ` ON CONFLICT (user_id, date) DO UPDATE SET
+	active_energy = EXCLUDED.active_energy,
+	active_energy_goal = EXCLUDED.active_energy_goal,
+	exercise_time = EXCLUDED.exercise_time,
+	exercise_time_goal = EXCLUDED.exercise_time_goal,
+	stand_hours = EXCLUDED.stand_hours,
+	stand_hours_goal = EXCLUDED.stand_hours_goal
+WHERE (activity_summaries.active_energy, activity_summaries.active_energy_goal,
+       activity_summaries.exercise_time, activity_summaries.exercise_time_goal,
+       activity_summaries.stand_hours, activity_summaries.stand_hours_goal)
+  IS DISTINCT FROM
+      (EXCLUDED.active_energy, EXCLUDED.active_energy_goal,
+       EXCLUDED.exercise_time, EXCLUDED.exercise_time_goal,
+       EXCLUDED.stand_hours, EXCLUDED.stand_hours_goal)
+RETURNING (xmax = 0)`
+
+// InsertActivitySummaries batch-inserts activity summary rows. It returns how
+// many rows were new and how many existing days it refreshed; rows that
+// conflicted without changing are counted in neither.
+//
+// The rows travel as a multi-row VALUES list: a request carries at most a few
+// hundred days, so the parameter count that forced health_metrics onto
+// unnest() never comes near the limit here.
+func (db *DB) InsertActivitySummaries(ctx context.Context, rows []models.ActivitySummaryRow) (inserted, updated int64, err error) {
 	if len(rows) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
+
+	rows = dedupeActivitySummaryRows(rows)
 
 	query := `INSERT INTO activity_summaries (user_id, date, active_energy, active_energy_goal, exercise_time, exercise_time_goal, stand_hours, stand_hours_goal) VALUES `
 	args := make([]any, 0, len(rows)*8)
@@ -30,13 +67,69 @@ func (db *DB) InsertActivitySummaries(ctx context.Context, rows []models.Activit
 			r.ExerciseTime, r.ExerciseTimeGoal, r.StandHours, r.StandHoursGoal)
 	}
 
-	query += strings.Join(valueStrings, ",") + " ON CONFLICT DO NOTHING"
+	query += strings.Join(valueStrings, ",") + activitySummaryConflictSQL
 
-	tag, err := db.Pool.Exec(ctx, query, args...)
+	result, err := db.Pool.Query(ctx, query, args...)
 	if err != nil {
-		return 0, fmt.Errorf("inserting activity summaries: %w", err)
+		return 0, 0, fmt.Errorf("inserting activity summaries: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	defer result.Close()
+
+	for result.Next() {
+		var isInsert bool
+		if err := result.Scan(&isInsert); err != nil {
+			return 0, 0, fmt.Errorf("scanning activity summary insert result: %w", err)
+		}
+		if isInsert {
+			inserted++
+		} else {
+			updated++
+		}
+	}
+	if err := result.Err(); err != nil {
+		return 0, 0, fmt.Errorf("inserting activity summaries: %w", err)
+	}
+	return inserted, updated, nil
+}
+
+// dedupeActivitySummaryRows keeps the last row per (user_id, date).
+//
+// ON CONFLICT DO UPDATE aborts the whole INSERT when one statement would touch
+// the same row twice ("cannot affect row a second time"), where DO NOTHING
+// silently dropped the repeat. A payload that carries the same day twice must
+// not turn into a failed batch, and the later copy is the one that should win.
+//
+// The key is the calendar day as pgx encodes a time.Time into DATE: year,
+// month and day read in the value's own location, the clock part discarded.
+// Two times on the same calendar day are one row to Postgres, so they have to
+// be one row here.
+func dedupeActivitySummaryRows(rows []models.ActivitySummaryRow) []models.ActivitySummaryRow {
+	type conflictKey struct {
+		userID int
+		year   int
+		month  time.Month
+		day    int
+	}
+	keyOf := func(r models.ActivitySummaryRow) conflictKey {
+		y, m, d := r.Date.Date()
+		return conflictKey{r.UserID, y, m, d}
+	}
+
+	lastAt := make(map[conflictKey]int, len(rows))
+	for i, r := range rows {
+		lastAt[keyOf(r)] = i
+	}
+	if len(lastAt) == len(rows) {
+		return rows
+	}
+
+	kept := make([]models.ActivitySummaryRow, 0, len(lastAt))
+	for i, r := range rows {
+		if lastAt[keyOf(r)] == i {
+			kept = append(kept, r)
+		}
+	}
+	return kept
 }
 
 // QueryActivitySummaries retrieves activity summaries in a date range for a user.

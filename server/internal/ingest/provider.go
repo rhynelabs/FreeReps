@@ -31,6 +31,7 @@ type Result struct {
 	ECGRecordingsInserted    int   `json:"ecg_recordings_inserted,omitempty"`
 	AudiogramsInserted       int   `json:"audiograms_inserted,omitempty"`
 	ActivitySummariesInserted int64 `json:"activity_summaries_inserted,omitempty"`
+	ActivitySummariesUpdated int64 `json:"activity_summaries_updated,omitempty"`
 	MedicationsInserted      int   `json:"medications_inserted,omitempty"`
 	VisionPrescriptionsInserted int `json:"vision_prescriptions_inserted,omitempty"`
 	StateOfMindInserted      int64 `json:"state_of_mind_inserted,omitempty"`
