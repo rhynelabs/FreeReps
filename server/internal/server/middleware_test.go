@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -346,6 +349,49 @@ func TestCachedUserStoreDoesNotCacheErrors(t *testing.T) {
 	}
 }
 
+// TestDecompressRequestGzip exists because the history upload compresses its
+// batches: a server that ignored Content-Encoding would hand gzip bytes to the
+// JSON decoder and reject every batch with 400. An unknown encoding must be
+// refused rather than decoded as if it were plain.
+func TestDecompressRequestGzip(t *testing.T) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(`{"hello":"world"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var got string
+	handler := DecompressRequest(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("reading body: %v", err)
+		}
+		got = string(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/ingest", &buf)
+	req.Header.Set("Content-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got != `{"hello":"world"}` {
+		t.Errorf("body = %q, want decoded JSON", got)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/ingest", bytes.NewReader([]byte("x")))
+	req.Header.Set("Content-Encoding", "br")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("status for br = %d, want 415", rec.Code)
+	}
+}
 
 // TestTailscaleIdentityTaggedNodeWithOwner verifies that a tagged device (e.g. an
 // MCP proxy) resolves to the primary user from the database instead of being rejected.

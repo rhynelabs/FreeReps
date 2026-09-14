@@ -1,6 +1,7 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
 	"log/slog"
 	"net/http"
@@ -245,6 +246,38 @@ func CORS(next http.Handler) http.Handler {
 	})
 }
 
+// maxDecompressedBody caps what a gzip-encoded request body may expand to.
+// The uncompressed path carries no cap; this one only keeps a body that is
+// small on the wire from being unbounded in memory.
+const maxDecompressedBody = 256 << 20
+
+// DecompressRequest accepts Content-Encoding: gzip on a request body and hands
+// the handler the decoded stream. Uploads of the same history batch shrink by
+// an order of magnitude on the wire, which is where a phone's time goes.
+func DecompressRequest(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))) {
+		case "":
+		case "gzip":
+			zr, err := gzip.NewReader(r.Body)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid gzip body: " + err.Error()})
+				return
+			}
+			defer func() { _ = zr.Close() }()
+			r.Body = http.MaxBytesReader(w, zr, maxDecompressedBody)
+			r.Header.Del("Content-Encoding")
+			r.ContentLength = -1
+		default:
+			writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "unsupported Content-Encoding; use gzip or none"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// statusWriter wraps ResponseWriter to capture the status code.
+// It also implements http.Flusher so SSE streaming works through the logging middleware.
 type statusWriter struct {
 	http.ResponseWriter
 	status int

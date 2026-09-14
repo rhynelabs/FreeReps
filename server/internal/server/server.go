@@ -144,12 +144,13 @@ func (s *Server) routes() {
 
 		// Ingest endpoints
 		r.Route("/api/v1/ingest", func(r chi.Router) {
+			r.Use(DecompressRequest)
 			r.Post("/", s.handleIngest)
 			r.Post("/alpha", s.handleAlphaIngest)
 		})
 
 		// Unified import with auto-detection
-		r.Post("/api/v1/import", s.handleUnifiedImport)
+		r.With(DecompressRequest).Post("/api/v1/import", s.handleUnifiedImport)
 
 		// User identity
 		r.Get("/api/v1/me", s.handleMe)
