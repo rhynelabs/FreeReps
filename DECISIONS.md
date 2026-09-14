@@ -19,6 +19,30 @@ is as recorded there; where the record named no alternative, none is claimed.
 
 ---
 
+## 2026-09-14 — Identity is cached per login for one minute
+
+**Decided:** 2026-09-14
+
+**Decision.** The Tailscale identity middleware keeps `login → user ID` in
+memory (`server/internal/server/middleware.go`, `cachedUserStore`) and runs
+the `users` upsert only for a login it has not seen, or not touched, within
+the last minute. `WhoIs` still runs on every request.
+
+**Reasoning.** The upsert is `INSERT … ON CONFLICT DO UPDATE SET last_seen =
+NOW()` on one row, one transaction per request. Every request of the same
+user queues on that row lock, so the identity check serialized the parallel
+history uploads it authenticated: five in flight raised throughput 1.8× and
+latency 2.5×. Nothing reads `users.last_seen` at request time; a value up to a
+minute old changes no behaviour. `WhoIs` is not cached because it is an
+in-process lookup in the tsnet node's netmap, not a network call, and caching
+it would keep a revoked device authenticated for the cache lifetime.
+
+**Trigger to re-open.** A consumer of `last_seen` that needs request
+resolution, or a per-request check on the user row (a disabled flag, a quota)
+that the cache would bypass.
+
+---
+
 ## 2026-09-14 — The sleep backfill after a REST ingest covers only the nights that ingest wrote
 
 **Decided:** 2026-09-14

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"tailscale.com/client/tailscale/apitype"
@@ -19,6 +20,60 @@ type whoisClient interface {
 type userStore interface {
 	GetOrCreateUser(ctx context.Context, login, displayName string) (int, error)
 	GetPrimaryUser(ctx context.Context) (int, string, error)
+}
+
+// identityTouchInterval is how long a resolved login is served from memory
+// before its users row is touched again.
+const identityTouchInterval = time.Minute
+
+// cachedUserStore serves GetOrCreateUser from memory for a login seen within
+// identityTouchInterval, and runs the upsert only for an unknown login or one
+// whose entry has aged out.
+//
+// The upsert is an INSERT ... ON CONFLICT DO UPDATE on the same users row for
+// every request of one user, each in its own transaction. Concurrent requests
+// from that user queue on the row lock, so the identity check alone serialized
+// the parallel uploads it was meant to authenticate. Nothing reads last_seen
+// at request time; a value up to a minute old changes nothing.
+type cachedUserStore struct {
+	userStore
+	now     func() time.Time
+	mu      sync.Mutex
+	entries map[string]cachedIdentity
+}
+
+type cachedIdentity struct {
+	id      int
+	touched time.Time
+}
+
+func newCachedUserStore(store userStore) *cachedUserStore {
+	return &cachedUserStore{
+		userStore: store,
+		now:       time.Now,
+		entries:   map[string]cachedIdentity{},
+	}
+}
+
+// GetOrCreateUser keeps the wrapped store's semantics for the first request of
+// a login: the row is created there, and the error surfaces unchanged.
+func (c *cachedUserStore) GetOrCreateUser(ctx context.Context, login, displayName string) (int, error) {
+	now := c.now()
+	c.mu.Lock()
+	entry, ok := c.entries[login]
+	c.mu.Unlock()
+	if ok && now.Sub(entry.touched) < identityTouchInterval {
+		return entry.id, nil
+	}
+
+	id, err := c.userStore.GetOrCreateUser(ctx, login, displayName)
+	if err != nil {
+		return 0, err
+	}
+	c.mu.Lock()
+	c.entries[login] = cachedIdentity{id: id, touched: now}
+	c.mu.Unlock()
+	return id, nil
 }
 
 type contextKey int
@@ -190,8 +245,6 @@ func CORS(next http.Handler) http.Handler {
 	})
 }
 
-// statusWriter wraps ResponseWriter to capture the status code.
-// It also implements http.Flusher so SSE streaming works through the logging middleware.
 type statusWriter struct {
 	http.ResponseWriter
 	status int

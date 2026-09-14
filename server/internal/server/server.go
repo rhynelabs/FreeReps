@@ -43,6 +43,12 @@ type Server struct {
 	// HAE TCP import state (only one import at a time)
 	importMu     sync.Mutex
 	activeImport *haeImportState
+
+	// users resolves Tailscale logins to user IDs. It lives on the Server
+	// rather than inside TailscaleIdentity because identityMiddleware builds
+	// that middleware afresh on every request; a cache created there would
+	// never see a second request.
+	users userStore
 }
 
 // SetOura configures the Oura integration components.
@@ -76,6 +82,7 @@ func New(db *storage.DB, healthProvider *health.Provider, alphaProvider *alpha.P
 		alpha:  alphaProvider,
 		log:    log,
 		router: chi.NewRouter(),
+		users:  newCachedUserStore(db),
 	}
 	s.routes()
 	return s
@@ -116,7 +123,7 @@ func (s *Server) identityMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if s.lc != nil {
-				TailscaleIdentity(s.lc, s.db, s.log)(next).ServeHTTP(w, r)
+				TailscaleIdentity(s.lc, s.users, s.log)(next).ServeHTTP(w, r)
 			} else {
 				DevIdentity(next).ServeHTTP(w, r)
 			}

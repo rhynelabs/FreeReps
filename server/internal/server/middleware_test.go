@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
@@ -208,14 +209,16 @@ func (m *mockWhois) WhoIs(_ context.Context, _ string) (*apitype.WhoIsResponse, 
 }
 
 type mockUserStore struct {
-	getOrCreateID  int
-	getOrCreateErr error
-	primaryID      int
-	primaryLogin   string
-	primaryErr     error
+	getOrCreateID    int
+	getOrCreateErr   error
+	getOrCreateCalls int
+	primaryID        int
+	primaryLogin     string
+	primaryErr       error
 }
 
 func (m *mockUserStore) GetOrCreateUser(_ context.Context, _, _ string) (int, error) {
+	m.getOrCreateCalls++
 	return m.getOrCreateID, m.getOrCreateErr
 }
 
@@ -270,6 +273,79 @@ func TestTailscaleIdentityPersonalNode(t *testing.T) {
 		t.Errorf("tailnet = %q, want %q", gotInfo.Tailnet, "tail1234.ts.net")
 	}
 }
+
+// TestCachedUserStoreUpsertsOncePerInterval exists because the users upsert
+// was the row lock that serialized one user's parallel uploads. Through the
+// identity middleware, a second request from a known login inside the
+// interval must not reach the store; one after the interval must, so
+// last_seen keeps moving; and a different login is its own entry.
+func TestCachedUserStoreUpsertsOncePerInterval(t *testing.T) {
+	profile := &tailcfg.UserProfile{LoginName: "alice@example.com", DisplayName: "Alice"}
+	wc := &mockWhois{resp: &apitype.WhoIsResponse{
+		Node:        &tailcfg.Node{Name: "macbook.tail1234.ts.net.", ComputedName: "macbook"},
+		UserProfile: profile,
+	}}
+	us := &mockUserStore{getOrCreateID: 42}
+	cached := newCachedUserStore(us)
+	now := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	cached.now = func() time.Time { return now }
+
+	var gotUID int
+	handler := TailscaleIdentity(wc, cached, slog.Default())(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUID, _ = userIDFromContext(r)
+		w.WriteHeader(http.StatusOK)
+	}))
+	serve := func() {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+	}
+
+	serve()
+	serve()
+	if us.getOrCreateCalls != 1 {
+		t.Fatalf("store calls after two requests = %d, want 1", us.getOrCreateCalls)
+	}
+	if gotUID != 42 {
+		t.Errorf("cached userID = %d, want 42", gotUID)
+	}
+
+	now = now.Add(identityTouchInterval + time.Second)
+	serve()
+	if us.getOrCreateCalls != 2 {
+		t.Errorf("store calls after the interval elapsed = %d, want 2", us.getOrCreateCalls)
+	}
+
+	profile.LoginName = "bob@example.com"
+	serve()
+	if us.getOrCreateCalls != 3 {
+		t.Errorf("store calls after a new login = %d, want 3", us.getOrCreateCalls)
+	}
+}
+
+// TestCachedUserStoreDoesNotCacheErrors verifies that a failed upsert leaves no
+// entry behind: the next request must retry the database rather than serve a
+// user ID that was never resolved.
+func TestCachedUserStoreDoesNotCacheErrors(t *testing.T) {
+	us := &mockUserStore{getOrCreateErr: fmt.Errorf("db down")}
+	cached := newCachedUserStore(us)
+
+	if _, err := cached.GetOrCreateUser(context.Background(), "alice@example.com", "Alice"); err == nil {
+		t.Fatal("expected error from failed upsert")
+	}
+	us.getOrCreateErr = nil
+	us.getOrCreateID = 7
+	id, err := cached.GetOrCreateUser(context.Background(), "alice@example.com", "Alice")
+	if err != nil || id != 7 {
+		t.Fatalf("after recovery: id=%d err=%v, want 7 and nil", id, err)
+	}
+	if us.getOrCreateCalls != 2 {
+		t.Errorf("store calls = %d, want 2", us.getOrCreateCalls)
+	}
+}
+
 
 // TestTailscaleIdentityTaggedNodeWithOwner verifies that a tagged device (e.g. an
 // MCP proxy) resolves to the primary user from the database instead of being rejected.
