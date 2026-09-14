@@ -141,6 +141,9 @@ func (db *DB) SleepStageUserIDs(ctx context.Context) ([]int, error) {
 // BackfillSleepSessions synthesizes sleep sessions from existing sleep stages
 // that don't yet have corresponding sessions. Called at server startup and
 // after each HAE TCP import. Idempotent (ON CONFLICT DO NOTHING).
+//
+// It reads every stage of every user. A request that has just written a few
+// stages wants BackfillSleepSessionsFor instead.
 func (db *DB) BackfillSleepSessions(ctx context.Context, log *slog.Logger) error {
 	userIDs, err := db.SleepStageUserIDs(ctx)
 	if err != nil {
@@ -163,6 +166,41 @@ func (db *DB) BackfillSleepSessions(ctx context.Context, log *slog.Logger) error
 	return nil
 }
 
+// backfillNightPad is how far past [from, to] BackfillSleepSessionsFor reads
+// so that a night straddling the window edge is grouped whole. A night is a
+// chain of stages with gaps under 12 hours; one that reaches three days past
+// the stages just written would need a nap every half day for that long.
+const backfillNightPad = 3 * 24 * time.Hour
+
+// BackfillSleepSessionsFor is BackfillSleepSessions for one user, limited to
+// the nights that overlap [from, to] — the span of the stages a request just
+// wrote. Returns the number of sessions created.
+//
+// Same ON CONFLICT DO NOTHING as the full backfill, for the same reason (see
+// the 2026-03-26 incident): a session a direct source wrote is never
+// overwritten. That is also why only whole nights are written — a night cut
+// at the window edge would become a short session no later run corrects.
+func (db *DB) BackfillSleepSessionsFor(ctx context.Context, log *slog.Logger, userID int, from, to time.Time) (int, error) {
+	stages, err := db.QuerySleepStages(ctx, from.Add(-backfillNightPad), to.Add(backfillNightPad), userID)
+	if err != nil {
+		return 0, fmt.Errorf("querying stages: %w", err)
+	}
+
+	var created int
+	for _, night := range nightsOverlapping(groupNights(stages), from, to) {
+		n, err := db.insertBackfillSession(ctx, userID, night)
+		if err != nil {
+			return created, err
+		}
+		created += n
+	}
+
+	if created > 0 {
+		log.Info("backfilled sleep sessions for user", "user_id", userID, "sessions", created, "from", from, "to", to)
+	}
+	return created, nil
+}
+
 func (db *DB) backfillUserSleepSessions(ctx context.Context, log *slog.Logger, userID int) (int, error) {
 	stages, err := db.QuerySleepStages(ctx,
 		time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
@@ -171,15 +209,34 @@ func (db *DB) backfillUserSleepSessions(ctx context.Context, log *slog.Logger, u
 	if err != nil {
 		return 0, fmt.Errorf("querying stages: %w", err)
 	}
+
+	var created int
+	for _, night := range groupNights(stages) {
+		n, err := db.insertBackfillSession(ctx, userID, night)
+		if err != nil {
+			return created, err
+		}
+		created += n
+	}
+
+	if created > 0 {
+		log.Info("backfilled sleep sessions for user", "user_id", userID, "sessions", created)
+	}
+	return created, nil
+}
+
+// groupNights sorts stages by start and splits them into nights: a gap of
+// more than 12 hours between one stage's end and the next one's start opens a
+// new night.
+func groupNights(stages []models.SleepStageRow) [][]models.SleepStageRow {
 	if len(stages) == 0 {
-		return 0, nil
+		return nil
 	}
 
 	sort.Slice(stages, func(i, j int) bool {
 		return stages[i].StartTime.Before(stages[j].StartTime)
 	})
 
-	// Group into nights (gap > 12h = new night)
 	var nights [][]models.SleepStageRow
 	var currentNight []models.SleepStageRow
 
@@ -199,80 +256,93 @@ func (db *DB) backfillUserSleepSessions(ctx context.Context, log *slog.Logger, u
 	if len(currentNight) > 0 {
 		nights = append(nights, currentNight)
 	}
+	return nights
+}
 
-	var created int
+// nightsOverlapping keeps the nights that have at least one instant in
+// common with [from, to]. A night is kept whole or not at all.
+func nightsOverlapping(nights [][]models.SleepStageRow, from, to time.Time) [][]models.SleepStageRow {
+	var kept [][]models.SleepStageRow
 	for _, night := range nights {
-		sleepStart := night[0].StartTime
-		sleepEnd := night[len(night)-1].EndTime
-
-		var deep, core, rem, awake, inBedDur float64
-		for _, s := range night {
-			switch s.Stage {
-			case "Deep":
-				deep += s.DurationHr
-			case "Core":
-				core += s.DurationHr
-			case "REM":
-				rem += s.DurationHr
-			case "Awake":
-				awake += s.DurationHr
-			case "In Bed":
-				inBedDur += s.DurationHr
-			}
+		first := night[0].StartTime
+		last := night[len(night)-1].EndTime
+		if last.Before(from) || first.After(to) {
+			continue
 		}
+		kept = append(kept, night)
+	}
+	return kept
+}
 
-		totalSleep := deep + core + rem
-		inBed := sleepEnd.Sub(sleepStart).Hours()
-		date := sleepEnd.Truncate(24 * time.Hour)
+// insertBackfillSession writes one night as a session and, when the night
+// was new, its sleep_analysis metric. Returns 1 when a session was created,
+// 0 when a direct source already owns that date.
+func (db *DB) insertBackfillSession(ctx context.Context, userID int, night []models.SleepStageRow) (int, error) {
+	sleepStart := night[0].StartTime
+	sleepEnd := night[len(night)-1].EndTime
 
-		session := models.SleepSessionRow{
-			UserID:     userID,
-			Date:       date,
-			TotalSleep: totalSleep,
-			Asleep:     totalSleep,
-			Core:       core,
-			Deep:       deep,
-			REM:        rem,
-			InBed:      inBed,
-			SleepStart: sleepStart,
-			SleepEnd:   sleepEnd,
-			InBedStart: sleepStart,
-			InBedEnd:   sleepEnd,
-		}
-
-		// Use DO NOTHING: backfill is a fallback — don't overwrite sessions
-		// from direct sources (Oura, HAE) which have more accurate data.
-		tag, err := db.Pool.Exec(ctx,
-			`INSERT INTO sleep_sessions (user_id, date, total_sleep, asleep, core, deep, rem, in_bed, sleep_start, sleep_end, in_bed_start, in_bed_end)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-			 ON CONFLICT (user_id, date) DO NOTHING`,
-			session.UserID, session.Date, session.TotalSleep, session.Asleep,
-			session.Core, session.Deep, session.REM, session.InBed,
-			session.SleepStart, session.SleepEnd, session.InBedStart, session.InBedEnd)
-		if err != nil {
-			return created, fmt.Errorf("inserting backfill session: %w", err)
-		}
-		if tag.RowsAffected() == 0 {
-			continue // session already exists from a direct source
-		}
-		created++
-
-		qty := totalSleep
-		sleepMetric := models.HealthMetricRow{
-			Time:       date.Add(12 * time.Hour), // noon UTC for stable dedup
-			UserID:     userID,
-			MetricName: "sleep_analysis",
-			Source:     "FreeReps Backfill",
-			Units:      "hr",
-			Qty:        &qty,
-		}
-		if _, err := db.InsertHealthMetrics(ctx, []models.HealthMetricRow{sleepMetric}); err != nil {
-			return created, fmt.Errorf("inserting backfill sleep_analysis metric: %w", err)
+	var deep, core, rem, awake, inBedDur float64
+	for _, s := range night {
+		switch s.Stage {
+		case "Deep":
+			deep += s.DurationHr
+		case "Core":
+			core += s.DurationHr
+		case "REM":
+			rem += s.DurationHr
+		case "Awake":
+			awake += s.DurationHr
+		case "In Bed":
+			inBedDur += s.DurationHr
 		}
 	}
 
-	if created > 0 {
-		log.Info("backfilled sleep sessions for user", "user_id", userID, "sessions", created)
+	totalSleep := deep + core + rem
+	inBed := sleepEnd.Sub(sleepStart).Hours()
+	date := sleepEnd.Truncate(24 * time.Hour)
+
+	session := models.SleepSessionRow{
+		UserID:     userID,
+		Date:       date,
+		TotalSleep: totalSleep,
+		Asleep:     totalSleep,
+		Core:       core,
+		Deep:       deep,
+		REM:        rem,
+		InBed:      inBed,
+		SleepStart: sleepStart,
+		SleepEnd:   sleepEnd,
+		InBedStart: sleepStart,
+		InBedEnd:   sleepEnd,
 	}
-	return created, nil
+
+	// Use DO NOTHING: backfill is a fallback — don't overwrite sessions
+	// from direct sources (Oura, HAE) which have more accurate data.
+	tag, err := db.Pool.Exec(ctx,
+		`INSERT INTO sleep_sessions (user_id, date, total_sleep, asleep, core, deep, rem, in_bed, sleep_start, sleep_end, in_bed_start, in_bed_end)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		 ON CONFLICT (user_id, date) DO NOTHING`,
+		session.UserID, session.Date, session.TotalSleep, session.Asleep,
+		session.Core, session.Deep, session.REM, session.InBed,
+		session.SleepStart, session.SleepEnd, session.InBedStart, session.InBedEnd)
+	if err != nil {
+		return 0, fmt.Errorf("inserting backfill session: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return 0, nil // session already exists from a direct source
+	}
+
+	qty := totalSleep
+	sleepMetric := models.HealthMetricRow{
+		Time:       date.Add(12 * time.Hour), // noon UTC for stable dedup
+		UserID:     userID,
+		MetricName: "sleep_analysis",
+		Source:     "FreeReps Backfill",
+		Units:      "hr",
+		Qty:        &qty,
+	}
+	if _, err := db.InsertHealthMetrics(ctx, []models.HealthMetricRow{sleepMetric}); err != nil {
+		return 1, fmt.Errorf("inserting backfill sleep_analysis metric: %w", err)
+	}
+	return 1, nil
 }

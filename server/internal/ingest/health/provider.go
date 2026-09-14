@@ -107,13 +107,14 @@ func (p *Provider) processMetrics(ctx context.Context, metrics []models.HealthMe
 	var healthRows []models.HealthMetricRow
 	rejectedSet := map[string]bool{}
 
+	// One allowlist query per payload, not one per metric name.
+	allowedNames, err := p.db.AllowedMetricNames(ctx)
+	if err != nil {
+		return fmt.Errorf("loading allowlist: %w", err)
+	}
+
 	for _, m := range metrics {
-		// Check allowlist
-		allowed, err := p.db.IsMetricAllowed(ctx, m.Name)
-		if err != nil {
-			return fmt.Errorf("checking allowlist for %s: %w", m.Name, err)
-		}
-		if !allowed {
+		if !allowedNames[m.Name] {
 			if !rejectedSet[m.Name] {
 				result.RejectedNames = append(result.RejectedNames, m.Name)
 				rejectedSet[m.Name] = true
@@ -223,6 +224,10 @@ func convertMetricDataPoint(name, units string, raw json.RawMessage, userID int)
 }
 
 func (p *Provider) processSleep(ctx context.Context, m models.HealthMetric, userID int, result *ingest.Result) error {
+	// Stage rows are collected and written in one statement below; one INSERT
+	// per stage made a night of Apple Health sleep cost fifty round trips.
+	var stageRows []models.SleepStageRow
+
 	for _, raw := range m.Data {
 		result.MetricsReceived++
 
@@ -284,21 +289,38 @@ func (p *Provider) processSleep(ctx context.Context, m models.HealthMetric, user
 			if !known {
 				p.log.Warn("unknown sleep stage name, storing as-is", "raw", dp.Value)
 			}
-			stageRow := models.SleepStageRow{
+			stageRows = append(stageRows, models.SleepStageRow{
 				StartTime:  dp.StartDate.Time,
 				EndTime:    dp.EndDate.Time,
 				UserID:     userID,
 				Stage:      stage,
 				DurationHr: dp.Qty,
-			}
-			inserted, err := p.db.InsertSleepStages(ctx, []models.SleepStageRow{stageRow})
-			if err != nil {
-				return err
-			}
-			result.SleepStagesInserted += inserted
+			})
 		}
 	}
+
+	if len(stageRows) > 0 {
+		inserted, err := p.db.InsertSleepStages(ctx, stageRows)
+		if err != nil {
+			return err
+		}
+		from, to := stageSpan(stageRows)
+		result.AddSleepStages(inserted, from, to)
+	}
 	return nil
+}
+
+// stageSpan returns the earliest start and latest end over the rows.
+func stageSpan(rows []models.SleepStageRow) (from, to time.Time) {
+	for i, r := range rows {
+		if i == 0 || r.StartTime.Before(from) {
+			from = r.StartTime
+		}
+		if i == 0 || r.EndTime.After(to) {
+			to = r.EndTime
+		}
+	}
+	return from, to
 }
 
 func (p *Provider) processWorkouts(ctx context.Context, workouts []models.HealthWorkout, userID int, result *ingest.Result) error {
@@ -706,7 +728,8 @@ func (p *Provider) processCategorySamples(ctx context.Context, samples []models.
 		if err != nil {
 			return fmt.Errorf("inserting sleep stages from category samples: %w", err)
 		}
-		result.SleepStagesInserted += inserted
+		from, to := stageSpan(sleepStages)
+		result.AddSleepStages(inserted, from, to)
 	}
 
 	return nil

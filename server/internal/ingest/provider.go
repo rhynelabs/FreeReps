@@ -1,5 +1,7 @@
 package ingest
 
+import "time"
+
 // Result holds the outcome of an ingest operation.
 type Result struct {
 	MetricsReceived int      `json:"metrics_received"`
@@ -10,6 +12,12 @@ type Result struct {
 
 	SleepSessionsInserted int `json:"sleep_sessions_inserted,omitempty"`
 	SleepStagesInserted   int64 `json:"sleep_stages_inserted,omitempty"`
+
+	// SleepStagesFrom and SleepStagesTo span the sleep stages this ingest
+	// wrote, so the caller can rebuild sessions for those nights alone. Both
+	// are zero while SleepStagesInserted is 0.
+	SleepStagesFrom time.Time `json:"-"`
+	SleepStagesTo   time.Time `json:"-"`
 
 	WorkoutsReceived int   `json:"workouts_received,omitempty"`
 	WorkoutsInserted int   `json:"workouts_inserted,omitempty"`
@@ -28,4 +36,21 @@ type Result struct {
 	CategorySamplesInserted  int64 `json:"category_samples_inserted,omitempty"`
 
 	Message string `json:"message,omitempty"`
+}
+
+// AddSleepStages counts inserted stage rows and widens the stage span to
+// cover [from, to]. A batch the database dropped entirely as duplicates
+// (inserted == 0) leaves the span alone, so an all-duplicate upload triggers
+// no session rebuild.
+func (r *Result) AddSleepStages(inserted int64, from, to time.Time) {
+	if inserted == 0 {
+		return
+	}
+	r.SleepStagesInserted += inserted
+	if r.SleepStagesFrom.IsZero() || from.Before(r.SleepStagesFrom) {
+		r.SleepStagesFrom = from
+	}
+	if to.After(r.SleepStagesTo) {
+		r.SleepStagesTo = to
+	}
 }

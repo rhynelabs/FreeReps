@@ -21,6 +21,29 @@ func (db *DB) IsMetricAllowed(ctx context.Context, metricName string) (bool, err
 	return enabled, nil
 }
 
+// AllowedMetricNames returns every allowlist entry keyed by name with its
+// enabled flag, so an ingest can check a whole payload with one query instead
+// of one IsMetricAllowed round trip per metric name. A name missing from the
+// map is not allowed, as in IsMetricAllowed.
+func (db *DB) AllowedMetricNames(ctx context.Context) (map[string]bool, error) {
+	rows, err := db.Pool.Query(ctx, `SELECT metric_name, enabled FROM metric_allowlist`)
+	if err != nil {
+		return nil, fmt.Errorf("querying metric allowlist: %w", err)
+	}
+	defer rows.Close()
+
+	allowed := map[string]bool{}
+	for rows.Next() {
+		var name string
+		var enabled bool
+		if err := rows.Scan(&name, &enabled); err != nil {
+			return nil, fmt.Errorf("scanning metric allowlist: %w", err)
+		}
+		allowed[name] = enabled
+	}
+	return allowed, rows.Err()
+}
+
 // AllowedMetric represents an entry in the metric allowlist with display metadata.
 type AllowedMetric struct {
 	MetricName        string  `json:"metric_name"`

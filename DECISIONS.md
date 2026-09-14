@@ -19,6 +19,30 @@ is as recorded there; where the record named no alternative, none is claimed.
 
 ---
 
+## 2026-09-14 — The sleep backfill after a REST ingest covers only the nights that ingest wrote
+
+**Decided:** 2026-09-14
+
+**Decision.** `POST /api/v1/ingest` rebuilds sleep sessions with
+`BackfillSleepSessionsFor(user, from, to)`, scoped to the user and to the span
+of the sleep stages the request inserted. The unscoped
+`BackfillSleepSessions` stays for startup and for the end of an HAE TCP
+import, where one full pass per run is the right size.
+
+**Reasoning.** The unscoped backfill reads every stage of every user and
+regroups them into nights, so a 500-row batch that happened to carry sleep
+data paid for the whole history — and did so on every batch of a history
+import. The scoped variant reads a window padded by three days on each side
+and writes only nights that overlap the ingested span, whole or not at all:
+the insert is `ON CONFLICT DO NOTHING` (2026-03-26 incident), so a night
+truncated at the window edge would become a short session nothing later
+corrects.
+
+**Trigger to re-open.** A sleep source whose stages chain across more than
+three days with gaps under 12 hours, or a change to the night-grouping rule.
+
+---
+
 ## 2026-09-14 — The iOS app can run its own Tailscale node
 
 **Decided:** 2026-09-14

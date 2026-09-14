@@ -48,7 +48,10 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if result.SleepStagesInserted > 0 {
-		if err := s.db.BackfillSleepSessions(r.Context(), s.log); err != nil {
+		// Only the nights this payload touched. The unscoped backfill reads
+		// every stage of every user, which made a batch with a few sleep rows
+		// cost as much as the whole history.
+		if _, err := s.db.BackfillSleepSessionsFor(r.Context(), s.log, uid, result.SleepStagesFrom, result.SleepStagesTo); err != nil {
 			s.log.Warn("sleep session backfill after REST ingest failed", "error", err)
 		}
 	}
