@@ -461,7 +461,30 @@ final class ServerOverview: ObservableObject {
     @Published private(set) var steps: Steps?
     @Published private(set) var workouts: [Workout]?
 
+    /// The load in flight, if any. Appearance, the end of a sync and a pull to
+    /// refresh each ask for a load and tend to arrive within the same second;
+    /// one set of requests serves them all.
+    private var inFlight: Task<Void, Never>?
+
     func load() async {
+        if let inFlight {
+            await inFlight.value
+            return
+        }
+        let task = Task { await fetch() }
+        inFlight = task
+        defer { inFlight = nil }
+        // The caller that started the load owns it: when SwiftUI cancels that
+        // caller, the requests stop as they did before the load was shared.
+        // Callers that only joined return quietly, the last values still shown.
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    private func fetch() async {
         // Placeholders while nothing is known; a refresh keeps the last values on screen.
         if stats == nil { state = .loading }
         let service = FreeRepsService(config: .load())
