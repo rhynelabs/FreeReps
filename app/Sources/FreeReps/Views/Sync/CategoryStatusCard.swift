@@ -9,6 +9,9 @@ struct CategoryStatusCard: View {
     var isIncluded: Bool = true
     /// Set while an older-data sync has not finished this category.
     var olderData: SyncState.OlderDataProgress? = nil
+    /// True for the Weight Training card: it is filled by the CSV import,
+    /// no sync ever touches it, so it neither waits for one nor offers one.
+    var isImport: Bool = false
 
     @State private var showResetConfirm = false
 
@@ -62,7 +65,7 @@ struct CategoryStatusCard: View {
         .padding(.vertical, 2)
         .opacity(isIncluded ? 1 : 0.5)
         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-            if !isSyncRunning && isIncluded {
+            if !isSyncRunning && isIncluded && !isImport {
                 Button {
                     onSync?()
                 } label: {
@@ -140,6 +143,10 @@ struct CategoryStatusCard: View {
     /// One honest line: "n new records" is what the server inserted in the last run, so a
     /// re-sent category reads "Nothing new" rather than a small number.
     private var detail: String {
+        if isImport {
+            guard state.lastSyncDate != nil else { return "Import a CSV from Alpha Progression" }
+            return state.recordCount == 1 ? "1 set imported" : "\(state.recordCount.formatted()) sets imported"
+        }
         guard isIncluded else { return "Off" }
         switch state.status {
         case .syncing:
@@ -169,13 +176,16 @@ struct CategoryStatusCard: View {
         if case .failed = state.status { return true } else { return false }
     }
 
+    /// Blue means syncing and nothing else: an idle category waiting its turn
+    /// in a run is gray, so the eye finds the ones that are actually working.
     private var iconColor: Color {
+        if isImport { return state.lastSyncDate != nil ? .green : .secondary }
         guard isIncluded else { return .secondary }
         switch state.status {
         case .failed:    return .red
         case .syncing:   return .blue
         case .completed: return .green
-        case .idle:      return state.daysBehind != nil ? .orange : .blue
+        case .idle:      return state.daysBehind != nil ? .orange : .secondary
         }
     }
 }

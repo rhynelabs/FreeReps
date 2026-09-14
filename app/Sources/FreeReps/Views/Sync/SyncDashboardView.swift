@@ -7,6 +7,8 @@ struct SyncDashboardView: View {
     @EnvironmentObject var importState: ImportState
     @State private var navigateToHealthPermissions = false
     @State private var showFilePicker = false
+    /// A throttled copy of `vm.currentOperation` for the Categories footer.
+    @State private var operationFooter = ""
     @ObservedObject private var selection = HealthSyncSelection.shared
 
     var body: some View {
@@ -80,8 +82,10 @@ struct SyncDashboardView: View {
                             onReset: { vm.resetCategory(categoryID: cat.id) },
                             onSync: { vm.startCategorySync(categoryID: cat.id) },
                             isSyncRunning: vm.isAnySyncRunning,
-                            isIncluded: selection.isEnabled && selection.includes(cat.id),
-                            olderData: cat.id == "cat_strength" ? nil : vm.syncState.olderDataProgress(for: cat.id)
+                            // The import card is not part of the Apple Health selection.
+                            isIncluded: cat.id == "cat_strength" || (selection.isEnabled && selection.includes(cat.id)),
+                            olderData: cat.id == "cat_strength" ? nil : vm.syncState.olderDataProgress(for: cat.id),
+                            isImport: cat.id == "cat_strength"
                         )
                     }
                 } header: {
@@ -89,9 +93,12 @@ struct SyncDashboardView: View {
                 } footer: {
                     // The full account of the run, with the rows the server has
                     // acknowledged per category, lives here rather than in the
-                    // header: it grows to six lines while categories run side by side.
-                    if vm.isAnySyncRunning && !vm.currentOperation.isEmpty {
-                        Text(vm.currentOperation)
+                    // header. Four lines hold the six-category sentence; the
+                    // height is fixed and the text refreshed on a timer, or the
+                    // section below jumps with every window.
+                    if vm.isAnySyncRunning && !operationFooter.isEmpty {
+                        Text(operationFooter)
+                            .lineLimit(4, reservesSpace: true)
                     }
                 }
 
@@ -112,6 +119,17 @@ struct SyncDashboardView: View {
                 vm.refreshRecordCounts()
                 vm.checkPrerequisites()
                 vm.refreshLatestHealthKitDates()
+            }
+            // The service rewrites currentOperation for every window of every
+            // category, several times a second. Copy it every 1.5 s while a run
+            // is going; the restart on the id change catches the final text.
+            .task(id: vm.isAnySyncRunning) {
+                operationFooter = vm.currentOperation
+                guard vm.isAnySyncRunning else { return }
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(1.5))
+                    operationFooter = vm.currentOperation
+                }
             }
             .fileImporter(
                 isPresented: $showFilePicker,

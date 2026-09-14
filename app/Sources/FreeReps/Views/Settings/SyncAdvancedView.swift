@@ -7,6 +7,9 @@ struct SyncAdvancedView: View {
     /// True for a few seconds after a reset, so the row itself confirms it:
     /// the alert closes without a trace otherwise.
     @State private var didResetSyncState = false
+    /// The feedback timer, so a second reset restarts the 3 seconds instead of
+    /// letting the first timer end them early.
+    @State private var resetFeedbackTask: Task<Void, Never>?
 
     var body: some View {
         List {
@@ -42,7 +45,9 @@ struct SyncAdvancedView: View {
                              : "Clears all sync progress. Next sync will re-send all data.")
                     }
                 }
-                .disabled(syncViewModel.isAnySyncRunning || didResetSyncState)
+                // Stays enabled during the confirmation feedback: a second reset
+                // is harmless and only restarts the feedback.
+                .disabled(syncViewModel.isAnySyncRunning)
                 .animation(.default, value: didResetSyncState)
             }
         }
@@ -53,8 +58,10 @@ struct SyncAdvancedView: View {
             Button("Reset", role: .destructive) {
                 syncViewModel.resetAllSyncState()
                 didResetSyncState = true
-                Task {
+                resetFeedbackTask?.cancel()
+                resetFeedbackTask = Task {
                     try? await Task.sleep(for: .seconds(3))
+                    guard !Task.isCancelled else { return }
                     didResetSyncState = false
                 }
             }
