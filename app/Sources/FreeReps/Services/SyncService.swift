@@ -401,9 +401,13 @@ final class SyncService: ObservableObject {
 
     /// Older data weighs its progress by rows instead of steps: a window of
     /// Vitals holds a hundred times the rows of one of Nutrition, so equal
-    /// steps left the last five per cent taking a third of the run. Each
-    /// category's windows still to come are estimated at its own rows per
-    /// acknowledged window, or at the run's average until it has one.
+    /// steps left the last five per cent taking a third of the run. Windows
+    /// run oldest to newest, and over a long range the early ones are empty
+    /// — a phone from 2015 has nothing for 1999 — so each category's windows
+    /// still to come are estimated at its rows per *non-empty* acknowledged
+    /// window, or at its last non-empty one when that held more; averaging
+    /// the empty ones in put the bar at 99 % with every heavy window ahead.
+    /// A category without a non-empty window yet takes the run's average.
     private var weighsRows = false
     private var rowEstimates: [String: RowEstimate] = [:]
     /// Rows acknowledged in windows still open, by "category/index".
@@ -411,8 +415,19 @@ final class SyncService: ObservableObject {
 
     private struct RowEstimate {
         var windowsLeft: Int
-        var windowsAcked = 0
+        /// Every row the server acknowledged, empty windows and the
+        /// acknowledged part of a failed window included.
         var rowsAcked = 0
+        var nonEmptyWindows = 0
+        var rowsInNonEmptyWindows = 0
+        var lastNonEmptyRows = 0
+
+        /// Rows expected of one window still to come, or nil without a
+        /// non-empty window to judge by.
+        var rowsPerWindow: Double? {
+            guard nonEmptyWindows > 0 else { return nil }
+            return max(Double(rowsInNonEmptyWindows) / Double(nonEmptyWindows), Double(lastNonEmptyRows))
+        }
     }
 
     /// Requests of a run in flight at once, across every uploader. The server
@@ -469,26 +484,30 @@ final class SyncService: ObservableObject {
     /// window may have collected twice.
     private func windowAcknowledged(_ catID: String, key: String, rows: Int, windows: Int = 1) {
         let partial = partialRows.removeValue(forKey: key) ?? 0
+        let rows = max(rows, partial)
         var estimate = rowEstimates[catID] ?? RowEstimate(windowsLeft: windows)
         estimate.windowsLeft = max(estimate.windowsLeft - windows, 0)
-        estimate.windowsAcked += windows
-        estimate.rowsAcked += max(rows, partial)
+        estimate.rowsAcked += rows
+        if rows > 0 {
+            estimate.nonEmptyWindows += windows
+            estimate.rowsInNonEmptyWindows += rows
+            estimate.lastNonEmptyRows = rows / windows
+        }
         rowEstimates[catID] = estimate
     }
 
     /// Rows acknowledged over rows acknowledged plus the estimate of the rest;
-    /// nil before any window is acknowledged, when there is nothing to
-    /// estimate from.
+    /// nil until some window with rows is acknowledged, when there is nothing
+    /// to estimate from. The windows left are the newest of each category,
+    /// so taking them all as non-empty is right.
     private func rowsWeightedProgress() -> Double? {
-        let windowsAcked = rowEstimates.values.reduce(0) { $0 + $1.windowsAcked }
-        guard windowsAcked > 0 else { return nil }
-        let rowsInWindows = rowEstimates.values.reduce(0) { $0 + $1.rowsAcked }
-        let runAverage = Double(rowsInWindows) / Double(windowsAcked)
+        let nonEmptyWindows = rowEstimates.values.reduce(0) { $0 + $1.nonEmptyWindows }
+        guard nonEmptyWindows > 0 else { return nil }
+        let runAverage = Double(rowEstimates.values.reduce(0) { $0 + $1.rowsInNonEmptyWindows }) / Double(nonEmptyWindows)
         let remaining = rowEstimates.values.reduce(0.0) { sum, estimate in
-            let average = estimate.windowsAcked > 0 ? Double(estimate.rowsAcked) / Double(estimate.windowsAcked) : runAverage
-            return sum + average * Double(estimate.windowsLeft)
+            sum + (estimate.rowsPerWindow ?? runAverage) * Double(estimate.windowsLeft)
         }
-        let acked = Double(rowsInWindows + partialRows.values.reduce(0, +))
+        let acked = Double(rowEstimates.values.reduce(0) { $0 + $1.rowsAcked } + partialRows.values.reduce(0, +))
         guard acked + remaining > 0 else { return 1 }
         return acked / (acked + remaining)
     }
@@ -497,7 +516,7 @@ final class SyncService: ObservableObject {
     /// the rows estimate stops at 0.99 until `completeRun`, because it is one.
     private func refreshProgress() {
         let steps = min(1, (Double(runStepsDone) + partialSteps.values.reduce(0, +)) / Double(runStepsTotal))
-        let value = weighsRows ? min(rowsWeightedProgress() ?? steps, 0.99) : steps
+        let value = weighsRows ? min(rowsWeightedProgress() ?? 0, 0.99) : steps
         syncState.overallProgress = max(syncState.overallProgress, value)
     }
 
@@ -508,6 +527,8 @@ final class SyncService: ObservableObject {
     /// Windows left to read for a category between `start` and `anchor`.
     private func windowsLeft(for catID: String, from start: Date, until anchor: Date) -> Int {
         let cursor = max(syncState.backfillCursors[catID] ?? start, start)
+    /// Before it exists the bar stays at 0 rather than racing up the step
+    /// count through the empty early windows, which take seconds.
         guard cursor < anchor else { return 0 }
         return Int(ceil(anchor.timeIntervalSince(cursor) / Self.backfillWindow))
     }
