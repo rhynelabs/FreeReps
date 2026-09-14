@@ -362,7 +362,11 @@ func stageSpan(rows []models.SleepStageRow) (from, to time.Time) {
 	return from, to
 }
 
+// processWorkouts converts the request's workouts and writes them in one
+// transaction: the rows, then the heart-rate points, then the route points.
+// A workout whose id is not a UUID is counted as received and skipped.
 func (p *Provider) processWorkouts(ctx context.Context, workouts []models.HealthWorkout, userID int, result *ingest.Result) error {
+	var batch storage.WorkoutBatch
 	for _, w := range workouts {
 		result.WorkoutsReceived++
 
@@ -421,59 +425,43 @@ func (p *Provider) processWorkouts(ctx context.Context, workouts []models.Health
 			}
 		}
 
-		inserted, err := p.db.InsertWorkout(ctx, row)
-		if err != nil {
-			return fmt.Errorf("inserting workout %s: %w", w.ID, err)
-		}
-		if inserted {
-			result.WorkoutsInserted++
-		}
+		batch.Workouts = append(batch.Workouts, row)
 
-		// Insert HR time-series (ON CONFLICT DO NOTHING — safe for backfill)
-		if len(w.HeartRateData) > 0 {
-			hrRows := make([]models.WorkoutHRRow, len(w.HeartRateData))
-			for i, hr := range w.HeartRateData {
-				hrRows[i] = models.WorkoutHRRow{
-					Time:      hr.Date.Time,
-					WorkoutID: workoutID,
-					UserID:    userID,
-					MinBPM:    &hr.Min,
-					AvgBPM:    &hr.Avg,
-					MaxBPM:    &hr.Max,
-					Source:    hr.Source,
-				}
-			}
-			n, err := p.db.InsertWorkoutHeartRate(ctx, hrRows)
-			if err != nil {
-				return fmt.Errorf("inserting workout HR: %w", err)
-			}
-			result.WorkoutHRPoints += n
+		// HR time-series and route points (ON CONFLICT DO NOTHING — safe for backfill)
+		for _, hr := range w.HeartRateData {
+			batch.HeartRate = append(batch.HeartRate, models.WorkoutHRRow{
+				Time:      hr.Date.Time,
+				WorkoutID: workoutID,
+				UserID:    userID,
+				MinBPM:    &hr.Min,
+				AvgBPM:    &hr.Avg,
+				MaxBPM:    &hr.Max,
+				Source:    hr.Source,
+			})
 		}
-
-		// Insert route data
-		if len(w.Route) > 0 {
-			routeRows := make([]models.WorkoutRouteRow, len(w.Route))
-			for i, rp := range w.Route {
-				routeRows[i] = models.WorkoutRouteRow{
-					Time:               rp.Timestamp.Time,
-					WorkoutID:          workoutID,
-					UserID:             userID,
-					Latitude:           rp.Latitude,
-					Longitude:          rp.Longitude,
-					Altitude:           &rp.Altitude,
-					Speed:              &rp.Speed,
-					Course:             &rp.Course,
-					HorizontalAccuracy: &rp.HorizontalAccuracy,
-					VerticalAccuracy:   &rp.VerticalAccuracy,
-				}
-			}
-			n, err := p.db.InsertWorkoutRoutes(ctx, routeRows)
-			if err != nil {
-				return fmt.Errorf("inserting workout routes: %w", err)
-			}
-			result.WorkoutRoutePoints += n
+		for _, rp := range w.Route {
+			batch.Routes = append(batch.Routes, models.WorkoutRouteRow{
+				Time:               rp.Timestamp.Time,
+				WorkoutID:          workoutID,
+				UserID:             userID,
+				Latitude:           rp.Latitude,
+				Longitude:          rp.Longitude,
+				Altitude:           &rp.Altitude,
+				Speed:              &rp.Speed,
+				Course:             &rp.Course,
+				HorizontalAccuracy: &rp.HorizontalAccuracy,
+				VerticalAccuracy:   &rp.VerticalAccuracy,
+			})
 		}
 	}
+
+	counts, err := p.db.InsertWorkoutBatch(ctx, batch)
+	if err != nil {
+		return fmt.Errorf("inserting workouts: %w", err)
+	}
+	result.WorkoutsInserted += int(counts.Workouts)
+	result.WorkoutHRPoints += counts.HRPoints
+	result.WorkoutRoutePoints += counts.RoutePoints
 	return nil
 }
 

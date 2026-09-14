@@ -19,6 +19,34 @@ is as recorded there; where the record named no alternative, none is claimed.
 
 ---
 
+## 2026-09-14 — A request's workouts are written in one transaction, not one per workout
+
+**Decided:** 2026-09-14
+
+**Decision.** The health ingest path inserts all workouts of a request in one
+multi-row statement, then all their heart-rate points, then all their route
+points, inside a single `withAsyncCommit` transaction
+(`InsertWorkoutBatch`, `server/internal/storage/workouts.go`). Duplicate ids
+within a payload are collapsed first; a workout whose id is not a UUID is
+still counted as received and skipped with the same log line. The single
+`InsertWorkout` with a synchronous commit stays for the Oura sync and the demo
+seed.
+
+**Reasoning.** Measured on the deployed server from the iOS client's trace: one
+request with 151 workouts (809 KB, a few dozen heart-rate points each, no
+routes) took 44 s, while 5,000-row metric batches in the same run took
+1.5–2.5 s. Each workout was its own synchronous commit — one fsync on the
+NAS's disk — followed by a second transaction for its heart-rate points, so
+the request paid ~300 statements and 151 fsyncs for 151 rows. The workouts
+table is the foreign-key target of both point tables, which is why the
+workouts go first and all three go in the same transaction.
+
+**Trigger to re-open.** A request whose workouts do not fit one statement in
+memory — the chunking keeps each statement under the 65,535-parameter limit,
+but the transaction holds the whole request.
+
+---
+
 ## 2026-09-14 — Ingest batches commit without waiting for the disk
 
 **Decided:** 2026-09-14

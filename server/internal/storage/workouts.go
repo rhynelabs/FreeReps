@@ -44,15 +44,178 @@ func syntheticWorkoutEnd(s SetSessionInfo) time.Time {
 	return s.SessionDate.Add(parseAlphaDuration(s.SessionDuration))
 }
 
-// InsertWorkout inserts a workout row. Returns true if inserted, false if duplicate.
+// Rows per multi-row INSERT for each of the three workout tables. The extended
+// protocol allows 65,535 parameters per statement; each chunk stays under that
+// with the column count of its table (21, 7 and 10).
+const (
+	workoutRowsPerStatement      = 3000
+	workoutHRRowsPerStatement    = 9000
+	workoutRouteRowsPerStatement = 6000
+)
+
+// insertWorkoutsSQL takes the workout columns as a multi-row VALUES list.
+// The primary key is the HealthKit UUID, so a re-sent workout is a no-op and
+// the command tag counts only the rows that were new.
+const insertWorkoutsSQL = `INSERT INTO workouts (id, user_id, name, source, start_time, end_time, duration_sec, location, is_indoor,
+	 active_energy_burned, active_energy_units, total_energy, total_energy_units,
+	 distance, distance_units, avg_heart_rate, max_heart_rate, min_heart_rate,
+	 elevation_up, elevation_down, raw_json) VALUES `
+
+const insertWorkoutHeartRateSQL = `INSERT INTO workout_heart_rate (time, workout_id, user_id, min_bpm, avg_bpm, max_bpm, source) VALUES `
+
+const insertWorkoutRoutesSQL = `INSERT INTO workout_routes (time, workout_id, user_id, latitude, longitude, altitude, speed, course, horizontal_accuracy, vertical_accuracy) VALUES `
+
+// valuesPlaceholders renders the "($1,$2),($3,$4)" part of a multi-row
+// INSERT for rows rows of width columns each.
+func valuesPlaceholders(rows, width int) string {
+	var sb strings.Builder
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('(')
+		for j := 0; j < width; j++ {
+			if j > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteByte('$')
+			sb.WriteString(strconv.Itoa(i*width + j + 1))
+		}
+		sb.WriteByte(')')
+	}
+	return sb.String()
+}
+
+// WorkoutBatch is what one ingest request carries for the workouts table and
+// its two point tables.
+type WorkoutBatch struct {
+	Workouts  []models.WorkoutRow
+	HeartRate []models.WorkoutHRRow
+	Routes    []models.WorkoutRouteRow
+}
+
+// WorkoutBatchCounts reports the rows InsertWorkoutBatch inserted, per table.
+type WorkoutBatchCounts struct {
+	Workouts    int64
+	HRPoints    int64
+	RoutePoints int64
+}
+
+// InsertWorkoutBatch inserts the workouts of one request, then their heart-rate
+// points, then their route points, in one transaction. Rows that already exist
+// are skipped and not counted.
+//
+// One transaction rather than one per workout: a request with 151 workouts
+// took 44 s on the deployed server, because each workout was its own
+// synchronous commit — one fsync on the NAS's disk — followed by a second
+// transaction for its heart-rate points. The points reference the workouts by
+// foreign key, so the workouts go first inside the same transaction.
+func (db *DB) InsertWorkoutBatch(ctx context.Context, b WorkoutBatch) (WorkoutBatchCounts, error) {
+	var counts WorkoutBatchCounts
+	if len(b.Workouts) == 0 && len(b.HeartRate) == 0 && len(b.Routes) == 0 {
+		return counts, nil
+	}
+	b.Workouts = dedupeWorkoutRows(b.Workouts)
+
+	// An ingest write: the app re-sends what a lost commit would drop.
+	err := db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
+		var err error
+		if counts.Workouts, err = insertWorkouts(ctx, tx, b.Workouts); err != nil {
+			return err
+		}
+		if counts.HRPoints, err = insertWorkoutHeartRate(ctx, tx, b.HeartRate); err != nil {
+			return err
+		}
+		counts.RoutePoints, err = insertWorkoutRoutes(ctx, tx, b.Routes)
+		return err
+	})
+	return counts, err
+}
+
+// dedupeWorkoutRows keeps the last row per id. The primary key would skip the
+// repeat anyway, but not before its raw_json travelled to the server twice.
+func dedupeWorkoutRows(rows []models.WorkoutRow) []models.WorkoutRow {
+	lastAt := make(map[uuid.UUID]int, len(rows))
+	for i, r := range rows {
+		lastAt[r.ID] = i
+	}
+	if len(lastAt) == len(rows) {
+		return rows
+	}
+
+	kept := make([]models.WorkoutRow, 0, len(lastAt))
+	for i, r := range rows {
+		if lastAt[r.ID] == i {
+			kept = append(kept, r)
+		}
+	}
+	return kept
+}
+
+func insertWorkouts(ctx context.Context, tx pgx.Tx, rows []models.WorkoutRow) (int64, error) {
+	var total int64
+	for start := 0; start < len(rows); start += workoutRowsPerStatement {
+		chunk := rows[start:min(start+workoutRowsPerStatement, len(rows))]
+		args := make([]any, 0, len(chunk)*21)
+		for _, r := range chunk {
+			args = append(args, r.ID, r.UserID, r.Name, r.Source, r.StartTime, r.EndTime, r.DurationSec,
+				r.Location, r.IsIndoor,
+				r.ActiveEnergyBurned, r.ActiveEnergyUnits, r.TotalEnergy, r.TotalEnergyUnits,
+				r.Distance, r.DistanceUnits, r.AvgHeartRate, r.MaxHeartRate, r.MinHeartRate,
+				r.ElevationUp, r.ElevationDown, r.RawJSON)
+		}
+		query := insertWorkoutsSQL + valuesPlaceholders(len(chunk), 21) + " ON CONFLICT DO NOTHING"
+		tag, err := tx.Exec(ctx, query, args...)
+		if err != nil {
+			return total, fmt.Errorf("inserting workouts: %w", err)
+		}
+		total += tag.RowsAffected()
+	}
+	return total, nil
+}
+
+func insertWorkoutHeartRate(ctx context.Context, tx pgx.Tx, rows []models.WorkoutHRRow) (int64, error) {
+	var total int64
+	for start := 0; start < len(rows); start += workoutHRRowsPerStatement {
+		chunk := rows[start:min(start+workoutHRRowsPerStatement, len(rows))]
+		args := make([]any, 0, len(chunk)*7)
+		for _, r := range chunk {
+			args = append(args, r.Time, r.WorkoutID, r.UserID, r.MinBPM, r.AvgBPM, r.MaxBPM, r.Source)
+		}
+		query := insertWorkoutHeartRateSQL + valuesPlaceholders(len(chunk), 7) + " ON CONFLICT DO NOTHING"
+		tag, err := tx.Exec(ctx, query, args...)
+		if err != nil {
+			return total, fmt.Errorf("inserting workout heart rate: %w", err)
+		}
+		total += tag.RowsAffected()
+	}
+	return total, nil
+}
+
+func insertWorkoutRoutes(ctx context.Context, tx pgx.Tx, rows []models.WorkoutRouteRow) (int64, error) {
+	var total int64
+	for start := 0; start < len(rows); start += workoutRouteRowsPerStatement {
+		chunk := rows[start:min(start+workoutRouteRowsPerStatement, len(rows))]
+		args := make([]any, 0, len(chunk)*10)
+		for _, r := range chunk {
+			args = append(args, r.Time, r.WorkoutID, r.UserID, r.Latitude, r.Longitude,
+				r.Altitude, r.Speed, r.Course, r.HorizontalAccuracy, r.VerticalAccuracy)
+		}
+		query := insertWorkoutRoutesSQL + valuesPlaceholders(len(chunk), 10) + " ON CONFLICT DO NOTHING"
+		tag, err := tx.Exec(ctx, query, args...)
+		if err != nil {
+			return total, fmt.Errorf("inserting workout routes: %w", err)
+		}
+		total += tag.RowsAffected()
+	}
+	return total, nil
+}
+
+// InsertWorkout inserts a single workout row with a synchronous commit, for
+// the Oura sync and the demo seed. Returns true if inserted, false if duplicate.
 func (db *DB) InsertWorkout(ctx context.Context, row models.WorkoutRow) (bool, error) {
 	tag, err := db.Pool.Exec(ctx,
-		`INSERT INTO workouts (id, user_id, name, source, start_time, end_time, duration_sec, location, is_indoor,
-		 active_energy_burned, active_energy_units, total_energy, total_energy_units,
-		 distance, distance_units, avg_heart_rate, max_heart_rate, min_heart_rate,
-		 elevation_up, elevation_down, raw_json)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-		 ON CONFLICT DO NOTHING`,
+		insertWorkoutsSQL+valuesPlaceholders(1, 21)+" ON CONFLICT DO NOTHING",
 		row.ID, row.UserID, row.Name, row.Source, row.StartTime, row.EndTime, row.DurationSec,
 		row.Location, row.IsIndoor,
 		row.ActiveEnergyBurned, row.ActiveEnergyUnits, row.TotalEnergy, row.TotalEnergyUnits,
@@ -64,87 +227,19 @@ func (db *DB) InsertWorkout(ctx context.Context, row models.WorkoutRow) (bool, e
 	return tag.RowsAffected() > 0, nil
 }
 
-// InsertWorkoutHeartRate batch-inserts workout HR data points. Returns count inserted.
+// InsertWorkoutHeartRate batch-inserts workout HR data points on their own,
+// for the demo seed. Returns count inserted.
 func (db *DB) InsertWorkoutHeartRate(ctx context.Context, rows []models.WorkoutHRRow) (int64, error) {
 	if len(rows) == 0 {
 		return 0, nil
 	}
-
-	query := `INSERT INTO workout_heart_rate (time, workout_id, user_id, min_bpm, avg_bpm, max_bpm, source) VALUES `
-	args := make([]any, 0, len(rows)*7)
-	valueStrings := make([]string, 0, len(rows))
-
-	for i, r := range rows {
-		base := i * 7
-		valueStrings = append(valueStrings, fmt.Sprintf(
-			"($%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7,
-		))
-		args = append(args, r.Time, r.WorkoutID, r.UserID, r.MinBPM, r.AvgBPM, r.MaxBPM, r.Source)
-	}
-
-	query += strings.Join(valueStrings, ",") + " ON CONFLICT DO NOTHING"
-
-	// An ingest write: the app re-sends what a lost commit would drop.
 	var inserted int64
 	err := db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, query, args...)
-		if err != nil {
-			return fmt.Errorf("inserting workout heart rate: %w", err)
-		}
-		inserted = tag.RowsAffected()
-		return nil
+		var err error
+		inserted, err = insertWorkoutHeartRate(ctx, tx, rows)
+		return err
 	})
 	return inserted, err
-}
-
-// InsertWorkoutRoutes batch-inserts workout route points. Returns count inserted.
-func (db *DB) InsertWorkoutRoutes(ctx context.Context, rows []models.WorkoutRouteRow) (int64, error) {
-	if len(rows) == 0 {
-		return 0, nil
-	}
-
-	// 10 params per row; PostgreSQL extended protocol limited to 65535 params.
-	const batchSize = 6000
-	var total int64
-
-	for start := 0; start < len(rows); start += batchSize {
-		end := start + batchSize
-		if end > len(rows) {
-			end = len(rows)
-		}
-		batch := rows[start:end]
-
-		query := `INSERT INTO workout_routes (time, workout_id, user_id, latitude, longitude, altitude, speed, course, horizontal_accuracy, vertical_accuracy) VALUES `
-		args := make([]any, 0, len(batch)*10)
-		valueStrings := make([]string, 0, len(batch))
-
-		for i, r := range batch {
-			base := i * 10
-			valueStrings = append(valueStrings, fmt.Sprintf(
-				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-				base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
-			))
-			args = append(args, r.Time, r.WorkoutID, r.UserID, r.Latitude, r.Longitude,
-				r.Altitude, r.Speed, r.Course, r.HorizontalAccuracy, r.VerticalAccuracy)
-		}
-
-		query += strings.Join(valueStrings, ",") + " ON CONFLICT DO NOTHING"
-
-		// An ingest write: the app re-sends what a lost commit would drop.
-		err := db.withAsyncCommit(ctx, func(tx pgx.Tx) error {
-			tag, err := tx.Exec(ctx, query, args...)
-			if err != nil {
-				return fmt.Errorf("inserting workout routes: %w", err)
-			}
-			total += tag.RowsAffected()
-			return nil
-		})
-		if err != nil {
-			return total, err
-		}
-	}
-	return total, nil
 }
 
 // WorkoutDetail is a workout with its HR and route data.
