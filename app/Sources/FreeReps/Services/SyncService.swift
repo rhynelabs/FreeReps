@@ -718,9 +718,8 @@ final class SyncService: ObservableObject {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch where retries < 3 {
-                    // Generic retry with backoff
                     retries += 1
-                    try await Task.sleep(nanoseconds: UInt64(retries) * 500_000_000)
+                    try await Task.sleep(for: Self.retryDelays[retries - 1])
                 } catch {
                     throw backfillFailure(error, category: catID, start: cursor, end: windowEnd)
                 }
@@ -737,6 +736,10 @@ final class SyncService: ObservableObject {
         }
         return total
     }
+
+    /// Pauses between attempts at one window. A server restart takes longer than
+    /// a blip, so the pauses grow to cover one.
+    private static let retryDelays: [Duration] = [.seconds(2), .seconds(5), .seconds(10)]
 
     /// Backfills a special (non-quantity) category in 90-day windows, resuming from cursor.
     private func backfillSpecialCategory(
@@ -771,9 +774,8 @@ final class SyncService: ObservableObject {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch where retries < 3 {
-                    // Generic retry with backoff
                     retries += 1
-                    try await Task.sleep(nanoseconds: UInt64(retries) * 500_000_000)
+                    try await Task.sleep(for: Self.retryDelays[retries - 1])
                 } catch {
                     throw backfillFailure(error, category: catID, start: cursor, end: windowEnd)
                 }
@@ -785,9 +787,9 @@ final class SyncService: ObservableObject {
             windowIdx += 1
             syncState.backfillCursors[catID] = cursor
             syncState.persist()
+            advanceRun()
             updateLiveActivity(phase: category?.displayName ?? catID, operation: op, records: syncState.newRecordsThisRun)
         }
-            advanceRun()
         return total
     }
 
@@ -905,9 +907,9 @@ final class SyncService: ObservableObject {
                             await semaphore.wait()
                             defer { Task { await semaphore.signal() } }
                             try checkSelection()
+                            defer { advanceRun() }
                             do {
                                 await SyncTrace.shared.record("quantity.started", ["type": typeDesc.id])
-                            defer { advanceRun() }
                                 let count = try await syncQuantityType(typeDesc: typeDesc, since: querySince)
                                 await SyncTrace.shared.record("quantity.finished", ["type": typeDesc.id])
                                 return (count, nil)
@@ -973,12 +975,12 @@ final class SyncService: ObservableObject {
                     if isBackgroundSync, (error as? HKError)?.code == .errorDatabaseInaccessible {
                         throw error
                     }
-                }
-            }
                     failedCategories.append(special.name)
                     syncState.updateCategory(special.id, status: .failed(error.localizedDescription))
-
+                }
                 advanceRun()
+            }
+
             try checkSelection()
             if !failedCategories.isEmpty {
                 syncState.errorMessage = "Sync completed with errors in: \(failedCategories.joined(separator: ", "))"
