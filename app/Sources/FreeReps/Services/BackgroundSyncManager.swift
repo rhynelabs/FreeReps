@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import HealthKit
 import UIKit
@@ -16,12 +17,44 @@ final class BackgroundSyncManager {
 
     private let healthStore = HealthKitService.shared.store
     private var observerQueries: [HKObserverQuery] = []
+    /// Sample types that changed since the last observer-triggered run. Non-empty
+    /// means a run is owed; the set stays filled while a run is in progress or
+    /// the quiet period is being waited out.
     private var pendingTypes: Set<String> = []
+    /// The one timer for the pending run. Every observer event replaces it, so
+    /// a burst of events ends in a single run.
     private var debounceTask: Task<Void, Never>?
     private var isSyncing = false
     private var observationGeneration = 0
+    /// When the last sync run of any kind ended — manual, scheduled or
+    /// observer-triggered. Read off `SyncState`, so the sync path stays untouched.
+    private var lastSyncEnded: Date?
+    private var cancellables = Set<AnyCancellable>()
 
-    private init() {}
+    /// Multiple types change at once (a workout saves distance, energy and
+    /// heart rate together); wait this long for all of them to arrive.
+    private static let debounceInterval: TimeInterval = 5
+    /// Observer events keep arriving while and right after a sync writes to the
+    /// server — the device trace shows runs 2–5 s apart. Nothing that lands in
+    /// this span after a run is worth a run of its own.
+    private static let quietInterval: TimeInterval = 60
+
+    private init() {
+        // The end of any run starts the quiet period. A change that arrived
+        // during the run is still pending, so the run's end also schedules it.
+        let state = SyncState.shared
+        Publishers.CombineLatest(state.$isFullSyncRunning, state.$isIncrementalSyncRunning)
+            .map { $0 || $1 }
+            .removeDuplicates()
+            .dropFirst()
+            .filter { !$0 }
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.lastSyncEnded = Date()
+                if !self.pendingTypes.isEmpty { self.scheduleSync() }
+            }
+            .store(in: &cancellables)
+    }
 
     // MARK: - Public API
 
@@ -91,17 +124,34 @@ final class BackgroundSyncManager {
         }
 
         pendingTypes.insert(sampleType.identifier)
-        debounceAndSync()
+        scheduleSync()
     }
 
-    /// Debounce rapid-fire observer callbacks. Multiple types can change at once
-    /// (e.g. workout saves distance, energy, heart rate simultaneously). Wait 5s
-    /// for all updates to arrive, then trigger a single incremental sync.
-    private func debounceAndSync() {
+    /// How long the quiet period after the last run still has to go; nil once
+    /// it is over or no run has ended yet.
+    private var quietTimeRemaining: TimeInterval? {
+        guard let lastSyncEnded else { return nil }
+        let remaining = Self.quietInterval - Date().timeIntervalSince(lastSyncEnded)
+        return remaining > 0 ? remaining : nil
+    }
+
+    /// One run for everything that arrived: first the debounce for the burst of
+    /// observer callbacks, then whatever is left of the quiet period after the
+    /// last run. A run in progress leaves the change pending; its end schedules
+    /// the run (see `init`). Manual syncs never come through here, so the
+    /// Sync Now button and pull to refresh are not held back.
+    private func scheduleSync() {
         debounceTask?.cancel()
         debounceTask = Task {
-            try? await Task.sleep(nanoseconds: 5_000_000_000) // 5 seconds
+            try? await Task.sleep(for: .seconds(Self.debounceInterval))
             guard !Task.isCancelled else { return }
+
+            if let remaining = quietTimeRemaining {
+                try? await Task.sleep(for: .seconds(remaining))
+                guard !Task.isCancelled else { return }
+            }
+
+            guard !isSyncing, !SyncState.shared.isAnySyncRunning, !SyncService.isSyncRunning else { return }
 
             let types = pendingTypes
             pendingTypes.removeAll()
