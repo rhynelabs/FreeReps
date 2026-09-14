@@ -39,13 +39,10 @@ struct ServerAddressTests {
         precondition(legacy.connectionMode == .address, "Existing installations keep their address")
         let local = try FreeRepsConfig(host: "localhost", port: 8080, useHTTPS: false).validatedBaseURL()
         precondition(local.absoluteString == "http://localhost:8080")
-        let test = try FreeRepsConfig(host: "production.example", port: 443, testMode: true,
-                                     testHost: "https://test.example/", testPort: 8443).validatedBaseURL()
-        precondition(test.absoluteString == "https://test.example")
         do {
             _ = try FreeRepsConfig(host: "localhost", port: 0).validatedBaseURL()
             preconditionFailure("Accepted port zero")
         } catch is FreeRepsConfigError {}
-        print("Server address tests passed (23 cases, connection modes)")
+        print("Server address tests passed (22 cases, connection modes)")
     }
 }

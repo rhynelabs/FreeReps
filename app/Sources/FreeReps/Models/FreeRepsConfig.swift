@@ -74,9 +74,6 @@ struct FreeRepsConfig: Codable, Equatable {
     var host: String
     var port: UInt16
     var useHTTPS: Bool = true
-    var testMode: Bool = false
-    var testHost: String = ""
-    var testPort: UInt16 = 443
     /// Max months of HealthKit history to backfill. nil = all data (back to 2000).
     /// Legacy: `backfillYears` is decoded and converted to months for backward compatibility.
     var backfillMonths: Int? = 24
@@ -87,13 +84,10 @@ struct FreeRepsConfig: Codable, Equatable {
         set { backfillMonths = newValue.map { $0 * 12 } }
     }
 
-    init(host: String, port: UInt16, useHTTPS: Bool = true, testMode: Bool = false, testHost: String = "", testPort: UInt16 = 443, backfillMonths: Int? = 24) {
+    init(host: String, port: UInt16, useHTTPS: Bool = true, backfillMonths: Int? = 24) {
         self.host = host
         self.port = port
         self.useHTTPS = useHTTPS
-        self.testMode = testMode
-        self.testHost = testHost
-        self.testPort = testPort
         self.backfillMonths = backfillMonths
     }
 
@@ -101,22 +95,15 @@ struct FreeRepsConfig: Codable, Equatable {
         host: "freereps.your-tailnet.ts.net",
         port: 443,
         useHTTPS: true,
-        testMode: false,
-        testHost: "",
-        testPort: 443,
         backfillMonths: 24
     )
 
-    /// Test mode always connects directly to its own server.
-    var usesEmbeddedTailscale: Bool { !testMode && connectionMode == .tailscale }
+    var usesEmbeddedTailscale: Bool { connectionMode == .tailscale }
 
     func validatedBaseURL() throws -> URL {
         let effectiveHost: String
         let effectivePort: UInt16
-        if testMode {
-            effectiveHost = testHost
-            effectivePort = testPort
-        } else if connectionMode == .tailscale {
+        if connectionMode == .tailscale {
             effectiveHost = tailnetHost
             effectivePort = 443
         } else {
@@ -156,7 +143,7 @@ struct FreeRepsConfig: Codable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case connectionMode, tailnetHost, host, port, useHTTPS, testMode, testHost, testPort, backfillMonths, backfillYears
+        case connectionMode, tailnetHost, host, port, useHTTPS, backfillMonths, backfillYears
     }
 
     init(from decoder: Decoder) throws {
@@ -167,9 +154,6 @@ struct FreeRepsConfig: Codable, Equatable {
         host = try c.decode(String.self, forKey: .host)
         port = try c.decode(UInt16.self, forKey: .port)
         useHTTPS = try c.decodeIfPresent(Bool.self, forKey: .useHTTPS) ?? true
-        testMode = try c.decodeIfPresent(Bool.self, forKey: .testMode) ?? false
-        testHost = try c.decodeIfPresent(String.self, forKey: .testHost) ?? ""
-        testPort = try c.decodeIfPresent(UInt16.self, forKey: .testPort) ?? 443
 
         // Migrate: prefer backfillMonths, fall back to backfillYears * 12
         if let months = try c.decodeIfPresent(Int.self, forKey: .backfillMonths) {
@@ -188,9 +172,6 @@ struct FreeRepsConfig: Codable, Equatable {
         try c.encode(host, forKey: .host)
         try c.encode(port, forKey: .port)
         try c.encode(useHTTPS, forKey: .useHTTPS)
-        try c.encode(testMode, forKey: .testMode)
-        try c.encode(testHost, forKey: .testHost)
-        try c.encode(testPort, forKey: .testPort)
         try c.encode(backfillMonths, forKey: .backfillMonths)
     }
 

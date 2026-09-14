@@ -129,19 +129,6 @@ struct SettingsView: View {
                 BrandFooter()
             }
             .navigationTitle("Settings")
-            .safeAreaInset(edge: .top) {
-                if vm.config.testMode {
-                    HStack {
-                        Image(systemName: "wrench.and.screwdriver")
-                        Text("Test Mode — \(vm.config.testHost)")
-                            .font(.caption.weight(.semibold))
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-                    .background(.orange.opacity(0.2))
-                    .foregroundStyle(.orange)
-                }
-            }
             .onAppear { vm.refreshPermissionsState() }
             .onChange(of: vm.config) { vm.saveConfig() }
         }
