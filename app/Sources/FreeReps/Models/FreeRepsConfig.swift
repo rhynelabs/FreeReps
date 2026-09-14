@@ -1,6 +1,21 @@
 import Foundation
 import Combine
 
+/// What the Health screen shows. iOS hides read grants and offers no revoke API,
+/// so "connected" means the permission sheet was answered and FreeReps syncs.
+enum HealthConnection: Equatable {
+    case notConnected
+    case connected
+    /// Disconnected in FreeReps; Apple's permission may still be in place.
+    case paused
+
+    /// `needsRequest` is nil until iOS has answered `statusForAuthorizationRequest`.
+    static func resolve(needsRequest: Bool?, requestedBefore: Bool, syncEnabled: Bool) -> HealthConnection {
+        if needsRequest ?? !requestedBefore { return .notConnected }
+        return syncEnabled ? .connected : .paused
+    }
+}
+
 /// App-level sharing choices, independent of Apple's opaque read permissions.
 @MainActor
 final class HealthSyncSelection: ObservableObject {

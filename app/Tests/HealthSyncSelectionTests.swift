@@ -4,6 +4,13 @@ import Foundation
 struct HealthSyncSelectionTests {
     @MainActor static func main() {
         let suite = "HealthSyncSelectionTests.\(UUID().uuidString)"
+        precondition(HealthConnection.resolve(needsRequest: nil, requestedBefore: false, syncEnabled: true) == .notConnected)
+        precondition(HealthConnection.resolve(needsRequest: nil, requestedBefore: true, syncEnabled: true) == .connected)
+        precondition(HealthConnection.resolve(needsRequest: true, requestedBefore: true, syncEnabled: true) == .notConnected,
+                     "A newly selected data type needs the sheet again")
+        precondition(HealthConnection.resolve(needsRequest: false, requestedBefore: false, syncEnabled: true) == .connected)
+        precondition(HealthConnection.resolve(needsRequest: false, requestedBefore: true, syncEnabled: false) == .paused)
+        precondition(HealthConnection.resolve(needsRequest: true, requestedBefore: true, syncEnabled: false) == .notConnected)
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set("preserved-progress", forKey: "syncState")
@@ -34,6 +41,6 @@ struct HealthSyncSelectionTests {
         } catch is CancellationError {} catch { fatalError("Unexpected error: \(error)") }
         precondition(!HealthSyncSelection(defaults: defaults).isEnabled)
         precondition(defaults.string(forKey: "syncState") == "preserved-progress")
-        print("Health selection tests passed: migration, category isolation, pause/resume, persistence, revision, progress preservation")
+        print("Health selection tests passed: connection state, migration, category isolation, pause/resume, persistence, revision, progress preservation")
     }
 }

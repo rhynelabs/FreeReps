@@ -16,10 +16,11 @@ final class SettingsViewModel: ObservableObject {
     @Published var connectionTestState: ConnectionTestState = .idle
     @Published var serverVersion: String?
     @Published var permissionsRequested: Bool = UserDefaults.standard.bool(forKey: "hk_permissions_requested")
-    @Published var deniedTypes: [HKObjectType] = []
-    @Published var grantedTypes: [HKObjectType] = []
+    @Published var authorizationRequestStatus: HKAuthorizationRequestStatus = .unknown
     @Published var errorMessage: String?
     @Published var isRequestingPermissions = false
+    @Published var isTestingHealth = false
+    @Published var healthReadCheck: HealthKitService.ReadCheck?
 
     private let healthKit = HealthKitService.shared
 
@@ -63,65 +64,126 @@ final class SettingsViewModel: ObservableObject {
 
     // MARK: - HealthKit permissions
 
+    var healthConnection: HealthConnection {
+        let needsRequest: Bool? = switch authorizationRequestStatus {
+        case .shouldRequest: true
+        case .unnecessary: false
+        default: nil
+        }
+        return .resolve(needsRequest: needsRequest, requestedBefore: permissionsRequested,
+                        syncEnabled: HealthSyncSelection.shared.isEnabled)
+    }
+
     func refreshPermissionsState() {
-        let (granted, denied) = healthKit.checkAllPermissionStatuses()
-        self.grantedTypes = granted
-        self.deniedTypes = denied
-        if !granted.isEmpty {
-            permissionsRequested = true
-            UserDefaults.standard.set(true, forKey: "hk_permissions_requested")
-        } else {
-            permissionsRequested = UserDefaults.standard.bool(forKey: "hk_permissions_requested")
+        guard !isRequestingPermissions else { return }
+        Task {
+            do {
+                authorizationRequestStatus = try await healthKit.authorizationRequestStatus()
+                await SyncTrace.shared.record("authorization.status", ["status": String(authorizationRequestStatus.rawValue)])
+                if authorizationRequestStatus == .unnecessary {
+                    permissionsRequested = true
+                    UserDefaults.standard.set(true, forKey: "hk_permissions_requested")
+                }
+            } catch {
+                authorizationRequestStatus = .unknown
+            }
         }
     }
 
-    var hasDeniedPermissions: Bool {
-        !deniedTypes.isEmpty
+    func testHealthAccess() {
+        guard !isTestingHealth else { return }
+        isTestingHealth = true
+        healthReadCheck = nil
+        Task {
+            healthReadCheck = await healthKit.checkReadAccess()
+            isTestingHealth = false
+        }
     }
 
-    func requestAllPermissions() {
+    func selectionChanged() {
+        SyncService.stopForSelectionChange()
+        errorMessage = nil
+        healthReadCheck = nil
+        BackgroundSyncManager.shared.startObserving()
+        refreshPermissionsState()
+    }
+
+    /// Shows Apple's sheet when iOS still needs an answer, then resumes syncing.
+    func connectHealth() {
+        guard authorizationRequestStatus != .unnecessary else {
+            setHealthSyncEnabled(true)
+            return
+        }
+        requestPermission(label: "general") { [weak self, healthKit] in
+            try await healthKit.requestAllPermissions()
+            UserDefaults.standard.set(true, forKey: "hk_permissions_requested")
+            self?.permissionsRequested = true
+            self?.setHealthSyncEnabled(true)
+        }
+    }
+
+    /// Apps cannot revoke HealthKit access; this stops FreeReps from reading and uploading.
+    func disconnectHealth() {
+        setHealthSyncEnabled(false)
+    }
+
+    private func setHealthSyncEnabled(_ enabled: Bool) {
+        HealthSyncSelection.shared.setEnabled(enabled)
+        selectionChanged()
+    }
+
+    func openHealthApp() {
+        errorMessage = nil
+        if let url = URL(string: "x-apple-health://") {
+            UIApplication.shared.open(url) { [weak self] opened in
+                Task { @MainActor in
+                    if !opened {
+                        self?.errorMessage = "Apple Health could not be opened. Open it from your Home Screen."
+                    }
+                }
+            }
+        }
+    }
+
+    private func requestPermission(label: String, operation: @escaping @MainActor () async throws -> Void) {
         guard !isRequestingPermissions else { return }
         isRequestingPermissions = true
+        errorMessage = nil
         Task {
-            do {
-                try await healthKit.requestAllPermissions()
-            } catch {
-                errorMessage = "HealthKit authorization failed: \(error.localizedDescription)"
+            defer {
+                isRequestingPermissions = false
+                refreshPermissionsState()
             }
-            UserDefaults.standard.set(true, forKey: "hk_permissions_requested")
-            permissionsRequested = true
-            refreshPermissionsState()
-            isRequestingPermissions = false
-        }
-    }
-
-    func requestMissingPermissions() {
-        guard !deniedTypes.isEmpty, !isRequestingPermissions else { return }
-        isRequestingPermissions = true
-        let types = Set(deniedTypes)
-        Task {
+            await SyncTrace.shared.record("authorization.started", ["request": label])
             do {
-                try await healthKit.requestPermissions(for: types)
+                try await operation()
+                await SyncTrace.shared.record("authorization.finished", ["request": label])
             } catch {
-                errorMessage = "HealthKit authorization failed: \(error.localizedDescription)"
+                let cause = error as NSError
+                if error is CancellationError ||
+                    (cause.domain == HKErrorDomain && cause.code == HKError.Code.errorUserCanceled.rawValue) {
+                    await SyncTrace.shared.record("authorization.cancelled", ["request": label])
+                    return
+                }
+                errorMessage = "Apple Health could not complete this request: \(error.localizedDescription)"
+                await SyncTrace.shared.record("authorization.failed", ["request": label,
+                    "domain": cause.domain, "code": String(cause.code)])
             }
-            refreshPermissionsState()
-            isRequestingPermissions = false
         }
     }
 
     // MARK: - Per-object authorization (medications & vision prescriptions)
 
     func requestVisionPrescriptionAccess() {
-        Task {
-            await healthKit.requestVisionPrescriptionAuthorization()
+        requestPermission(label: "vision_prescriptions") { [healthKit] in
+            try await healthKit.requestVisionPrescriptionAuthorization()
         }
     }
 
     func requestMedicationAccess() {
-        Task {
+        requestPermission(label: "medications") { [healthKit] in
             if #available(iOS 26, *) {
-                await healthKit.requestMedicationAuthorization()
+                try await healthKit.requestMedicationAuthorization()
             }
         }
     }

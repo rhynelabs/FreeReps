@@ -33,11 +33,9 @@ struct SettingsView: View {
                         HStack(spacing: 12) {
                             iconBox("heart.fill", color: .red)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Apple Health Permissions")
+                                Text("Apple Health Sync")
                                     .font(.subheadline.weight(.semibold))
-                                Text(vm.permissionsRequested
-                     ? (vm.deniedTypes.isEmpty ? "All permissions granted" : "\(vm.deniedTypes.count) permission(s) missing")
-                     : "Tap to request permissions")
+                                Text(vm.healthConnection == .connected ? "Connected" : "Not connected")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }

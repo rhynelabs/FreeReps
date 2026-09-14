@@ -13,6 +13,65 @@ final class HealthKitService {
 
     var isAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
 
+    enum ReadCheck: Equatable {
+        case readable
+        /// iOS reports denied read access as an empty store, so this cannot prove a denial.
+        case noData
+        case failed(String)
+    }
+
+    /// Reads at most one sample of a few common types. Nothing is uploaded.
+    func checkReadAccess() async -> ReadCheck {
+        guard isAvailable else { return .failed("Apple Health isn't available on this device.") }
+        enum Outcome { case found, empty, failed(Error), timedOut }
+        let checks: [@Sendable () async throws -> Bool] = [
+            { try await self.hasSample(.quantitySample(type: HKQuantityType(.stepCount))) },
+            { try await self.hasSample(.quantitySample(type: HKQuantityType(.heartRate))) },
+            { try await self.hasSample(.categorySample(type: HKCategoryType(.sleepAnalysis))) },
+            { try await self.hasSample(.workout()) },
+        ]
+        return await withTaskGroup(of: Outcome.self) { group in
+            for check in checks {
+                group.addTask {
+                    do { return try await check() ? .found : .empty } catch { return .failed(error) }
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(10))
+                return .timedOut
+            }
+            var pending = checks.count
+            var firstError: Error?
+            for await outcome in group {
+                switch outcome {
+                case .found:
+                    group.cancelAll()
+                    return .readable
+                case .timedOut:
+                    group.cancelAll()
+                    return .failed("Apple Health didn't respond. Try again.")
+                case .failed(let error):
+                    firstError = firstError ?? error
+                    pending -= 1
+                case .empty:
+                    pending -= 1
+                }
+                if pending == 0 { group.cancelAll(); break }
+            }
+            guard let firstError else { return .noData }
+            switch (firstError as? HKError)?.code {
+            case .errorDatabaseInaccessible: return .failed("Unlock your iPhone and try again.")
+            case .errorAuthorizationNotDetermined: return .failed("Connect Apple Health first.")
+            default: return .failed(firstError.localizedDescription)
+            }
+        }
+    }
+
+    private func hasSample<S: HKSample>(_ predicate: HKSamplePredicate<S>) async throws -> Bool {
+        let descriptor = HKSampleQueryDescriptor(predicates: [predicate], sortDescriptors: [], limit: 1)
+        return try await !descriptor.result(for: store).isEmpty
+    }
+
     // MARK: - Authorization
 
     @MainActor
@@ -45,10 +104,7 @@ final class HealthKitService {
         let readTypes = Self.selectedReadTypes
         guard !readTypes.isEmpty else { return }
         try await store.requestAuthorization(toShare: [], read: readTypes)
-        await requestVisionPrescriptionAuthorization()
-        if #available(iOS 26, *) {
-            await requestMedicationAuthorization()
-        }
+        // Optional per-object pickers must be separate, explicit actions.
     }
 
     func authorizationStatus(for type: HKObjectType) -> HKAuthorizationStatus {
@@ -61,34 +117,11 @@ final class HealthKitService {
         try await store.requestAuthorization(toShare: [], read: types)
     }
 
-    /// Check authorization status for all requested types.
-    /// Returns two arrays: "processed" types and "not yet requested" types.
-    ///
-    /// HealthKit's `authorizationStatus(for:)` only tracks *write* authorization.
-    /// Since this app requests read-only access (`toShare: []`), the statuses mean:
-    ///   - `.notDetermined`   → HealthKit dialog has never been shown for this type (needs requesting)
-    ///   - `.sharingDenied`   → dialog was shown and user went through it; read grant/deny is hidden by iOS
-    ///   - `.sharingAuthorized` → write was also granted (not expected here)
-    ///
-    /// After the user approves the HealthKit dialog, all read-only types transition
-    /// from `.notDetermined` to `.sharingDenied`. Treating `.sharingDenied` as "denied"
-    /// is therefore incorrect — it just means the dialog was already shown.
-    ///
-    /// "denied" here means `.notDetermined` (never shown the dialog), which is the
-    /// only case where calling `requestAuthorization` will actually surface the iOS prompt.
-    func checkAllPermissionStatuses() -> (granted: [HKObjectType], denied: [HKObjectType]) {
-        let allTypes = HealthDataTypes.allReadTypes
-        var granted: [HKObjectType] = []
-        var denied: [HKObjectType] = []
-        for type in allTypes {
-            let status = store.authorizationStatus(for: type)
-            if status == .notDetermined {
-                denied.append(type)
-            } else {
-                granted.append(type)
-            }
-        }
-        return (granted, denied)
+    /// Reports whether Apple would show a permission sheet, not whether reads were granted.
+    @MainActor
+    func authorizationRequestStatus() async throws -> HKAuthorizationRequestStatus {
+        guard !Self.selectedReadTypes.isEmpty else { return .unnecessary }
+        return try await store.statusForAuthorizationRequest(toShare: [], read: Self.selectedReadTypes)
     }
 
     // MARK: - Quantity Samples
@@ -365,16 +398,16 @@ final class HealthKitService {
 
     // MARK: - Medications (iOS 26+)
 
-    func requestVisionPrescriptionAuthorization() async {
-        try? await store.requestPerObjectReadAuthorization(
+    func requestVisionPrescriptionAuthorization() async throws {
+        try await store.requestPerObjectReadAuthorization(
             for: HKObjectType.visionPrescriptionType(),
             predicate: nil
         )
     }
 
     @available(iOS 26, *)
-    func requestMedicationAuthorization() async {
-        try? await store.requestPerObjectReadAuthorization(
+    func requestMedicationAuthorization() async throws {
+        try await store.requestPerObjectReadAuthorization(
             for: HKObjectType.userAnnotatedMedicationType(),
             predicate: nil
         )
@@ -880,5 +913,3 @@ final class HealthKitService {
 }
 
 // MARK: - Helper extensions
-
-

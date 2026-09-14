@@ -254,22 +254,10 @@ final class SyncService: ObservableObject {
             issues.append(.healthPermissionsNotRequested)
         }
 
-        // Check a sample of key HealthKit types for authorization.
-        // authorizationStatus only tracks write permission. For read-only types,
-        // .notDetermined means the dialog was never shown (truly not requested),
-        // while .sharingDenied means the dialog was shown (read grant/deny is hidden by iOS).
-        let criticalTypes: [HKObjectType] = [
-            HKObjectType.quantityType(forIdentifier: .heartRate)!,
-            HKObjectType.quantityType(forIdentifier: .stepCount)!,
-            HKObjectType.quantityType(forIdentifier: .bodyMass)!,
-            HKObjectType.workoutType(),
-            HKObjectType.quantityType(forIdentifier: .appleSleepingWristTemperature)!,
-        ]
-        let notRequestedTypes = criticalTypes.filter {
-            healthKit.authorizationStatus(for: $0) == .notDetermined
-        }
-        if !notRequestedTypes.isEmpty {
-            issues.append(.somePermissionsDenied(count: notRequestedTypes.count))
+        // Read permission cannot be inferred from write-authorization status.
+        if permissionsRequested,
+           (try? await healthKit.authorizationRequestStatus()) == .shouldRequest {
+            issues.append(.healthPermissionsNotRequested)
         }
 
         // Test FreeReps connectivity
