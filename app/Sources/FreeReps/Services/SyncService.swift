@@ -38,36 +38,142 @@ actor AsyncSemaphore {
     }
 }
 
-// MARK: - MetricUploader
+// MARK: - BatchUploader
 
-/// Collects metric points from several Health types and uploads them in full
-/// batches, a few requests at a time. Small types share a request, and a type
-/// with many rows keeps reading while its earlier pages upload.
-actor MetricUploader {
+/// Rows a `BatchUploader` packs into requests. A piece splits at any row, so a
+/// request fills up exactly whatever sizes the pieces come in.
+protocol UploadRows {
+    var rowCount: Int { get }
+    /// The first `count` rows and the rest.
+    func split(at count: Int) -> (head: Self, tail: Self)
+}
+
+extension FreeRepsMetric: UploadRows {
+    var rowCount: Int { data.count }
+    func split(at count: Int) -> (head: FreeRepsMetric, tail: FreeRepsMetric) {
+        (FreeRepsMetric(name: name, units: units, data: Array(data.prefix(count))),
+         FreeRepsMetric(name: name, units: units, data: Array(data.dropFirst(count))))
+    }
+}
+
+/// Category samples of one Health type, as one piece for the uploader.
+struct CategoryRows: UploadRows {
+    var samples: [FreeRepsCategorySample]
+    var rowCount: Int { samples.count }
+    func split(at count: Int) -> (head: CategoryRows, tail: CategoryRows) {
+        (CategoryRows(samples: Array(samples.prefix(count))), CategoryRows(samples: Array(samples.dropFirst(count))))
+    }
+}
+
+/// One request the server acknowledged.
+struct UploadAck: Sendable {
+    let window: Int
+    let rows: Int
+    let inserted: Int
+    let elapsedMs: Int
+    /// Requests of the window sent and acknowledged so far, this one included.
+    let windowBatchesSent: Int
+    let windowBatchesAcked: Int
+}
+
+/// A window every request of which the server has acknowledged.
+struct UploadedWindow: Sendable {
+    let index: Int
+    let rows: Int
+    let inserted: Int
+}
+
+typealias MetricUploader = BatchUploader<FreeRepsMetric>
+typealias CategoryUploader = BatchUploader<CategoryRows>
+
+/// Collects rows from several Health types and uploads them in full batches, a
+/// few requests at a time. Small types share a request, and a type with many
+/// rows keeps reading while its earlier pages upload.
+///
+/// Rows carry the backfill window they were read in. The caller hears when a
+/// whole window is on the server and moves its cursor then, instead of draining
+/// the pipeline at every window boundary. Each batch holds rows of one window
+/// only (`endWindow` flushes), so a window's rows and inserted count are exact.
+actor BatchUploader<Rows: UploadRows> {
     /// An upload that failed, wrapped so a reader can tell it from its own errors.
     struct UploadFailed: Error { let underlying: Error }
 
-    private let batchSize: Int
-    private let maxInFlight: Int
-    private let ingest: @Sendable (FreeRepsPayload) async throws -> IngestResult
-    private var pending: [FreeRepsMetric] = []
-    private var pendingRows = 0
-    private var inFlight: [Task<Int, Error>] = []
-    private var inserted = 0
-
-    init(batchSize: Int, maxInFlight: Int, ingest: @escaping @Sendable (FreeRepsPayload) async throws -> IngestResult) {
-        self.batchSize = batchSize
-        self.maxInFlight = maxInFlight
-        self.ingest = ingest
+    private struct WindowState {
+        var batchesSent = 0
+        var batchesAcked = 0
+        var rowsSent = 0
+        var rowsInserted = 0
+        var isDrained: Bool { batchesAcked == batchesSent }
     }
 
-    func add(_ metric: FreeRepsMetric) async throws {
-        var points = metric.data[...]
-        while !points.isEmpty {
-            let piece = points.prefix(batchSize - pendingRows)
-            pending.append(FreeRepsMetric(name: metric.name, units: metric.units, data: Array(piece)))
-            pendingRows += piece.count
-            points = points.dropFirst(piece.count)
+    private let label: String
+    private let batchSize: Int
+    private let maxInFlight: Int
+    private let makePayload: @Sendable ([Rows]) -> FreeRepsPayload
+    private let insertedRows: @Sendable (IngestResult) -> Int?
+    private let ingest: @Sendable (FreeRepsPayload) async throws -> IngestResult
+    private let onBatch: (@Sendable (UploadAck) async -> Void)?
+    private let onWindowUploaded: (@Sendable (UploadedWindow) async -> Void)?
+
+    private var pending: [Rows] = []
+    private var pendingRows = 0
+    private var currentWindow = 0
+    private var windows: [Int: WindowState] = [:]
+    /// Windows whose rows are all sent, oldest first; each leaves once acknowledged.
+    private var closedWindows: [Int] = []
+    private var inFlight: [Int: Task<Void, Never>] = [:]
+    private var nextBatchID = 0
+    private var inserted = 0
+    /// The first error a request hit; every later call rethrows it.
+    private var failure: Error?
+    private var waiters: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var nextWaiterID = 0
+
+    /// - Parameters:
+    ///   - label: Names the uploader in the trace, e.g. the category it serves.
+    ///   - onBatch: Called for every acknowledged request, before the next
+    ///     request takes its slot; keep it short.
+    ///   - onWindowUploaded: Called once per window, in window order, when the
+    ///     last of its requests is acknowledged. Never called for a window one
+    ///     of whose requests failed.
+    init(label: String, batchSize: Int, maxInFlight: Int,
+         makePayload: @escaping @Sendable ([Rows]) -> FreeRepsPayload,
+         insertedRows: @escaping @Sendable (IngestResult) -> Int?,
+         ingest: @escaping @Sendable (FreeRepsPayload) async throws -> IngestResult,
+         onBatch: (@Sendable (UploadAck) async -> Void)? = nil,
+         onWindowUploaded: (@Sendable (UploadedWindow) async -> Void)? = nil) {
+        self.label = label
+        self.batchSize = batchSize
+        self.maxInFlight = maxInFlight
+        self.makePayload = makePayload
+        self.insertedRows = insertedRows
+        self.ingest = ingest
+        self.onBatch = onBatch
+        self.onWindowUploaded = onWindowUploaded
+    }
+
+    /// Rows added from now on belong to window `index`.
+    func beginWindow(_ index: Int) {
+        currentWindow = index
+        if windows[index] == nil { windows[index] = WindowState() }
+    }
+
+    /// Sends the rest of window `index`; it is reported once all of it is acknowledged.
+    func endWindow(_ index: Int) async throws {
+        try await flush()
+        if windows[index] == nil { windows[index] = WindowState() }
+        closedWindows.append(index)
+        for window in takeUploadedWindows() { await onWindowUploaded?(window) }
+    }
+
+    func add(_ rows: Rows) async throws {
+        try rethrowFailure()
+        var rest = rows
+        while rest.rowCount > 0 {
+            let (head, tail) = rest.split(at: min(batchSize - pendingRows, rest.rowCount))
+            pending.append(head)
+            pendingRows += head.rowCount
+            rest = tail
             if pendingRows >= batchSize { try await flush() }
         }
     }
@@ -75,39 +181,135 @@ actor MetricUploader {
     /// Uploads what is left and waits for every request. Returns the rows inserted.
     func finish() async throws -> Int {
         try await flush()
-        while !inFlight.isEmpty { try await reapOldest() }
+        while !inFlight.isEmpty {
+            await waitForBatch(cancellable: true)
+            try Task.checkCancellation()
+            try rethrowFailure()
+        }
+        try rethrowFailure()
         return inserted
     }
 
-    func cancel() {
-        for task in inFlight { task.cancel() }
-        inFlight = []
+    /// Cancels the requests in flight and drops the rows not sent yet. Returns
+    /// once every request has reported, so no callback fires after it.
+    func cancel() async {
         pending = []
         pendingRows = 0
+        for task in inFlight.values { task.cancel() }
+        while !inFlight.isEmpty { await waitForBatch(cancellable: false) }
     }
 
     private func flush() async throws {
         guard pendingRows > 0 else { return }
-        let payload = FreeRepsPayload(data: FreeRepsData(metrics: pending))
-        let rows = pendingRows
+        let rows = pending
+        let count = pendingRows
+        let window = currentWindow
         pending = []
         pendingRows = 0
-        while inFlight.count >= maxInFlight { try await reapOldest() }
+        // Counted as sent before the slot wait: should the wait end in an error,
+        // the window stays unacknowledged and its cursor does not move.
+        windows[window, default: WindowState()].batchesSent += 1
+        windows[window]!.rowsSent += count
+        while inFlight.count >= maxInFlight {
+            await waitForBatch(cancellable: true)
+            try Task.checkCancellation()
+            try rethrowFailure()
+        }
+        try rethrowFailure()
+        let id = nextBatchID
+        nextBatchID += 1
+        let payload = makePayload(rows)
+        let started = Date()
         let ingest = self.ingest
-        inFlight.append(Task {
+        let insertedRows = self.insertedRows
+        inFlight[id] = Task {
+            let outcome: Result<Int, Error>
             do {
-                return try await ingest(payload).metrics_inserted ?? rows
-            } catch is CancellationError {
-                throw CancellationError()
+                outcome = .success(try await insertedRows(ingest(payload)) ?? count)
             } catch {
-                throw UploadFailed(underlying: error)
+                outcome = .failure(error)
             }
-        })
+            await self.batchFinished(id, window: window, rows: count, started: started, outcome: outcome)
+        }
     }
 
-    private func reapOldest() async throws {
-        let task = inFlight.removeFirst()
-        inserted += try await task.value
+    private func batchFinished(_ id: Int, window: Int, rows: Int, started: Date, outcome: Result<Int, Error>) async {
+        switch outcome {
+        case .success(let count):
+            inserted += count
+            var state = windows[window] ?? WindowState()
+            state.batchesAcked += 1
+            state.rowsInserted += count
+            windows[window] = state
+            // Decided before the callbacks suspend this actor, so a window is
+            // reported exactly once even while other batches finish.
+            let uploaded = takeUploadedWindows()
+            await SyncTrace.shared.record("upload.batch", [
+                "uploader": label, "window": String(window), "rows": String(rows), "inserted": String(count),
+                "elapsed_ms": String(Int(Date().timeIntervalSince(started) * 1000)),
+            ])
+            if let onBatch {
+                await onBatch(UploadAck(window: window, rows: rows, inserted: count,
+                                        elapsedMs: Int(Date().timeIntervalSince(started) * 1000),
+                                        windowBatchesSent: state.batchesSent, windowBatchesAcked: state.batchesAcked))
+            }
+            for window in uploaded { await onWindowUploaded?(window) }
+        case .failure(let error):
+            if failure == nil { failure = error }
+        }
+        inFlight.removeValue(forKey: id)
+        resumeWaiters()
+    }
+
+    /// Closed windows whose requests are all acknowledged, oldest first, up to
+    /// the first one still in flight — so windows are reported in order.
+    private func takeUploadedWindows() -> [UploadedWindow] {
+        var uploaded: [UploadedWindow] = []
+        while let index = closedWindows.first, let state = windows[index], state.isDrained {
+            closedWindows.removeFirst()
+            windows.removeValue(forKey: index)
+            uploaded.append(UploadedWindow(index: index, rows: state.rowsSent, inserted: state.rowsInserted))
+        }
+        return uploaded
+    }
+
+    private func rethrowFailure() throws {
+        guard let failure else { return }
+        if failure is CancellationError { throw CancellationError() }
+        throw UploadFailed(underlying: failure)
+    }
+
+    /// Suspends until a request finishes. A cancellable wait also ends when the
+    /// caller is cancelled, so a stopped sync does not sit out a slow request;
+    /// `cancel()` waits without that, because it needs the requests to report.
+    private func waitForBatch(cancellable: Bool) async {
+        let id = nextWaiterID
+        nextWaiterID += 1
+        guard cancellable else {
+            await withCheckedContinuation { waiters[id] = $0 }
+            return
+        }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    waiters[id] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.resumeWaiter(id) }
+        }
+    }
+
+    private func resumeWaiter(_ id: Int) {
+        waiters.removeValue(forKey: id)?.resume()
+    }
+
+    private func resumeWaiters() {
+        let resumed = waiters
+        waiters = [:]
+        for continuation in resumed.values { continuation.resume() }
     }
 }
 
@@ -179,19 +381,48 @@ final class SyncService: ObservableObject {
     /// so the bar never moves back while categories run side by side.
     private var runStepsDone = 0
     private var runStepsTotal = 1
-    /// Quantity categories being read right now, in the order they started.
-    private var activeCategories: [String] = []
+    /// Windows partly acknowledged by the server, by "category/index". Each
+    /// share only grows and stays below one; when the window is fully on the
+    /// server it leaves the map and counts as a whole step, so the bar moves
+    /// between windows without ever moving back.
+    private var partialSteps: [String: Double] = [:]
+    /// Counts up per run, so an upload callback from a run that has ended
+    /// cannot touch the progress of the next one.
+    private var runID = 0
+    /// Categories being read right now, in the order they started, each with
+    /// the window it is on and the rows the server has acknowledged so far.
+    private var activeCategories: [ActiveCategory] = []
+
+    private struct ActiveCategory {
+        let name: String
+        var window: String?
+        var rows = 0
+    }
 
     private func beginRun(steps: Int) {
+        runID += 1
         runStepsDone = 0
         runStepsTotal = max(steps, 1)
+        partialSteps = [:]
         activeCategories = []
         syncState.overallProgress = 0
     }
 
     private func advanceRun(by steps: Int = 1) {
         runStepsDone += steps
-        syncState.overallProgress = min(1, Double(runStepsDone) / Double(runStepsTotal))
+        refreshProgress()
+    }
+
+    /// Credits part of a window's step from its acknowledged batches; the share
+    /// stays short of a whole step until the window is done.
+    private func partialStep(_ key: String, fraction: Double) {
+        partialSteps[key] = max(partialSteps[key] ?? 0, min(fraction, 0.95))
+        refreshProgress()
+    }
+
+    private func refreshProgress() {
+        let done = Double(runStepsDone) + partialSteps.values.reduce(0, +)
+        syncState.overallProgress = max(syncState.overallProgress, min(1, done / Double(runStepsTotal)))
     }
 
     /// Where a category's HealthKit anchors live in `SyncState.anchors`; the
@@ -207,15 +438,39 @@ final class SyncService: ObservableObject {
 
     /// Names the categories being read, e.g. "Nutrition, Vitals, and Activity".
     private func categoryStarted(_ name: String) {
-        activeCategories.append(name)
-        syncState.currentOperation = activeCategories.formatted(.list(type: .and))
+        if !activeCategories.contains(where: { $0.name == name }) {
+            activeCategories.append(ActiveCategory(name: name))
+        }
+        refreshHeadline()
     }
 
     private func categoryFinished(_ name: String) {
-        activeCategories.removeAll { $0 == name }
-        if !activeCategories.isEmpty {
-            syncState.currentOperation = activeCategories.formatted(.list(type: .and))
-        }
+        activeCategories.removeAll { $0.name == name }
+        if !activeCategories.isEmpty { refreshHeadline() }
+    }
+
+    /// Notes the window a category is on, e.g. "window 3 of 9".
+    private func categoryWindow(_ name: String, _ window: String) {
+        categoryStarted(name)
+        activeCategories[activeCategories.firstIndex { $0.name == name }!].window = window
+        refreshHeadline()
+    }
+
+    /// Adds rows the server acknowledged for a category.
+    private func categoryRows(_ name: String, add rows: Int) {
+        guard let index = activeCategories.firstIndex(where: { $0.name == name }) else { return }
+        activeCategories[index].rows += rows
+        refreshHeadline()
+    }
+
+    /// "Vitals · window 7 of 9 · 12,345 rows and Workouts · window 2 of 9".
+    private func refreshHeadline() {
+        syncState.currentOperation = activeCategories.map { category in
+            var parts = [category.name]
+            if let window = category.window { parts.append(window) }
+            if category.rows > 0 { parts.append("\(category.rows.formatted()) rows") }
+            return parts.joined(separator: " \u{00B7} ")
+        }.formatted(.list(type: .and))
     }
 
     init(syncState: SyncState) {
@@ -423,8 +678,9 @@ final class SyncService: ObservableObject {
             try checkSelection()
 
             syncState.updateCategory(categoryID, status: .syncing)
-            syncState.currentOperation = "Syncing\u{2026}"
             beginRun(steps: Self.sparseCategories.contains(categoryID) ? 1 : windowsLeft(for: categoryID, from: epoch, until: anchor))
+            let displayName = syncState.categories.first { $0.id == categoryID }?.displayName ?? categoryID
+            categoryStarted(displayName)
 
             let count: Int
             if categoryID.hasPrefix("qty_") {
@@ -449,20 +705,12 @@ final class SyncService: ObservableObject {
                 }
             } else {
                 count = try await backfillSpecialCategory(
-                    catID: categoryID, from: epoch, until: anchor, config: config
-                ) { [self] windowStart, windowEnd in
-                    switch categoryID {
-                    case "cat_category":          return try await syncCategorySamples(since: windowStart, until: windowEnd)
-                    case "cat_workouts":          return try await syncWorkouts(since: windowStart, until: windowEnd)
-                    case "cat_bp":                return try await syncBloodPressure(since: windowStart, until: windowEnd)
-                    case "cat_activity_summaries": return try await syncActivitySummaries(since: windowStart, until: windowEnd)
-                    case "cat_workout_routes":    return try await syncWorkoutRoutes(since: windowStart, until: windowEnd)
-                    default: return 0
-                    }
-                }
+                    catID: categoryID, displayName: displayName, from: epoch, until: anchor, config: config
+                )
             }
 
             try checkSelection()
+            categoryFinished(displayName)
 
             syncState.newRecordsThisRun = count
             syncState.updateCategory(categoryID, status: .completed, recordCount: count, lastSyncDate: Date())
@@ -593,8 +841,13 @@ final class SyncService: ObservableObject {
             beginRun(steps: windowSteps.reduce(0) { $0 + windowsLeft(for: $1, from: historicalStart, until: anchor) } + sparseSpecials.count)
 
             // Quantity categories — 90-day windowed backfill. A few categories run at
-            // once so uploads overlap with Health reads; the server handles them in parallel.
+            // once so uploads overlap with Health reads; the server handles them in
+            // parallel. The heavy special categories run alongside in a lane of their
+            // own: one after another they took half the wall time for a seventh of
+            // the rows. Each category still walks its windows in order and keeps its
+            // own cursor, so nothing is shared between the tasks but the main actor.
             let categorySemaphore = AsyncSemaphore(value: 3)
+            let specialSemaphore = AsyncSemaphore(value: 3)
             try await withThrowingTaskGroup(of: String?.self) { group in
                 for (cat, types) in pending {
                     group.addTask { @MainActor [self] in
@@ -623,45 +876,34 @@ final class SyncService: ObservableObject {
                         }
                     }
                 }
-                for try await failed in group {
-                    if let failed { failedCategories.append(failed) }
-                }
-            }
-
-            // Special categories — sequential heavy categories use 90-day windowed backfill
-            for (catID, displayName) in heavySpecials {
-                try checkSelection()
-
-                syncState.updateCategory(catID, status: .syncing)
-                syncState.currentOperation = "Reading \(displayName)\u{2026}"
-                do {
-                    let count = try await backfillSpecialCategory(
-                        catID: catID, from: historicalStart, until: anchor, config: config
-                    ) { [self] windowStart, windowEnd in
-                        switch catID {
-                        case "cat_category":
-                            return try await syncCategorySamples(since: windowStart, until: windowEnd)
-                        case "cat_workouts":
-                            return try await syncWorkouts(since: windowStart, until: windowEnd)
-                        case "cat_bp":
-                            return try await syncBloodPressure(since: windowStart, until: windowEnd)
-                        case "cat_activity_summaries":
-                            return try await syncActivitySummaries(since: windowStart, until: windowEnd)
-                        case "cat_workout_routes":
-                            return try await syncWorkoutRoutes(since: windowStart, until: windowEnd)
-                        default:
-                            return 0
+                for (catID, displayName) in heavySpecials {
+                    group.addTask { @MainActor [self] in
+                        await specialSemaphore.wait()
+                        defer { Task { await specialSemaphore.signal() } }
+                        try checkSelection()
+                        syncState.updateCategory(catID, status: .syncing)
+                        categoryStarted(displayName)
+                        defer { categoryFinished(displayName) }
+                        do {
+                            let count = try await backfillSpecialCategory(
+                                catID: catID, displayName: displayName,
+                                from: historicalStart, until: anchor, config: config
+                            )
+                            try checkSelection()
+                            syncState.updateCategory(catID, status: .completed, recordCount: count, lastSyncDate: Date())
+                            updateLiveActivity(phase: displayName, operation: "Synced older data: \(displayName)", records: syncState.newRecordsThisRun)
+                            return nil
+                        } catch is CancellationError {
+                            throw CancellationError()
+                        } catch {
+                            syncState.updateCategory(catID, status: .failed(error.localizedDescription))
+                            print("Category \(displayName) failed: \(error.localizedDescription)")
+                            return displayName
                         }
                     }
-                    try checkSelection()
-                    syncState.updateCategory(catID, status: .completed, recordCount: count, lastSyncDate: Date())
-                    updateLiveActivity(phase: displayName, operation: "Synced older data: \(displayName)", records: syncState.newRecordsThisRun)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    syncState.updateCategory(catID, status: .failed(error.localizedDescription))
-                    failedCategories.append(displayName)
-                    print("Category \(displayName) failed: \(error.localizedDescription)")
+                }
+                for try await failed in group {
+                    if let failed { failedCategories.append(failed) }
                 }
             }
 
@@ -746,12 +988,167 @@ final class SyncService: ObservableObject {
 
     // MARK: - Backfill helpers
 
+    /// One category's windows while its uploader runs. On the main actor because
+    /// an acknowledged window moves the cursor in `SyncState`.
+    @MainActor
+    private final class WindowLedger {
+        let runID: Int
+        /// Where each started window ends, by index.
+        var ends: [Int: Date] = [:]
+        /// Windows acknowledged so far, counted from the first window of the
+        /// backfill. Acknowledgements arrive in window order from one uploader;
+        /// a retry's uploader may report a window the first attempt had already
+        /// acknowledged, which then counts once.
+        var uploadedCount: Int
+        var inserted = 0
+
+        init(runID: Int, uploadedCount: Int) {
+            self.runID = runID
+            self.uploadedCount = uploadedCount
+        }
+    }
+
     /// Backfills a quantity category in 90-day windows from `historicalStart` to `anchor`,
     /// resuming from `syncState.backfillCursors[catID]` if set.
+    ///
+    /// The windows share one uploader, and the cursor follows the server's
+    /// acknowledgements (`windowUploaded`), not the reads. A failed request ends
+    /// the attempt; the next one resumes behind the last acknowledged window,
+    /// and three attempts in a row without progress fail the category.
     private func backfillQuantityCategory(
         catID: String,
         cat: HealthCategory,
         types: [QuantityTypeDescriptor],
+        from historicalStart: Date,
+        until anchor: Date,
+        config: FreeRepsConfig
+    ) async throws -> Int {
+        let windowSize = Self.backfillWindow
+        let totalWindows = Int(ceil(anchor.timeIntervalSince(historicalStart) / windowSize))
+        func index(of cursor: Date) -> Int {
+            cursor > historicalStart ? Int(ceil(cursor.timeIntervalSince(historicalStart) / windowSize)) : 0
+        }
+        var cursor = syncState.backfillCursors[catID] ?? historicalStart
+        let ledger = WindowLedger(runID: runID, uploadedCount: index(of: cursor))
+        var retries = 0
+
+        while cursor < anchor {
+            do {
+                try await uploadQuantityWindows(
+                    catID: catID, cat: cat, types: types,
+                    from: cursor, firstIndex: index(of: cursor), until: anchor,
+                    totalWindows: totalWindows, ledger: ledger
+                )
+                break
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Acknowledged windows stay; the next attempt resumes behind them.
+                let resumeAt = syncState.backfillCursors[catID] ?? historicalStart
+                if resumeAt > cursor { retries = 0 }
+                cursor = resumeAt
+                guard retries < 3 else {
+                    throw backfillFailure(error, category: catID, start: cursor,
+                                          end: min(cursor.addingTimeInterval(windowSize), anchor))
+                }
+                retries += 1
+                try await Task.sleep(for: Self.retryDelays[retries - 1])
+            }
+        }
+        return ledger.inserted
+    }
+
+    /// Reads the windows from `cursor` to `anchor` one after another into a
+    /// single uploader, so the next window's Health read starts while the last
+    /// batches of the previous one are still on their way. The cursor moves
+    /// from the uploader's window callbacks, never from here.
+    private func uploadQuantityWindows(
+        catID: String,
+        cat: HealthCategory,
+        types: [QuantityTypeDescriptor],
+        from cursor: Date,
+        firstIndex: Int,
+        until anchor: Date,
+        totalWindows: Int,
+        ledger: WindowLedger
+    ) async throws {
+        let name = cat.rawValue
+        let uploader = makeMetricUploader(label: catID, onBatch: { @MainActor [self] ack in
+            batchAcknowledged(ack, catID: catID, name: name, ledger: ledger)
+        }, onWindowUploaded: { @MainActor [self] window in
+            await windowUploaded(window, catID: catID, totalWindows: totalWindows, ledger: ledger)
+        })
+        do {
+            var cursor = cursor
+            var index = firstIndex
+            while cursor < anchor {
+                try checkSelection()
+                let windowEnd = min(cursor.addingTimeInterval(Self.backfillWindow), anchor)
+                ledger.ends[index] = windowEnd
+                // The window shows on the category's own row; the headline names the
+                // categories running side by side.
+                syncState.updateCategory(catID, status: .syncing, progress: index, total: totalWindows, period: cursor..<windowEnd)
+                categoryWindow(name, "window \(index + 1) of \(totalWindows)")
+                await SyncTrace.shared.record("window.started", [
+                    "category": catID, "index": String(index), "total": String(totalWindows),
+                ])
+                await uploader.beginWindow(index)
+                let windowStart = cursor
+                _ = try await readQuantityTypes(types, since: { _ in windowStart }, until: windowEnd, into: uploader)
+                try await uploader.endWindow(index)
+                cursor = windowEnd
+                index += 1
+            }
+            _ = try await uploader.finish()
+        } catch {
+            await uploader.cancel()
+            throw error
+        }
+    }
+
+    /// Credits an acknowledged batch to the run's counters and the window's step.
+    private func batchAcknowledged(_ ack: UploadAck, catID: String, name: String, ledger: WindowLedger) {
+        guard ledger.runID == runID else { return }
+        syncState.newRecordsThisRun += ack.inserted
+        categoryRows(name, add: ack.rows)
+        if ack.window >= ledger.uploadedCount {
+            partialStep("\(catID)/\(ack.window)", fraction: Double(ack.windowBatchesAcked) / Double(max(ack.windowBatchesSent, 1)))
+        }
+        updateLiveActivity(phase: name, operation: syncState.currentOperation, records: syncState.newRecordsThisRun)
+    }
+
+    /// Moves the cursor past a window the server has acknowledged in full. The
+    /// cursor only moves forward: windows are reported in order, so a report
+    /// for an earlier index than the ledger's count was already covered.
+    private func windowUploaded(_ window: UploadedWindow, catID: String, totalWindows: Int, ledger: WindowLedger) async {
+        guard ledger.runID == runID else { return }
+        await SyncTrace.shared.record("window.finished", [
+            "category": catID, "index": String(window.index), "total": String(totalWindows),
+            "rows": String(window.rows), "inserted": String(window.inserted),
+        ])
+        ledger.inserted += window.inserted
+        partialSteps.removeValue(forKey: "\(catID)/\(window.index)")
+        guard window.index >= ledger.uploadedCount else {
+            refreshProgress()
+            return
+        }
+        let steps = window.index + 1 - ledger.uploadedCount
+        ledger.uploadedCount = window.index + 1
+        if let end = ledger.ends[window.index] {
+            syncState.backfillCursors[catID] = end
+            syncState.persist()
+        }
+        advanceRun(by: steps)
+    }
+
+    /// Pauses between attempts at one window. A server restart takes longer than
+    /// a blip, so the pauses grow to cover one.
+    private static let retryDelays: [Duration] = [.seconds(2), .seconds(5), .seconds(10)]
+
+    /// Backfills a special (non-quantity) category in 90-day windows, resuming from cursor.
+    private func backfillSpecialCategory(
+        catID: String,
+        displayName: String,
         from historicalStart: Date,
         until anchor: Date,
         config: FreeRepsConfig
@@ -768,15 +1165,17 @@ final class SyncService: ObservableObject {
             try checkSelection()
 
             let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
-            // The window shows on the category's own row; the headline names the
-            // categories running side by side.
             syncState.updateCategory(catID, status: .syncing, progress: windowIdx, total: totalWindows, period: cursor..<windowEnd)
-            var windowTotal = 0
+            categoryWindow(displayName, "window \(windowIdx + 1) of \(totalWindows)")
+            await SyncTrace.shared.record("window.started", [
+                "category": catID, "index": String(windowIdx), "total": String(totalWindows),
+            ])
             var retries = 0
+            var windowTotal = 0
             while true {
                 do {
-                    let windowStart = cursor
-                    windowTotal = try await uploadQuantityTypes(types, since: { _ in windowStart }, until: windowEnd).inserted
+                    windowTotal = try await syncSpecialWindow(catID: catID, displayName: displayName,
+                                                              index: windowIdx, start: cursor, end: windowEnd)
                     break
                 } catch is CancellationError {
                     throw CancellationError()
@@ -787,73 +1186,49 @@ final class SyncService: ObservableObject {
                     throw backfillFailure(error, category: catID, start: cursor, end: windowEnd)
                 }
             }
+            await SyncTrace.shared.record("window.finished", [
+                "category": catID, "index": String(windowIdx), "total": String(totalWindows),
+                "inserted": String(windowTotal),
+            ])
             total += windowTotal
             syncState.newRecordsThisRun += windowTotal
+            partialSteps.removeValue(forKey: "\(catID)/\(windowIdx)")
 
             cursor = windowEnd
             windowIdx += 1
             syncState.backfillCursors[catID] = cursor
             syncState.persist()
             advanceRun()
-            updateLiveActivity(phase: syncState.currentOperation, operation: "Syncing older data", records: syncState.newRecordsThisRun)
+            updateLiveActivity(phase: displayName, operation: syncState.currentOperation, records: syncState.newRecordsThisRun)
         }
         return total
     }
 
-    /// Pauses between attempts at one window. A server restart takes longer than
-    /// a blip, so the pauses grow to cover one.
-    private static let retryDelays: [Duration] = [.seconds(2), .seconds(5), .seconds(10)]
-
-    /// Backfills a special (non-quantity) category in 90-day windows, resuming from cursor.
-    private func backfillSpecialCategory(
-        catID: String,
-        from historicalStart: Date,
-        until anchor: Date,
-        config: FreeRepsConfig,
-        syncWindow: (Date, Date) async throws -> Int
-    ) async throws -> Int {
-        let windowSize = Self.backfillWindow
-        var cursor = syncState.backfillCursors[catID] ?? historicalStart
-        var total = 0
-        let totalWindows = Int(ceil(anchor.timeIntervalSince(historicalStart) / windowSize))
-        var windowIdx = cursor > historicalStart
-            ? Int(ceil(cursor.timeIntervalSince(historicalStart) / windowSize))
-            : 0
-
-        while cursor < anchor {
-            try checkSelection()
-
-            let windowEnd = min(cursor.addingTimeInterval(windowSize), anchor)
-            syncState.updateCategory(catID, status: .syncing, progress: windowIdx, total: totalWindows, period: cursor..<windowEnd)
-            let category = syncState.categories.first(where: { $0.id == catID })
-            let op = "\(category?.displayName ?? catID) · \(category?.periodLabel ?? "")"
-            syncState.currentOperation = op
-            var retries = 0
-            var windowTotal = 0
-            while true {
-                do {
-                    windowTotal = try await syncWindow(cursor, windowEnd)
-                    break
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch where retries < 3 {
-                    retries += 1
-                    try await Task.sleep(for: Self.retryDelays[retries - 1])
-                } catch {
-                    throw backfillFailure(error, category: catID, start: cursor, end: windowEnd)
-                }
+    /// One window of a special category. Category samples go through a batching
+    /// uploader whose acknowledgements credit part of the window's step; the
+    /// other categories are small enough to count per window.
+    private func syncSpecialWindow(catID: String, displayName: String, index: Int, start: Date, end: Date) async throws -> Int {
+        switch catID {
+        case "cat_category":
+            let run = runID
+            let key = "\(catID)/\(index)"
+            return try await syncCategorySamples(since: start, until: end) { @MainActor [self] ack in
+                guard run == runID else { return }
+                categoryRows(displayName, add: ack.rows)
+                partialStep(key, fraction: Double(ack.windowBatchesAcked) / Double(max(ack.windowBatchesSent, 1)))
+                updateLiveActivity(phase: displayName, operation: syncState.currentOperation, records: syncState.newRecordsThisRun)
             }
-            total += windowTotal
-            syncState.newRecordsThisRun += windowTotal
-
-            cursor = windowEnd
-            windowIdx += 1
-            syncState.backfillCursors[catID] = cursor
-            syncState.persist()
-            advanceRun()
-            updateLiveActivity(phase: category?.displayName ?? catID, operation: op, records: syncState.newRecordsThisRun)
+        case "cat_workouts":
+            return try await syncWorkouts(since: start, until: end)
+        case "cat_bp":
+            return try await syncBloodPressure(since: start, until: end)
+        case "cat_activity_summaries":
+            return try await syncActivitySummaries(since: start, until: end)
+        case "cat_workout_routes":
+            return try await syncWorkoutRoutes(since: start, until: end)
+        default:
+            return 0
         }
-        return total
     }
 
     // MARK: - Incremental sync
@@ -961,6 +1336,7 @@ final class SyncService: ObservableObject {
                     // the last day, because late samples change the sums of past hours.
                     let outcome = try await uploadQuantityTypes(
                         types,
+                        label: catID,
                         since: { $0.syncStrategy.isIndividual ? querySince : bucketSince },
                         anchorKey: { Self.anchorKey(category: catID, type: $0.id) },
                         onTypeFailed: { typeDesc, error in
@@ -1351,54 +1727,39 @@ final class SyncService: ObservableObject {
         }
     }
 
+    /// Six requests in flight: the pipeline sat at the old cap of three while the
+    /// server's latency stayed flat from one to three, and its pool holds sixteen
+    /// connections. Watch `upload.batch` `elapsed_ms` in the trace — a median
+    /// past a second means the database is the limit, not the client.
+    private func makeMetricUploader(
+        label: String,
+        onBatch: (@Sendable (UploadAck) async -> Void)? = nil,
+        onWindowUploaded: (@Sendable (UploadedWindow) async -> Void)? = nil
+    ) -> MetricUploader {
+        MetricUploader(
+            label: label, batchSize: batchSize, maxInFlight: 6,
+            makePayload: { FreeRepsPayload(data: FreeRepsData(metrics: $0)) },
+            insertedRows: { $0.metrics_inserted },
+            ingest: { [self] payload in try await self.ingest(payload) },
+            onBatch: onBatch, onWindowUploaded: onWindowUploaded
+        )
+    }
+
     /// Reads a category's quantity types a few at a time and uploads them through
     /// one `MetricUploader`, so small types share a request and reads overlap with
     /// uploads. Returns the rows the server inserted and the anchors to keep.
     private func uploadQuantityTypes(
         _ types: [QuantityTypeDescriptor],
+        label: String,
         since: @escaping (QuantityTypeDescriptor) -> Date?,
         until: Date? = nil,
         anchorKey: ((QuantityTypeDescriptor) -> String)? = nil,
         onTypeFailed: ((QuantityTypeDescriptor, Error) -> Void)? = nil
     ) async throws -> (inserted: Int, anchors: [String: Data]) {
-        let uploader = MetricUploader(batchSize: batchSize, maxInFlight: 3) { [self] payload in
-            try await ingest(payload)
-        }
-        let semaphore = AsyncSemaphore(value: 5)
-        var anchors: [String: Data] = [:]
+        let uploader = makeMetricUploader(label: label)
         do {
-            try await withThrowingTaskGroup(of: (String, Data)?.self) { group in
-                for typeDesc in types {
-                    group.addTask { @MainActor [self] in
-                        await semaphore.wait()
-                        defer { Task { await semaphore.signal() } }
-                        try checkSelection()
-                        let key = anchorKey?(typeDesc)
-                        do {
-                            await SyncTrace.shared.record("quantity.started", ["type": typeDesc.id])
-                            let anchor = try await readQuantityType(typeDesc: typeDesc, since: since(typeDesc), until: until,
-                                                                    anchorKey: key) { try await uploader.add($0) }
-                            await SyncTrace.shared.record("quantity.finished", ["type": typeDesc.id])
-                            if let key, let anchor { return (key, anchor) }
-                            return nil
-                        } catch is CancellationError {
-                            throw CancellationError()
-                        } catch let error as MetricUploader.UploadFailed {
-                            throw error.underlying
-                        } catch {
-                            let cause = error as NSError
-                            await SyncTrace.shared.record("quantity.failed", ["type": typeDesc.id,
-                                "domain": cause.domain, "code": String(cause.code)])
-                            guard let onTypeFailed else { throw error }
-                            onTypeFailed(typeDesc, error)
-                            return nil
-                        }
-                    }
-                }
-                for try await pair in group {
-                    if let (key, anchor) = pair { anchors[key] = anchor }
-                }
-            }
+            let anchors = try await readQuantityTypes(types, since: since, until: until, anchorKey: anchorKey,
+                                                      onTypeFailed: onTypeFailed, into: uploader)
             let inserted = try await uploader.finish()
             return (inserted, anchors)
         } catch {
@@ -1407,49 +1768,130 @@ final class SyncService: ObservableObject {
         }
     }
 
-    // MARK: - Category sync
-
-    /// Uploads category samples such as sleep stages. With `anchored`, each type
-    /// is read through its HealthKit anchor, so only additions since the last
-    /// run come back; the anchors are kept once every type is on the server.
-    private func syncCategorySamples(since: Date?, until: Date? = nil, anchored: Bool = false,
-                                     insertBatchSize: Int = batchSize) async throws -> Int {
-        try checkSelection()
-        var total = 0
-        var newAnchors: [String: Data] = [:]
-        for typeDesc in HealthDataTypes.allCategoryTypes {
-            try checkSelection()
-            func upload(_ hkBatch: [HKCategorySample]) async throws {
-                for batch in hkBatch.chunked(into: insertBatchSize) {
-                    let samples = batch.map { s in
-                        FreeRepsCategorySample(
-                            id: s.uuid.uuidString,
-                            type: typeDesc.id,
-                            value: s.value,
-                            value_label: typeDesc.valueLabels[s.value],
-                            start_date: haeDate(s.startDate),
-                            end_date: haeDate(s.endDate),
-                            source: s.sourceDisplayName
-                        )
-                    }
-                    let payload = FreeRepsPayload(data: FreeRepsData(category_samples: samples))
+    /// Reads the types five at a time into `uploader`. Returns the anchors to keep.
+    private func readQuantityTypes(
+        _ types: [QuantityTypeDescriptor],
+        since: @escaping (QuantityTypeDescriptor) -> Date?,
+        until: Date? = nil,
+        anchorKey: ((QuantityTypeDescriptor) -> String)? = nil,
+        onTypeFailed: ((QuantityTypeDescriptor, Error) -> Void)? = nil,
+        into uploader: MetricUploader
+    ) async throws -> [String: Data] {
+        let semaphore = AsyncSemaphore(value: 5)
+        var anchors: [String: Data] = [:]
+        try await withThrowingTaskGroup(of: (String, Data)?.self) { group in
+            for typeDesc in types {
+                group.addTask { @MainActor [self] in
+                    await semaphore.wait()
+                    defer { Task { await semaphore.signal() } }
                     try checkSelection()
-                    let result = try await ingest(payload)
-                    total += result.category_samples_inserted ?? batch.count
+                    let key = anchorKey?(typeDesc)
+                    do {
+                        await SyncTrace.shared.record("quantity.started", ["type": typeDesc.id])
+                        let anchor = try await readQuantityType(typeDesc: typeDesc, since: since(typeDesc), until: until,
+                                                                anchorKey: key) { try await uploader.add($0) }
+                        await SyncTrace.shared.record("quantity.finished", ["type": typeDesc.id])
+                        if let key, let anchor { return (key, anchor) }
+                        return nil
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch let error as MetricUploader.UploadFailed {
+                        throw error.underlying
+                    } catch {
+                        let cause = error as NSError
+                        await SyncTrace.shared.record("quantity.failed", ["type": typeDesc.id,
+                            "domain": cause.domain, "code": String(cause.code)])
+                        guard let onTypeFailed else { throw error }
+                        onTypeFailed(typeDesc, error)
+                        return nil
+                    }
                 }
             }
-            if anchored, let start = since {
-                let key = Self.anchorKey(category: "cat_category", type: typeDesc.id)
-                let changes = try await healthKit.changedCategorySamples(
-                    typeID: typeDesc.hkIdentifier, anchor: syncState.anchors[key], fallbackSince: start)
-                try await upload(changes.added)
-                newAnchors[key] = changes.anchor
-            } else {
-                try await healthKit.streamCategorySamples(typeID: typeDesc.hkIdentifier, from: since, until: until, handler: upload)
+            for try await pair in group {
+                if let (key, anchor) = pair { anchors[key] = anchor }
             }
         }
-        syncState.anchors.merge(newAnchors) { _, new in new }
-        return total
+        return anchors
+    }
+
+    // MARK: - Category sync
+
+    /// Uploads category samples such as sleep stages. The types are read a few
+    /// at a time into one uploader, so the many small types share requests the
+    /// way quantity types do. With `anchored`, each type is read through its
+    /// HealthKit anchor, so only additions since the last run come back; the
+    /// anchors are kept once every type is on the server — a failure anywhere
+    /// leaves them all where they were.
+    private func syncCategorySamples(since: Date?, until: Date? = nil, anchored: Bool = false,
+                                     insertBatchSize: Int = batchSize,
+                                     onBatch: (@Sendable (UploadAck) async -> Void)? = nil) async throws -> Int {
+        try checkSelection()
+        let uploader = CategoryUploader(
+            label: "cat_category", batchSize: insertBatchSize, maxInFlight: 3,
+            makePayload: { FreeRepsPayload(data: FreeRepsData(category_samples: $0.flatMap(\.samples))) },
+            insertedRows: { $0.category_samples_inserted },
+            ingest: { [self] payload in try await self.ingest(payload) },
+            onBatch: onBatch
+        )
+        let semaphore = AsyncSemaphore(value: 5)
+        var newAnchors: [String: Data] = [:]
+        do {
+            try await withThrowingTaskGroup(of: (String, Data)?.self) { group in
+                for typeDesc in HealthDataTypes.allCategoryTypes {
+                    group.addTask { @MainActor [self] in
+                        await semaphore.wait()
+                        defer { Task { await semaphore.signal() } }
+                        try checkSelection()
+                        await SyncTrace.shared.record("category.started", ["type": typeDesc.id])
+                        var rows = 0
+                        func upload(_ hkBatch: [HKCategorySample]) async throws {
+                            rows += hkBatch.count
+                            let samples = hkBatch.map { s in
+                                FreeRepsCategorySample(
+                                    id: s.uuid.uuidString,
+                                    type: typeDesc.id,
+                                    value: s.value,
+                                    value_label: typeDesc.valueLabels[s.value],
+                                    start_date: haeDate(s.startDate),
+                                    end_date: haeDate(s.endDate),
+                                    source: s.sourceDisplayName
+                                )
+                            }
+                            try await uploader.add(CategoryRows(samples: samples))
+                        }
+                        do {
+                            let result: (String, Data)?
+                            if anchored, let start = since {
+                                let key = Self.anchorKey(category: "cat_category", type: typeDesc.id)
+                                let changes = try await healthKit.changedCategorySamples(
+                                    typeID: typeDesc.hkIdentifier, anchor: syncState.anchors[key], fallbackSince: start)
+                                try await upload(changes.added)
+                                result = (key, changes.anchor)
+                            } else {
+                                try await healthKit.streamCategorySamples(
+                                    typeID: typeDesc.hkIdentifier, from: since, until: until, handler: upload)
+                                result = nil
+                            }
+                            await SyncTrace.shared.record("category.finished", ["type": typeDesc.id, "rows": String(rows)])
+                            return result
+                        } catch is CancellationError {
+                            throw CancellationError()
+                        } catch let error as CategoryUploader.UploadFailed {
+                            throw error.underlying
+                        }
+                    }
+                }
+                for try await pair in group {
+                    if let (key, anchor) = pair { newAnchors[key] = anchor }
+                }
+            }
+            let total = try await uploader.finish()
+            syncState.anchors.merge(newAnchors) { _, new in new }
+            return total
+        } catch {
+            await uploader.cancel()
+            throw error
+        }
     }
 
     // MARK: - Workout sync
