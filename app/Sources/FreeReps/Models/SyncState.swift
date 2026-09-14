@@ -28,15 +28,6 @@ enum SyncStatus: Equatable {
     case completed
     case failed(String)
 
-    var label: String {
-        switch self {
-        case .idle: return "Idle"
-        case .syncing: return "Syncing…"
-        case .completed: return "Synced"
-        case .failed: return "Error"
-        }
-    }
-
     var isActive: Bool {
         if case .syncing = self { return true }
         return false

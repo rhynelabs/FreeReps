@@ -7,47 +7,28 @@ struct CategoryStatusCard: View {
     var isSyncRunning: Bool = false
     /// False when the category is turned off in Settings → Apple Health.
     var isIncluded: Bool = true
+    /// Set while an older-data sync has not finished this category.
+    var olderData: SyncState.OlderDataProgress? = nil
 
     @State private var showResetConfirm = false
 
     var body: some View {
-        HStack(spacing: 12) {
-            // Icon
-            ZStack {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(iconColor.opacity(0.15))
-                    .frame(width: 44, height: 44)
-                Image(systemName: state.systemImage)
-                    .font(.system(size: 20))
-                    .foregroundStyle(iconColor)
-            }
+        HStack(spacing: 14) {
+            Image(systemName: state.systemImage)
+                .font(.system(size: 22))
+                .foregroundStyle(iconColor)
+                .frame(width: 32)
 
-            // Info
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(state.displayName)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.primary)
-                HStack(spacing: 6) {
-                    statusBadge
-                    if state.recordCount > 0 || state.status == .syncing {
-                        Text("\(state.recordCount.formatted()) records")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                            .lineLimit(1)
-                            .contentTransition(.numericText())
-                            .animation(.default, value: state.recordCount)
-                    }
-                }
+                Text(detail)
+                    .font(.subheadline)
+                    .foregroundStyle(isFailed ? .red : .secondary)
+                    .monospacedDigit()
+                    .contentTransition(.numericText())
+                    .animation(.default, value: state.recordCount)
                 if case .syncing = state.status {
-                    if state.currentProgress > 0 {
-                        Text("Window \(state.currentProgress)/\(state.totalEstimated)")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                    }
                     ProgressView(value: state.progressFraction)
-                        .tint(.blue)
                         .frame(maxWidth: 180)
                 }
                 if case .failed(let message) = state.status {
@@ -66,20 +47,20 @@ struct CategoryStatusCard: View {
             // Last sync time + staleness indicator
             VStack(alignment: .trailing, spacing: 2) {
                 if let date = state.lastSyncDate {
-                    Text(date, style: .relative)
+                    Text(date, format: .relative(presentation: .named))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.trailing)
                 }
                 if let days = state.daysBehind {
-                    Text(days == 1 ? "1 day behind" : "\(days)d behind")
+                    Text(days == 1 ? "1 day behind" : "\(days) days behind")
                         .font(.caption2)
                         .foregroundStyle(.orange)
                         .multilineTextAlignment(.trailing)
                 }
             }
         }
-        .padding(.vertical, 6)
+        .padding(.vertical, 2)
         .opacity(isIncluded ? 1 : 0.5)
         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
             if !isSyncRunning && isIncluded {
@@ -113,34 +94,39 @@ struct CategoryStatusCard: View {
         }
     }
 
-    private var statusBadge: some View {
-        HStack(spacing: 4) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 7, height: 7)
-            Text(isIncluded ? state.status.label : "Off")
-                .font(.caption)
-                .foregroundStyle(statusColor)
+    /// One honest line: "n new records" is what the server inserted in the last run, so a
+    /// re-sent category reads "Nothing new" rather than a small number.
+    private var detail: String {
+        guard isIncluded else { return "Off" }
+        switch state.status {
+        case .syncing:
+            return state.periodLabel ?? "Syncing\u{2026}"
+        case .failed:
+            return "Failed"
+        case .idle, .completed:
+            switch olderData {
+            case .notStarted:
+                return "Older data: not sent yet"
+            case .sentUpTo(let date):
+                return "Older data: up to \(date.formatted(.dateTime.month(.abbreviated).year()))"
+            case nil:
+                guard state.lastSyncDate != nil else { return "Not synced yet" }
+                return state.recordCount > 0 ? "\(state.recordCount.formatted()) new records" : "Nothing new"
+            }
         }
     }
 
-    private var statusColor: Color {
-        guard isIncluded else { return .secondary }
-        switch state.status {
-        case .idle:       return .secondary
-        case .syncing:    return .blue
-        case .completed:  return .green
-        case .failed:     return .red
-        }
+    private var isFailed: Bool {
+        if case .failed = state.status { return true } else { return false }
     }
 
     private var iconColor: Color {
+        guard isIncluded else { return .secondary }
         switch state.status {
         case .failed:    return .red
         case .syncing:   return .blue
         case .completed: return .green
-        default:         return state.daysBehind != nil ? .orange : .blue
+        case .idle:      return state.daysBehind != nil ? .orange : .blue
         }
     }
-
 }

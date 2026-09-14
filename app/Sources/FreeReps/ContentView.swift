@@ -15,7 +15,7 @@ struct ContentView: View {
 
             SyncDashboardView(vm: syncViewModel)
                 .tabItem {
-                    Label("Data", systemImage: "list.bullet.rectangle")
+                    Label("Sync", systemImage: "arrow.triangle.2.circlepath")
                 }
 
             SettingsView(syncViewModel: syncViewModel)
@@ -24,7 +24,7 @@ struct ContentView: View {
                 }
         }
         .environmentObject(syncViewModel)
-        // Both tabs start a history import, so screen and prerequisite handling live here.
+        // Both tabs start syncing older data, so screen and prerequisite handling live here.
         .onChange(of: syncViewModel.isFullSyncRunning) { _, isRunning in
             UIApplication.shared.isIdleTimerDisabled = isRunning && keepScreenOnDuringSync
         }

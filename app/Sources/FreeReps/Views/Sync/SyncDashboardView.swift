@@ -14,65 +14,55 @@ struct SyncDashboardView: View {
             List {
                 if vm.isAnySyncRunning {
                     Section {
-                        VStack(alignment: .leading, spacing: 8) {
-                            if !vm.currentOperation.isEmpty {
-                                Text(vm.currentOperation)
+                        HStack(spacing: 14) {
+                            Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                                .font(.system(size: 30))
+                                .foregroundStyle(.blue)
+                                .frame(width: 40)
+                                .symbolEffect(.pulse)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(vm.isFullSyncRunning ? "Syncing Older Data" : "Syncing New Data")
+                                    .font(.headline)
+                                Text(vm.currentOperation.isEmpty ? "Reading Apple Health\u{2026}" : vm.currentOperation)
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                             }
-                            overallProgress
                         }
                         .padding(.vertical, 4)
+                        overallProgress
+                        LabeledContent("New Records", value: vm.syncState.newRecordsThisRun.formatted())
+                            .monospacedDigit()
+                        if vm.isFullSyncRunning {
+                            noticeRow(
+                                icon: "lock.open.display",
+                                color: .blue,
+                                title: "Keep Screen On",
+                                message: "Apple Health can't be read while iPhone is locked."
+                            )
+                        }
                         Button("Cancel Sync", role: .destructive) { vm.cancelSync() }
                     }
                 }
 
-                // Full sync screen-on reminder
-                if vm.isFullSyncRunning {
-                    Section {
-                        noticeBanner(
-                            icon: "lock.open.display",
-                            color: .blue,
-                            title: "Keep Screen On",
-                            message: "Apple Health can't be read while the iPhone is locked. Keep the screen on until the history import completes."
-                        )
-                    }
-                }
-
-                // Error banner
                 if let err = vm.errorMessage {
                     Section {
-                        noticeBanner(
-                            icon: "exclamationmark.triangle.fill",
-                            color: .red,
-                            title: nil,
-                            message: err
-                        )
+                        noticeRow(icon: "exclamationmark.triangle.fill", color: .red, title: "Sync Failed", message: err)
+                            .textSelection(.enabled)
                     }
                 }
 
-                // Prerequisite issues banner
                 if !vm.prerequisiteIssues.isEmpty && !vm.isAnySyncRunning {
                     Section("Action Required") {
                         ForEach(vm.prerequisiteIssues) { issue in
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack(spacing: 8) {
-                                    Image(systemName: "exclamationmark.circle.fill")
-                                        .foregroundStyle(.orange)
-                                    Text(issue.title)
-                                        .font(.subheadline.weight(.semibold))
+                            if issue.actionLabel.isEmpty {
+                                noticeRow(icon: "exclamationmark.circle.fill", color: .orange, title: issue.title, message: issue.message)
+                            } else {
+                                Button { handlePrerequisiteAction(issue) } label: {
+                                    noticeRow(icon: "exclamationmark.circle.fill", color: .orange, title: issue.title,
+                                              message: issue.message, action: issue.actionLabel)
                                 }
-                                Text(issue.message)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                if !issue.actionLabel.isEmpty {
-                                    Button(issue.actionLabel) {
-                                        handlePrerequisiteAction(issue)
-                                    }
-                                    .font(.caption.weight(.semibold))
-                                }
+                                .foregroundStyle(.primary)
                             }
-                            .padding(.vertical, 4)
                         }
                     }
                 }
@@ -85,24 +75,28 @@ struct SyncDashboardView: View {
                             onReset: { vm.resetCategory(categoryID: cat.id) },
                             onSync: { vm.startCategorySync(categoryID: cat.id) },
                             isSyncRunning: vm.isAnySyncRunning,
-                            isIncluded: selection.isEnabled && selection.includes(cat.id)
+                            isIncluded: selection.isEnabled && selection.includes(cat.id),
+                            olderData: cat.id == "cat_strength" ? nil : vm.syncState.olderDataProgress(for: cat.id)
                         )
                     }
                 }
 
                 Section {
-                    Button("Import History") { vm.startFullSync() }
+                    Button("Sync Older Data") { vm.startFullSync() }
                         .disabled(vm.isAnySyncRunning || !selection.isEnabled)
+                } footer: {
+                    Text("Sends all Apple Health data from before your first sync. If it's interrupted, it continues where it stopped.")
+                }
+
+                Section {
                     Button("Import File…") { showFilePicker = true }
                         .disabled(vm.isAnySyncRunning)
-                } header: {
-                    Text("Import")
                 } footer: {
-                    Text("Import History reads all Apple Health data since the backfill start and continues where it stopped. Import File uploads a CSV export, for example from Alpha Progression.")
+                    Text("Uploads a CSV export, for example from Alpha Progression.")
                 }
 
             }
-            .navigationTitle("Data")
+            .navigationTitle("Sync")
             .navigationBarTitleDisplayMode(.large)
             .navigationDestination(isPresented: $navigateToHealthPermissions) {
                 HealthPermissionsView(vm: SettingsViewModel())
@@ -141,42 +135,33 @@ struct SyncDashboardView: View {
     }
 
     private var overallProgress: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("Overall Progress")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("\(Int(vm.overallProgress * 100))%")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
+        VStack(alignment: .leading, spacing: 6) {
+            LabeledContent("Overall Progress", value: vm.overallProgress, format: .percent.precision(.fractionLength(0)))
+                .monospacedDigit()
             ProgressView(value: vm.overallProgress)
-                .tint(.blue)
         }
+        .padding(.vertical, 2)
     }
 
-    private func noticeBanner(icon: String, color: Color, title: String?, message: String) -> some View {
-        HStack(spacing: 10) {
+    /// A notice in the style of a Settings row: symbol, headline, secondary text.
+    private func noticeRow(icon: String, color: Color, title: String, message: String, action: String? = nil) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
             Image(systemName: icon)
                 .foregroundStyle(color)
             VStack(alignment: .leading, spacing: 2) {
-                if let title {
-                    Text(title)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.primary)
-                }
+                Text(title)
                 Text(message)
-                    .font(.caption)
-                    .foregroundStyle(title != nil ? .secondary : color)
-                    .lineLimit(3)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                if let action {
+                    Text(action)
+                        .font(.subheadline)
+                        .foregroundStyle(.tint)
+                        .padding(.top, 2)
+                }
             }
         }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(color.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
-        .listRowBackground(Color.clear)
-        .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+        .padding(.vertical, 2)
     }
 
     private func handlePrerequisiteAction(_ issue: SyncPrerequisiteIssue) {

@@ -1,7 +1,10 @@
 import SwiftUI
 
 /// The everyday answer: is the server up to date, what arrived last night,
-/// and how much is stored. Per-category detail lives in the Data tab.
+/// and how much is stored. Per-category detail lives in the Sync tab.
+///
+/// A `List` of inset-grouped sections in the density of Settings: a status row
+/// like `HealthPermissionsView`, plain button rows, `LabeledContent` for values.
 struct OverviewView: View {
     @ObservedObject var vm: SyncViewModel
     @ObservedObject private var selection = HealthSyncSelection.shared
@@ -11,8 +14,15 @@ struct OverviewView: View {
         NavigationStack {
             List {
                 statusSection
-                lastNightSection
-                serverSection
+                if selection.isEnabled && !vm.isAnySyncRunning && !vm.hasCompletedFullSync && olderDataPending.isEmpty {
+                    olderDataSection
+                }
+                if server.stats == nil, case .failed(let message) = server.state {
+                    unreachableSection(message)
+                } else {
+                    lastNightSection
+                    serverSection
+                }
                 BrandFooter()
             }
             .navigationTitle("Overview")
@@ -28,21 +38,29 @@ struct OverviewView: View {
     // MARK: - Status
 
     private enum Status {
-        case paused, syncing, failed(String), behind(Int), neverSynced, upToDate(Date)
+        case paused, syncing(older: Bool), failed(String), olderDataPaused, behind(Int), neverSynced, upToDate(Date)
     }
 
     private var included: [CategorySyncState] {
         vm.categories.filter { $0.id != "cat_strength" && selection.includes($0.id) }
     }
 
+    /// Categories an older-data sync started but has not finished.
+    private var olderDataPending: [(CategorySyncState, SyncState.OlderDataProgress)] {
+        included.compactMap { category in
+            vm.syncState.olderDataProgress(for: category.id).map { (category, $0) }
+        }
+    }
+
     private var status: Status {
         if !selection.isEnabled { return .paused }
-        if vm.isAnySyncRunning { return .syncing }
+        if vm.isAnySyncRunning { return .syncing(older: vm.isFullSyncRunning) }
         let failed = included.filter { if case .failed = $0.status { return true } else { return false } }
         if let message = vm.errorMessage { return .failed(message) }
         if !failed.isEmpty {
             return .failed(failed.count == 1 ? "\(failed[0].displayName) couldn't sync." : "\(failed.count) categories couldn't sync.")
         }
+        if !olderDataPending.isEmpty { return .olderDataPaused }
         let behind = included.filter { $0.daysBehind != nil }.count
         if behind > 0 { return .behind(behind) }
         guard let last = vm.lastSyncDate else { return .neverSynced }
@@ -56,30 +74,35 @@ struct OverviewView: View {
                     .font(.system(size: 30))
                     .foregroundStyle(statusIcon.color)
                     .frame(width: 40)
+                    .symbolEffect(.pulse, isActive: vm.isAnySyncRunning)
+                    .contentTransition(.symbolEffect(.replace))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(statusTitle).font(.headline)
+                    Text(statusTitle)
+                        .font(.headline)
                     Text(statusSubtitle)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                        .lineLimit(2)
+                    if vm.isAnySyncRunning {
+                        ProgressView(value: vm.overallProgress)
+                            .padding(.top, 4)
+                    }
                 }
             }
             .padding(.vertical, 4)
+            .animation(.default, value: statusTitle)
 
             if vm.isAnySyncRunning {
-                ProgressView(value: vm.overallProgress)
-                    .tint(.blue)
                 Button("Cancel Sync", role: .destructive) { vm.cancelSync() }
             } else if selection.isEnabled {
-                Button("Sync Now") { vm.startRecentSync() }
-                    .accessibilityIdentifier("sync-now")
-                if !vm.hasCompletedFullSync {
-                    Button("Import History") { vm.startFullSync() }
+                switch status {
+                case .olderDataPaused:
+                    Button("Continue") { vm.startFullSync() }
+                case .failed:
+                    Button("Try Again") { olderDataPending.isEmpty ? vm.startRecentSync() : vm.startFullSync() }
+                default:
+                    Button("Sync Now") { vm.startRecentSync() }
+                        .accessibilityIdentifier("sync-now")
                 }
-            }
-        } footer: {
-            if selection.isEnabled && !vm.isAnySyncRunning && !vm.hasCompletedFullSync {
-                Text("Older data isn't on your server yet. Importing history reads all of it once; keep FreeReps open while it runs.")
             }
         }
     }
@@ -89,8 +112,9 @@ struct OverviewView: View {
         case .paused: return ("pause.circle.fill", .secondary)
         case .syncing: return ("arrow.triangle.2.circlepath.circle.fill", .blue)
         case .failed: return ("exclamationmark.circle.fill", .red)
+        case .olderDataPaused: return ("pause.circle.fill", .orange)
         case .behind: return ("clock.badge.exclamationmark.fill", .orange)
-        case .neverSynced: return ("circle.dashed", .secondary)
+        case .neverSynced: return ("arrow.up.heart.fill", .blue)
         case .upToDate: return ("checkmark.circle.fill", .green)
         }
     }
@@ -98,8 +122,9 @@ struct OverviewView: View {
     private var statusTitle: String {
         switch status {
         case .paused: return "Sync Paused"
-        case .syncing: return "Syncing"
+        case .syncing(let older): return older ? "Syncing Older Data" : "Syncing New Data"
         case .failed: return "Sync Failed"
+        case .olderDataPaused: return "Older Data Paused"
         case .behind: return "Not Up to Date"
         case .neverSynced: return "Not Synced Yet"
         case .upToDate: return "Up to Date"
@@ -109,57 +134,104 @@ struct OverviewView: View {
     private var statusSubtitle: String {
         switch status {
         case .paused: return "Connect Apple Health in Settings to sync."
-        case .syncing: return vm.currentOperation.isEmpty ? "Reading Apple Health…" : vm.currentOperation
+        case .syncing: return vm.currentOperation.isEmpty ? "Reading Apple Health\u{2026}" : vm.currentOperation
         case .failed(let message): return message
+        case .olderDataPaused: return olderDataPausedSubtitle
         case .behind(let count): return count == 1 ? "1 category has newer data." : "\(count) categories have newer data."
-        case .neverSynced: return "Sync to send your Health data to your server."
+        case .neverSynced: return "Send your Health data to your server."
         case .upToDate(let date): return "Synced \(date.formatted(.relative(presentation: .named)))"
         }
     }
 
-    // MARK: - Last night
-
-    private var lastNightSection: some View {
-        Section {
-            if let night = server.lastNight {
-                LabeledContent("Sleep", value: Self.duration(hours: night.hours))
-                LabeledContent("Asleep", value: "\(night.start.formatted(date: .omitted, time: .shortened)) – \(night.end.formatted(date: .omitted, time: .shortened))")
-            } else {
-                Text(server.state == .loading ? "Loading…" : "No sleep on your server yet")
-                    .foregroundStyle(.secondary)
+    /// Older data is sent one category at a time, so at most one is partly done.
+    private var olderDataPausedSubtitle: String {
+        let pending = olderDataPending
+        let left = pending.count == 1 ? "1 category left" : "\(pending.count) categories left"
+        for (category, progress) in pending {
+            if case .sentUpTo(let date) = progress {
+                return "\(category.displayName) sent up to \(date.formatted(.dateTime.month(.abbreviated).year())) · \(left)"
             }
-        } header: {
-            Text("Last Night")
+        }
+        return "Stopped before it finished · \(left)"
+    }
+
+    private var olderDataSection: some View {
+        Section {
+            Button("Sync Older Data") { vm.startFullSync() }
+        } footer: {
+            Text("Older Apple Health data isn't on your server yet. This sends it once. Keep FreeReps open until it finishes.")
         }
     }
 
     // MARK: - Server
 
+    private var lastNightSection: some View {
+        Section("Last Night") {
+            if let night = server.lastNight {
+                nightRows(night)
+            } else if server.state == .loading {
+                nightRows(.init(hours: 7.5, start: .now, end: .now))
+                    .redacted(reason: .placeholder)
+            } else {
+                Text("No sleep recorded")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func nightRows(_ night: ServerOverview.Night) -> some View {
+        let minutes = Int((night.hours * 60).rounded())
+        LabeledContent("Sleep", value: Duration.seconds(minutes * 60), format: .units(allowed: [.hours, .minutes], width: .abbreviated))
+        LabeledContent("Asleep", value: "\(night.start.formatted(date: .omitted, time: .shortened)) – \(night.end.formatted(date: .omitted, time: .shortened))")
+            .monospacedDigit()
+    }
+
     private var serverSection: some View {
         Section {
             if let stats = server.stats {
-                LabeledContent("Health Metrics", value: stats.metrics.formatted())
-                LabeledContent("Workouts", value: stats.workouts.formatted())
-                LabeledContent("Sleep Nights", value: stats.sleepNights.formatted())
-                if let earliest = stats.earliest {
-                    LabeledContent("Since", value: earliest.formatted(.dateTime.month(.wide).year()))
-                }
+                statRows(stats)
             } else {
-                Text(server.state == .loading ? "Loading…" : "Not available")
-                    .foregroundStyle(.secondary)
+                statRows(.init(metrics: 1_000_000, workouts: 100, sleepNights: 100, earliest: .now))
+                    .redacted(reason: .placeholder)
             }
         } header: {
             Text("On Your Server")
         } footer: {
             if case .failed(let message) = server.state {
-                Text(message)
+                Text("Couldn't refresh: \(message)")
             }
         }
     }
 
-    private static func duration(hours: Double) -> String {
-        let minutes = Int((hours * 60).rounded())
-        return "\(minutes / 60) h \(minutes % 60) min"
+    @ViewBuilder
+    private func statRows(_ stats: ServerOverview.Stats) -> some View {
+        LabeledContent("Health Metrics", value: stats.metrics, format: .number)
+        LabeledContent("Workouts", value: stats.workouts, format: .number)
+        LabeledContent("Sleep Nights", value: stats.sleepNights, format: .number)
+        if let earliest = stats.earliest {
+            LabeledContent("Since", value: earliest, format: .dateTime.month(.abbreviated).year())
+        }
+    }
+
+    private func unreachableSection(_ message: String) -> some View {
+        Section("On Your Server") {
+            HStack(spacing: 14) {
+                Image(systemName: "server.rack")
+                    .font(.system(size: 30))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 40)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Server Not Reachable")
+                        .font(.headline)
+                    Text(message)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.vertical, 4)
+            Button("Try Again") { Task { await server.load() } }
+        }
     }
 }
 
@@ -186,6 +258,8 @@ final class ServerOverview: ObservableObject {
     @Published private(set) var lastNight: Night?
 
     func load() async {
+        // Placeholders while nothing is known; a refresh keeps the last values on screen.
+        if stats == nil { state = .loading }
         let service = FreeRepsService(config: .load())
         do {
             let statsData = try await service.get(path: "api/v1/stats")
@@ -199,7 +273,7 @@ final class ServerOverview: ObservableObject {
         } catch is CancellationError {
             return
         } catch {
-            state = .failed("Your server couldn't be reached: \(error.localizedDescription)")
+            state = .failed(error.localizedDescription)
         }
     }
 
