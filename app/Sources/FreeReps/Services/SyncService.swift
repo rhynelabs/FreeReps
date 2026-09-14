@@ -1737,9 +1737,12 @@ final class SyncService: ObservableObject {
     }
 
     /// How many workouts have their routes read and uploaded at once. Each
-    /// route is one 0.3–0.5 MB request, and HealthKit streams the locations
-    /// in chunks; one at a time, the read sits idle while the upload runs.
-    private static let routeConcurrency = 3
+    /// route is one request of 2–6 MB of JSON (0.5–1.5 MB gzipped), and
+    /// HealthKit streams the locations in chunks; one at a time, the read sits
+    /// idle while the upload runs. Routes are the tail of an older-data run,
+    /// alone after the other categories, so they may take most of the run's
+    /// `requestSlotCount`, which still caps the total.
+    private static let routeConcurrency = 6
 
     /// Runs `uploadRoutes(of:)` for the workouts, `routeConcurrency` at a time.
     /// The outcomes come back in completion order, which the callers do not
