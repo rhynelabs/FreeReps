@@ -679,7 +679,7 @@ final class ServerOverview: ObservableObject {
     }
 }
 
-/// A hypnogram of one night in the style of the Health app's sleep widget: one
+/// A hypnogram of one night in the style of the Health app's sleep detail: one
 /// lane per stage from Awake down to Deep, every stage a chunky rounded bar
 /// placed by its time within the night, every transition a straight vertical
 /// line fading from the color it leaves to the color it enters. The bars are
@@ -697,12 +697,14 @@ struct SleepStagesChart: View {
     @Environment(\.redactionReasons) private var redaction
     @Environment(\.colorScheme) private var scheme
 
-    private static let laneHeight: CGFloat = 22
-    private static let barHeight: CGFloat = 15
+    private static let laneHeight: CGFloat = 26
+    private static let barHeight: CGFloat = 14
     private static let barRadius: CGFloat = 5
     /// A stage of a few minutes still has to be visible.
     private static let minimumBarWidth: CGFloat = 3.5
     private static let connectorWidth: CGFloat = 2
+    private static let connectorOpacity: Double = 0.45
+    private static let glowOpacity: Double = 0.12
 
     /// A night with stage detail gets the four Health lanes; a night that only
     /// knows "asleep" gets a single one. Mixed input — an "In Bed" stretch next
@@ -748,34 +750,44 @@ struct SleepStagesChart: View {
                 let lane = lanes.firstIndex(of: kind) ?? 0
                 return (CGFloat(lane) + 0.5) * Self.laneHeight
             }
-
-            // Transitions first, so the bars cover their ends: a soft line in the
-            // two stage colors, from the bar it leaves to the bar it enters.
-            for (previous, next) in zip(items, items.dropFirst()) {
-                let x = (position(previous.end) + position(next.start)) / 2
-                let from = centerY(previous.kind)
-                let to = centerY(next.kind)
-                guard from != to else { continue }
-                let edge = Self.barHeight / 2 * (from < to ? 1 : -1)
-                let top = min(from + edge, to - edge)
-                let bottom = max(from + edge, to - edge)
-                guard bottom > top else { continue }
-                let rect = CGRect(x: x - Self.connectorWidth / 2, y: top,
-                                  width: Self.connectorWidth, height: bottom - top)
+            // A transition stands on the boundary the two stages share and runs
+            // from the middle of one bar to the middle of the next.
+            let transitions: [(line: Path, shading: GraphicsContext.Shading)] = zip(items, items.dropFirst()).compactMap { previous, next in
+                let from = CGPoint(x: position(previous.end), y: centerY(previous.kind))
+                let to = CGPoint(x: from.x, y: centerY(next.kind))
+                guard from.y != to.y else { return nil }
+                var line = Path()
+                line.move(to: from)
+                line.addLine(to: to)
                 let shading = GraphicsContext.Shading.linearGradient(
-                    Gradient(colors: [color(previous.kind).opacity(0.4), color(next.kind).opacity(0.4)]),
-                    startPoint: CGPoint(x: x, y: from < to ? top : bottom),
-                    endPoint: CGPoint(x: x, y: from < to ? bottom : top))
-                context.fill(Path(roundedRect: rect, cornerRadius: Self.connectorWidth / 2), with: shading)
+                    Gradient(colors: [color(previous.kind), color(next.kind)]),
+                    startPoint: from, endPoint: to)
+                return (line, shading)
+            }
+
+            // Glow, then line, then bars: each layer is translucent so the one
+            // under it shows through, and the bars cover the line ends.
+            context.drawLayer { layer in
+                layer.opacity = Self.glowOpacity
+                for transition in transitions {
+                    layer.stroke(transition.line, with: transition.shading,
+                                 style: StrokeStyle(lineWidth: 3 * Self.connectorWidth))
+                }
+            }
+            context.drawLayer { layer in
+                layer.opacity = Self.connectorOpacity
+                for transition in transitions {
+                    layer.stroke(transition.line, with: transition.shading,
+                                 style: StrokeStyle(lineWidth: Self.connectorWidth))
+                }
             }
 
             for stage in items {
                 let left = position(stage.start)
-                let width = min(max(position(stage.end) - left, Self.minimumBarWidth), max(size.width - left, Self.minimumBarWidth))
-                let rect = CGRect(x: left,
-                                  y: centerY(stage.kind) - Self.barHeight / 2,
-                                  width: width,
-                                  height: Self.barHeight)
+                let width = min(max(position(stage.end) - left, Self.minimumBarWidth),
+                                max(size.width - left, Self.minimumBarWidth))
+                let rect = CGRect(x: left, y: centerY(stage.kind) - Self.barHeight / 2,
+                                  width: width, height: Self.barHeight)
                 context.fill(Path(roundedRect: rect, cornerRadius: Self.barRadius),
                              with: .color(color(stage.kind)))
             }
@@ -795,7 +807,7 @@ struct SleepStagesChart: View {
         let dark = scheme == .dark
         switch kind {
         case .awake: return Color(red: 1.0, green: 0.45, blue: 0.35)
-        case .rem: return Color(red: 0.36, green: 0.80, blue: 1.0)
+        case .rem: return Color(red: 0.20, green: 0.78, blue: 0.92)
         case .core, .asleep: return dark ? Color(red: 0.13, green: 0.55, blue: 1.0) : Color(red: 0.0, green: 0.48, blue: 1.0)
         case .deep: return dark ? Color(red: 0.42, green: 0.46, blue: 0.92) : Color(red: 0.22, green: 0.26, blue: 0.68)
         }
